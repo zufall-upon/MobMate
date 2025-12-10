@@ -33,11 +33,21 @@ Whisper.cpp / Java / NAudio を利用しています。
 
 `models` フォルダに以下を配置してください：
 
+
+<img width="466" height="570" alt="tips01" src="https://github.com/user-attachments/assets/1acfed6b-8035-460a-a1ed-f41b400e3532" />
+
+※ 解凍して発声しない場合、（wavが生成されない場合）、DLLがブロックされている可能性があります。
+
+お手数をおかけしますが、各DLLファイルのブロックを解除してご確認ください。
+
+
 👉 **推奨モデル： `ggml-small.bin`**
 
 - Tiny：精度不足
 - Medium：巨大 & 遅い
 - Small：最適バランス（推奨）
+
+- 
 
 ---
 
