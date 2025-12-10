@@ -1,0 +1,1966 @@
+package Whisper;
+
+import java.awt.*;
+import java.awt.Window.Type;
+import java.awt.datatransfer.Clipboard;
+import java.awt.datatransfer.StringSelection;
+import java.awt.datatransfer.Transferable;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.awt.event.ItemEvent;
+import java.awt.event.ItemListener;
+import java.awt.event.KeyEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.event.WindowAdapter;
+import java.awt.event.WindowEvent;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.logging.Logger;
+import java.util.prefs.BackingStoreException;
+import java.util.prefs.Preferences;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.Files;
+import java.nio.file.StandardOpenOption;
+import java.nio.charset.StandardCharsets;
+import javax.sound.sampled.AudioInputStream;
+import javax.sound.sampled.AudioSystem;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.FileReader;
+import java.net.*;
+import javax.sound.sampled.Clip;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.FileInputStream;
+import java.io.OutputStreamWriter;
+import java.io.InputStreamReader;
+
+import javax.swing.*;
+import javax.sound.sampled.AudioFileFormat;
+import javax.sound.sampled.AudioFormat;
+import javax.sound.sampled.Line;
+import javax.sound.sampled.LineUnavailableException;
+import javax.sound.sampled.Mixer;
+import javax.sound.sampled.TargetDataLine;
+import javax.swing.Timer;
+import javax.swing.event.ChangeEvent;
+import javax.swing.event.ChangeListener;
+
+import com.github.kwhat.jnativehook.GlobalScreen;
+import com.github.kwhat.jnativehook.NativeHookException;
+import com.github.kwhat.jnativehook.keyboard.NativeKeyEvent;
+import com.github.kwhat.jnativehook.keyboard.NativeKeyListener;
+
+public class MobMateWhisp implements NativeKeyListener {
+    static {
+        try {
+            // DLL のパス（配布 ZIP の中のフォルダ）
+            Path dll = Paths.get("win32-x86-64", "whisper.dll").toAbsolutePath();
+
+            // ロードする
+            System.load(dll.toString());
+
+            System.out.println("Loaded whisper.dll from: " + dll);
+        } catch (Throwable t) {
+            t.printStackTrace();
+        }
+    }
+    private static final int MIN_AUDIO_DATA_LENGTH = (int) (16000 * 2.1);
+
+    private Preferences prefs;
+    private String lastOutput = null;
+    private Random rnd = new Random();
+    private String[] laughOptions;
+    private HistoryFrame historyFrame;
+
+    // Whisper
+    private LocalWhisperCPP w;
+    private String model;
+    private String remoteUrl;
+    // Tray icon
+    private TrayIcon trayIcon;
+    private Image imageRecording;
+    private Image imageTranscribing;
+    private Image imageInactive;
+
+    // Execution services
+    private ExecutorService executorService = Executors.newSingleThreadExecutor();
+    private ExecutorService audioService = Executors.newSingleThreadExecutor();
+
+    // Audio capture
+    private AudioFormat audioFormat;
+
+    private boolean recording;
+    private boolean transcribing;
+
+    // History
+    private List<String> history = new ArrayList<>();
+    private List<ChangeListener> historyListeners = new ArrayList<>();
+
+    // Hotkey for recording
+    private String hotkey;
+    private boolean shiftHotkey;
+    private boolean ctrltHotkey;
+    private long recordingStartTime = 0;
+    private boolean hotkeyPressed;
+    // Trigger mode
+    private static final String START_STOP = "start_stop";
+    private static final String PUSH_TO_TALK_DOUBLE_TAP = "push_to_talk_double_tap";
+    private static final String PUSH_TO_TALK = "push_to_talk";
+
+    protected JFrame window;
+    final JButton button = new JButton("Start");
+
+    final JLabel label = new JLabel("Idle");
+
+    private Process psProcess;
+    private BufferedWriter psWriter;
+    private BufferedReader psReader;
+
+    private boolean debug;
+
+    private static final String[] ALLOWED_HOTKEYS = { "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14", "F15", "F16", "F17", "F18" };
+    private static final int[] ALLOWED_HOTKEYS_CODE = { NativeKeyEvent.VC_F1, NativeKeyEvent.VC_F2, NativeKeyEvent.VC_F3, NativeKeyEvent.VC_F4, NativeKeyEvent.VC_F5, NativeKeyEvent.VC_F6,
+            NativeKeyEvent.VC_F7, NativeKeyEvent.VC_F8, NativeKeyEvent.VC_F9, NativeKeyEvent.VC_F10, NativeKeyEvent.VC_F11, NativeKeyEvent.VC_F12, NativeKeyEvent.VC_F13, NativeKeyEvent.VC_F14,
+            NativeKeyEvent.VC_F15, NativeKeyEvent.VC_F16, NativeKeyEvent.VC_F17, NativeKeyEvent.VC_F18 };
+
+    // Action
+    enum Action {
+        COPY_TO_CLIPBOARD_AND_PASTE, TYPE_STRING, NOTHING
+    }
+
+    public MobMateWhisp(String remoteUrl) throws FileNotFoundException, NativeHookException {
+        if (MobMateWhisp.ALLOWED_HOTKEYS.length != MobMateWhisp.ALLOWED_HOTKEYS_CODE.length) {
+            throw new IllegalStateException("ALLOWED_HOTKEYS size mismatch");
+        }
+
+        this.prefs = Preferences.userRoot().node("MobMateWhispTalk");
+        this.hotkey = this.prefs.get("hotkey", "F9");
+        this.shiftHotkey = this.prefs.getBoolean("shift-hotkey", false);
+        this.ctrltHotkey = this.prefs.getBoolean("ctrl-hotkey", false);
+        this.model = this.prefs.get("model", "ggml-small.bin");
+
+        GlobalScreen.registerNativeHook();
+        GlobalScreen.addNativeKeyListener(this);
+
+        String laughSetting = loadSetting("laughs", "ワハハハハハ");
+        laughOptions = laughSetting.split(",");
+        // trim
+        for (int i = 0; i < laughOptions.length; i++) {
+            laughOptions[i] = laughOptions[i].trim();
+        }
+
+        // Create audio format
+        float sampleRate = 16000.0F;
+        int sampleSizeInBits = 16;
+        int channels = 1;
+        boolean signed = true;
+        boolean bigEndian = false;
+        this.audioFormat = new AudioFormat(sampleRate, sampleSizeInBits, channels, signed, bigEndian);
+
+        this.remoteUrl = remoteUrl;
+        if (remoteUrl == null) {
+
+            File dir = new File("models");
+            if (!dir.exists()) {
+                dir.mkdirs();
+            }
+            boolean hasModels = false;
+            for (File f : dir.listFiles()) {
+                if (f.getName().endsWith(".bin")) {
+                    hasModels = true;
+                }
+            }
+            if (!hasModels) {
+                JOptionPane.showMessageDialog(null,
+                        "Please download a model (.bin file) from :\nhttps://huggingface.co/ggerganov/whisper.cpp/tree/main\n\n and copy it in :\n" + dir.getAbsolutePath());
+                if (Desktop.isDesktopSupported()) {
+                    final Desktop desktop = Desktop.getDesktop();
+                    if (desktop.isSupported(Desktop.Action.BROWSE)) {
+                        try {
+                            desktop.browse(new URI("https://huggingface.co/ggerganov/whisper.cpp/tree/main"));
+                        } catch (IOException | URISyntaxException e) {
+                            e.printStackTrace();
+                        }
+                    }
+                    if (desktop.isSupported(Desktop.Action.OPEN)) {
+                        try {
+                            desktop.open(dir);
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+                    }
+
+                }
+                System.exit(0);
+            }
+
+            if (!new File(dir, this.model).exists()) {
+                for (File f : dir.listFiles()) {
+                    if (f.getName().endsWith(".bin")) {
+                        this.model = f.getName();
+                        setModelPref(f.getName());
+                        break;
+                    }
+                }
+            }
+
+            this.w = new LocalWhisperCPP(new File(dir, this.model));
+            System.out.println("MobMateWhispTalk using WhisperCPP with " + this.model);
+        } else {
+            System.out.println("MobMateWhispTalk using remote speech to text service : " + remoteUrl);
+        }
+    }
+
+    void createTrayIcon() {
+        this.imageRecording = new ImageIcon(this.getClass().getResource("recording.png")).getImage();
+        this.imageInactive = new ImageIcon(this.getClass().getResource("inactive.png")).getImage();
+        this.imageTranscribing = new ImageIcon(this.getClass().getResource("transcribing.png")).getImage();
+
+        this.trayIcon = new TrayIcon(this.imageInactive, "Press " + this.hotkey + " to record");
+        this.trayIcon.setImageAutoSize(true);
+        final SystemTray tray = SystemTray.getSystemTray();
+        final Frame frame = new Frame("");
+        frame.setUndecorated(true);
+        frame.setType(Type.UTILITY);
+        // Create a pop-up menu components
+        final PopupMenu popup = createPopupMenu();
+        this.trayIcon.setPopupMenu(popup);
+        this.trayIcon.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                if (!e.isPopupTrigger()) {
+                    stopRecording();
+                }
+            }
+
+        });
+        try {
+            frame.setResizable(false);
+            frame.setVisible(true);
+            tray.add(this.trayIcon);
+        } catch (AWTException ex) {
+            System.out.println("TrayIcon could not be added.\n" + ex.getMessage());
+        }
+        trayIcon.addActionListener(e -> bringToFront(window));
+
+    }
+
+    protected PopupMenu createPopupMenu() {
+        final String strAction = this.prefs.get("action", "paste");
+
+        final PopupMenu popup = new PopupMenu();
+
+        CheckboxMenuItem autoPaste = new CheckboxMenuItem("Auto paste");
+        autoPaste.setState(strAction.equals("paste"));
+        popup.add(autoPaste);
+
+        CheckboxMenuItem autoType = new CheckboxMenuItem("Auto type");
+        autoType.setState(strAction.equals("type"));
+        popup.add(autoType);
+
+        final ItemListener typeListener = new ItemListener() {
+
+            @Override
+            public void itemStateChanged(ItemEvent e) {
+                if (e.getSource().equals(autoPaste) && e.getStateChange() == ItemEvent.SELECTED) {
+                    System.out.println("itemStateChanged() PASTE " + e.toString());
+                    MobMateWhisp.this.prefs.put("action", "paste");
+                    autoType.setState(false);
+                } else if (e.getSource().equals(autoType) && e.getStateChange() == ItemEvent.SELECTED) {
+                    System.out.println("itemStateChanged() TYPE " + e.toString());
+                    MobMateWhisp.this.prefs.put("action", "type");
+                    autoPaste.setState(false);
+                } else {
+                    MobMateWhisp.this.prefs.put("action", "nothing");
+                }
+
+                try {
+                    MobMateWhisp.this.prefs.sync();
+                } catch (BackingStoreException e1) {
+                    e1.printStackTrace();
+                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
+                }
+            }
+        };
+        autoPaste.addItemListener(typeListener);
+        autoType.addItemListener(typeListener);
+
+        CheckboxMenuItem detectSilece = new CheckboxMenuItem("Silence detection");
+        detectSilece.setState(this.prefs.getBoolean("silence-detection", false));
+        detectSilece.addItemListener(new ItemListener() {
+
+            @Override
+            public void itemStateChanged(ItemEvent e) {
+                MobMateWhisp.this.prefs.putBoolean("silence-detection", detectSilece.getState());
+                try {
+                    MobMateWhisp.this.prefs.sync();
+                } catch (BackingStoreException e1) {
+                    e1.printStackTrace();
+                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
+                }
+            }
+        });
+        popup.add(detectSilece);
+        Menu hotkeysMenu = new Menu("Keyboard shortcut");
+        // Shift hotkey modifier
+        final CheckboxMenuItem shiftHotkeyMenuItem = new CheckboxMenuItem("SHIFT");
+        shiftHotkeyMenuItem.setState(this.prefs.getBoolean("shift-hotkey", false));
+        hotkeysMenu.add(shiftHotkeyMenuItem);
+        shiftHotkeyMenuItem.addItemListener(new ItemListener() {
+
+            @Override
+            public void itemStateChanged(ItemEvent e) {
+
+                MobMateWhisp.this.shiftHotkey = shiftHotkeyMenuItem.getState();
+                MobMateWhisp.this.prefs.putBoolean("shift-hotkey", MobMateWhisp.this.shiftHotkey);
+                try {
+                    MobMateWhisp.this.prefs.sync();
+                } catch (BackingStoreException e1) {
+                    e1.printStackTrace();
+                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
+                }
+                updateToolTip();
+            }
+        });
+        // Ctrl hotkey modifier
+        final CheckboxMenuItem ctrlHotkeyMenuItem = new CheckboxMenuItem("CTRL");
+        ctrlHotkeyMenuItem.setState(this.prefs.getBoolean("ctrl-hotkey", false));
+        hotkeysMenu.add(ctrlHotkeyMenuItem);
+        ctrlHotkeyMenuItem.addItemListener(new ItemListener() {
+
+            @Override
+            public void itemStateChanged(ItemEvent e) {
+
+                MobMateWhisp.this.ctrltHotkey = ctrlHotkeyMenuItem.getState();
+                MobMateWhisp.this.prefs.putBoolean("ctrl-hotkey", MobMateWhisp.this.ctrltHotkey);
+                try {
+                    MobMateWhisp.this.prefs.sync();
+                } catch (BackingStoreException e1) {
+                    e1.printStackTrace();
+                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
+                }
+                updateToolTip();
+            }
+        });
+        hotkeysMenu.addSeparator();
+        for (final String key : MobMateWhisp.ALLOWED_HOTKEYS) {
+            final CheckboxMenuItem hotkeyMenuItem = new CheckboxMenuItem(key);
+            if (this.hotkey.equals(key)) {
+                hotkeyMenuItem.setState(true);
+            }
+            hotkeysMenu.add(hotkeyMenuItem);
+            hotkeyMenuItem.addItemListener(new ItemListener() {
+
+                @Override
+                public void itemStateChanged(ItemEvent e) {
+                    if (hotkeyMenuItem.getState()) {
+                        MobMateWhisp.this.hotkey = key;
+                        MobMateWhisp.this.prefs.put("hotkey", MobMateWhisp.this.hotkey);
+                        try {
+                            MobMateWhisp.this.prefs.sync();
+                        } catch (BackingStoreException e1) {
+                            e1.printStackTrace();
+                            JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
+                        }
+                        hotkeyMenuItem.setState(false);
+                        updateToolTip();
+
+                    }
+                }
+            });
+        }
+
+        if (this.remoteUrl == null) {
+            Menu modelMenu = new Menu("Models");
+
+            final File dir = new File("models");
+            List<CheckboxMenuItem> allModels = new ArrayList<>();
+            if (new File(dir, this.model).exists()) {
+                for (File f : dir.listFiles()) {
+                    final String name = f.getName();
+                    if (name.endsWith(".bin")) {
+                        final boolean selected = this.model.equals(name);
+                        String cleanName = name.replace(".bin", "");
+                        cleanName = cleanName.replace(".bin", "");
+                        cleanName = cleanName.replace("ggml", "");
+                        cleanName = cleanName.replace("-", " ");
+                        cleanName = cleanName.trim();
+                        final CheckboxMenuItem modelItem = new CheckboxMenuItem(cleanName);
+
+                        modelItem.setState(selected);
+
+                        modelItem.addItemListener(new ItemListener() {
+
+                            @Override
+                            public void itemStateChanged(ItemEvent e) {
+                                if (modelItem.getState()) {
+                                    // Deselected others
+                                    for (CheckboxMenuItem item : allModels) {
+                                        if (item != modelItem) {
+                                            item.setState(false);
+                                        }
+                                    }
+                                    // Apply model
+                                    MobMateWhisp.this.model = f.getName();
+                                    setModelPref(MobMateWhisp.this.model);
+                                    try {
+                                        MobMateWhisp.this.w = new LocalWhisperCPP(f);
+                                    } catch (FileNotFoundException e1) {
+                                        JOptionPane.showMessageDialog(null, e1.getMessage());
+                                        e1.printStackTrace();
+                                    }
+                                }
+                            }
+
+                        });
+                        allModels.add(modelItem);
+                        modelMenu.add(modelItem);
+                    }
+                }
+            }
+
+            popup.add(modelMenu);
+        }
+        popup.add(hotkeysMenu);
+
+        final Menu modeMenu = new Menu("Key trigger mode");
+
+        final CheckboxMenuItem pushToTalkItem = new CheckboxMenuItem("Push to talk");
+        final CheckboxMenuItem pushToTalkDoubleTapItem = new CheckboxMenuItem("Push to talk + double tap");
+        final CheckboxMenuItem startStopItem = new CheckboxMenuItem("Start / Stop");
+
+        String currentMode = this.prefs.get("trigger-mode", PUSH_TO_TALK);
+
+        pushToTalkItem.setState(PUSH_TO_TALK.equals(currentMode));
+        pushToTalkDoubleTapItem.setState(PUSH_TO_TALK_DOUBLE_TAP.equals(currentMode));
+        startStopItem.setState(START_STOP.equals(currentMode));
+
+        if (!pushToTalkItem.getState() && !pushToTalkDoubleTapItem.getState() && !startStopItem.getState()) {
+            pushToTalkItem.setState(true);
+            MobMateWhisp.this.prefs.put("trigger-mode", PUSH_TO_TALK);
+            try {
+                MobMateWhisp.this.prefs.sync();
+            } catch (BackingStoreException ex) {
+                ex.printStackTrace();
+                JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + ex.getMessage());
+            }
+        }
+
+        final ItemListener modeListener = new ItemListener() {
+
+            @Override
+            public void itemStateChanged(ItemEvent e) {
+                CheckboxMenuItem source = (CheckboxMenuItem) e.getSource();
+                if (source == pushToTalkItem && e.getStateChange() == ItemEvent.SELECTED) {
+                    pushToTalkItem.setState(true);
+                    pushToTalkDoubleTapItem.setState(false);
+                    startStopItem.setState(false);
+                    MobMateWhisp.this.prefs.put("trigger-mode", PUSH_TO_TALK);
+                } else if (source == pushToTalkDoubleTapItem && e.getStateChange() == ItemEvent.SELECTED) {
+                    pushToTalkItem.setState(false);
+                    pushToTalkDoubleTapItem.setState(true);
+                    startStopItem.setState(false);
+                    MobMateWhisp.this.prefs.put("trigger-mode", PUSH_TO_TALK_DOUBLE_TAP);
+                } else if (source == startStopItem && e.getStateChange() == ItemEvent.SELECTED) {
+                    pushToTalkItem.setState(false);
+                    pushToTalkDoubleTapItem.setState(false);
+                    startStopItem.setState(true);
+                    MobMateWhisp.this.prefs.put("trigger-mode", START_STOP);
+                } else {
+                    // Default to push to talk
+                    pushToTalkItem.setState(true);
+                    pushToTalkDoubleTapItem.setState(false);
+                    startStopItem.setState(false);
+                    MobMateWhisp.this.prefs.put("trigger-mode", PUSH_TO_TALK);
+                }
+                try {
+                    MobMateWhisp.this.prefs.sync();
+                } catch (BackingStoreException ex) {
+                    ex.printStackTrace();
+                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + ex.getMessage());
+                }
+            }
+        };
+
+        pushToTalkItem.addItemListener(modeListener);
+        pushToTalkDoubleTapItem.addItemListener(modeListener);
+        startStopItem.addItemListener(modeListener);
+
+        modeMenu.add(pushToTalkItem);
+        modeMenu.add(pushToTalkDoubleTapItem);
+        modeMenu.add(startStopItem);
+
+        popup.add(modeMenu);
+        final Menu audioInputsItem = new Menu("Audio inputs");
+        String audioDevice = this.prefs.get("audio.device", "");
+        String previsouAudipDevice = this.prefs.get("audio.device.previous", "");
+        // Get available audio input devices
+
+        List<String> mixers = getInputsMixerNames();
+        if (!mixers.isEmpty()) {
+            String currentAudioDevice = "";
+            if (!audioDevice.isEmpty() && mixers.contains(audioDevice)) {
+                currentAudioDevice = audioDevice;
+            } else if (!previsouAudipDevice.isEmpty() && mixers.contains(previsouAudipDevice)) {
+                currentAudioDevice = previsouAudipDevice;
+            } else {
+                currentAudioDevice = mixers.get(0);
+                this.prefs.put("audio.device", currentAudioDevice);
+                try {
+                    this.prefs.sync();
+                } catch (BackingStoreException e1) {
+                    e1.printStackTrace();
+                }
+            }
+            Collections.sort(mixers);
+            List<CheckboxMenuItem> all = new ArrayList<>();
+            for (String name : mixers) {
+
+                CheckboxMenuItem menuItem = new CheckboxMenuItem(name);
+                if (currentAudioDevice.equals(name)) {
+                    menuItem.setState(true);
+                }
+                audioInputsItem.add(menuItem);
+                all.add(menuItem);
+                // Add action listener to each menu item
+                menuItem.addItemListener(new ItemListener() {
+
+                    @Override
+                    public void itemStateChanged(ItemEvent e) {
+                        if (menuItem.getState()) {
+
+                            for (CheckboxMenuItem m : all) {
+                                final boolean selected = m.getLabel().equals(name);
+                                m.setState(selected);
+
+                            }
+                            // Set preference
+                            MobMateWhisp.this.prefs.put("audio.device.previous", MobMateWhisp.this.prefs.get("audio.device", ""));
+                            MobMateWhisp.this.prefs.put("audio.device", name);
+                            try {
+                                MobMateWhisp.this.prefs.sync();
+                            } catch (BackingStoreException e1) {
+                                e1.printStackTrace();
+                            }
+                        }
+                    }
+                });
+
+            }
+        }
+        popup.add(audioInputsItem);
+
+        Menu audioOutputsItem = new Menu("Audio outputs");
+        String outputDevice = this.prefs.get("audio.output.device", "");
+        String prevOutputDevice = this.prefs.get("audio.output.device.previous", "");
+
+        List<String> outputMixers = getOutputMixerNames();
+        if (!outputMixers.isEmpty()) {
+
+            Collections.sort(outputMixers);
+            List<CheckboxMenuItem> all = new ArrayList<>();
+
+            for (int i = 0; i < outputMixers.size(); i++) {
+                String name = outputMixers.get(i);
+
+                // ① 表示名: "番号: 名前"
+                String displayName = String.format("%02d: %s", i, name);
+
+                CheckboxMenuItem item = new CheckboxMenuItem(displayName);
+
+                // ② 既存の保存名は「名前」なので変換
+                item.setState(outputDevice.equals(name));
+
+                audioOutputsItem.add(item);
+                all.add(item);
+
+                final String mixerName = name; // capture
+
+                item.addItemListener(e -> {
+                    if (item.getState()) {
+                        for (CheckboxMenuItem m : all) {
+                            m.setState(m == item);
+                        }
+
+                        prefs.put("audio.output.device.previous",
+                                prefs.get("audio.output.device", ""));
+                        prefs.put("audio.output.device", mixerName);
+
+                        try {
+                            prefs.sync();
+                        } catch (BackingStoreException ex) {
+                            ex.printStackTrace();
+                        }
+                    }
+                });
+            }
+        }
+        popup.add(audioOutputsItem);
+
+        CheckboxMenuItem openWindowItem = new CheckboxMenuItem("Open Window");
+        openWindowItem.setState(this.prefs.getBoolean("open-window", true));
+        openWindowItem.addItemListener(new ItemListener() {
+            @Override
+            public void itemStateChanged(ItemEvent e) {
+                boolean state = openWindowItem.getState();
+                MobMateWhisp.this.prefs.putBoolean("open-window", state);
+                try {
+                    MobMateWhisp.this.prefs.sync();
+                } catch (BackingStoreException ex) {
+                    ex.printStackTrace();
+                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + ex.getMessage());
+                }
+                if (state) {
+                    if (MobMateWhisp.this.window == null || !MobMateWhisp.this.window.isVisible()) {
+                        MobMateWhisp.this.openWindow();
+                    }
+                    if (MobMateWhisp.this.window != null) {
+                        MobMateWhisp.this.window.toFront();
+                        MobMateWhisp.this.window.requestFocus();
+                    }
+                } else {
+                    if (MobMateWhisp.this.window != null && MobMateWhisp.this.window.isVisible()) {
+                        MobMateWhisp.this.window.setVisible(false);
+                    }
+                }
+
+            }
+        });
+        popup.add(openWindowItem);
+        final MenuItem historyItem = new MenuItem("History");
+
+        popup.add(historyItem);
+
+        popup.addSeparator();
+        MenuItem exitItem = new MenuItem("Exit");
+        popup.add(exitItem);
+        exitItem.addActionListener(new ActionListener() {
+
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                System.exit(0);
+
+            }
+        });
+        historyItem.addActionListener(new ActionListener() {
+
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                showHistory();
+
+            }
+        });
+        return popup;
+    }
+
+    protected void updateToolTip() {
+        String tooltip = "Press ";
+        if (MobMateWhisp.this.shiftHotkey) {
+            tooltip += "Shift + ";
+        }
+        if (MobMateWhisp.this.ctrltHotkey) {
+            tooltip += "Ctrl + ";
+        }
+        tooltip += MobMateWhisp.this.hotkey + " to record";
+        if (this.trayIcon != null) {
+            MobMateWhisp.this.trayIcon.setToolTip(tooltip);
+        }
+        System.out.println(tooltip);
+    }
+
+    private List<String> getInputsMixerNames() {
+        final List<String> names = new ArrayList<>();
+        final Mixer.Info[] mixers = AudioSystem.getMixerInfo();
+
+        for (Mixer.Info mixerInfo : mixers) {
+            final Mixer mixer = AudioSystem.getMixer(mixerInfo);
+            final Line.Info[] targetLines = mixer.getTargetLineInfo();
+            boolean ok = false;
+            for (Line.Info lineInfo : targetLines) {
+                if (lineInfo.getLineClass().getName().contains("TargetDataLine")) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (ok) {
+
+                names.add(mixerInfo.getName());
+            }
+        }
+        return names;
+    }
+
+    private List<String> getOutputMixerNames() {
+        List<String> names = new ArrayList<>();
+        Mixer.Info[] mixers = AudioSystem.getMixerInfo();
+
+        for (Mixer.Info mixerInfo : mixers) {
+            Mixer mixer = AudioSystem.getMixer(mixerInfo);
+            Line.Info[] sourceLines = mixer.getSourceLineInfo();
+
+            for (Line.Info lineInfo : sourceLines) {
+                if (lineInfo.getLineClass().getName().contains("SourceDataLine")) {
+                    names.add(mixerInfo.getName());
+                    break;
+                }
+            }
+        }
+        return names;
+    }
+
+    private TargetDataLine getFirstTargetDataLine() {
+        final Mixer.Info[] mixers = AudioSystem.getMixerInfo();
+        // Return first
+        for (Mixer.Info mixerInfo : mixers) {
+            final Mixer mixer = AudioSystem.getMixer(mixerInfo);
+            final Line.Info[] targetLines = mixer.getTargetLineInfo();
+
+            Line.Info lInfo = null;
+            for (Line.Info lineInfo : targetLines) {
+                if (lineInfo.getLineClass().getName().contains("TargetDataLine")) {
+                    try {
+                        return (TargetDataLine) mixer.getLine(lInfo);
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                }
+            }
+
+        }
+        return null;
+    }
+
+    private TargetDataLine getTargetDataLine(String audioDevice) {
+        if (audioDevice == null || audioDevice.isEmpty()) {
+            return null;
+        }
+        final Mixer.Info[] mixers = AudioSystem.getMixerInfo();
+
+        for (Mixer.Info mixerInfo : mixers) {
+            final Mixer mixer = AudioSystem.getMixer(mixerInfo);
+            final Line.Info[] targetLines = mixer.getTargetLineInfo();
+
+            Line.Info lInfo = null;
+            for (Line.Info lineInfo : targetLines) {
+                if (lineInfo != null && lineInfo.getLineClass().getName().contains("TargetDataLine")) {
+                    lInfo = lineInfo;
+                    if (mixerInfo.getName().equals(audioDevice)) {
+                        try {
+                            return (TargetDataLine) mixer.getLine(lInfo);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+
+    @Override
+    public void nativeKeyPressed(NativeKeyEvent e) {
+        if (this.hotkeyPressed) {
+            return;
+        }
+        int modifier = 0;
+        if (this.shiftHotkey) {
+            modifier += 1;
+        }
+        if (this.ctrltHotkey) {
+            modifier += 2;
+        }
+        if (e.getModifiers() != modifier) {
+            return;
+        }
+        final int length = MobMateWhisp.ALLOWED_HOTKEYS_CODE.length;
+        for (int i = 0; i < length; i++) {
+            if (MobMateWhisp.ALLOWED_HOTKEYS_CODE[i] == e.getKeyCode() && this.hotkey.equals(MobMateWhisp.ALLOWED_HOTKEYS[i])) {
+                this.hotkeyPressed = true;
+
+                SwingUtilities.invokeLater(new Runnable() {
+
+                    @Override
+                    public void run() {
+                        final String strAction = MobMateWhisp.this.prefs.get("action", "paste");
+                        Action action = Action.NOTHING;
+                        if (strAction.equals("paste")) {
+                            action = Action.COPY_TO_CLIPBOARD_AND_PASTE;
+                        } else if (strAction.equals("type")) {
+                            action = Action.TYPE_STRING;
+                        }
+
+                        if (!isRecording()) {
+                            MobMateWhisp.this.recordingStartTime = System.currentTimeMillis();
+                            startRecording(action);
+                        } else {
+                            stopRecording();
+                        }
+                    }
+                });
+                break;
+            }
+        }
+
+    }
+
+    @Override
+    public void nativeKeyReleased(NativeKeyEvent e) {
+        int modifier = 0;
+        if (this.shiftHotkey) {
+            modifier += 1;
+        }
+        if (this.ctrltHotkey) {
+            modifier += 2;
+        }
+        if (e.getModifiers() != modifier) {
+            return;
+        }
+
+        final int length = MobMateWhisp.ALLOWED_HOTKEYS_CODE.length;
+        for (int i = 0; i < length; i++) {
+            if (MobMateWhisp.ALLOWED_HOTKEYS_CODE[i] == e.getKeyCode() && this.hotkey.equals(MobMateWhisp.ALLOWED_HOTKEYS[i])) {
+                this.hotkeyPressed = false;
+
+                SwingUtilities.invokeLater(new Runnable() {
+
+                    @Override
+                    public void run() {
+
+                        String currentMode = MobMateWhisp.this.prefs.get("trigger-mode", PUSH_TO_TALK);
+                        if (currentMode.equals(PUSH_TO_TALK)) {
+                            stopRecording();
+                        } else if (currentMode.equals(PUSH_TO_TALK_DOUBLE_TAP)) {
+                            long delta = System.currentTimeMillis() - MobMateWhisp.this.recordingStartTime;
+                            if (delta > 300) {
+                                stopRecording();
+                            }
+                        }
+                    }
+                });
+                break;
+            }
+        }
+
+    }
+
+    @Override
+    public void nativeKeyTyped(NativeKeyEvent e) {
+        // Not used but required by the interface
+    }
+
+    private void startRecording(Action action) {
+        System.out.println("MobMateWhispTalk.startRecording()" + action);
+        if (isRecording()) {
+            // Prevent multiple recordings
+            return;
+        }
+
+        setRecording(true);
+        try {
+            String audioDevice = this.prefs.get("audio.device", "");
+            String previsouAudipDevice = this.prefs.get("audio.device.previous", "");
+
+            // Create a thread to capture the audio data
+            this.audioService.execute(new Runnable() {
+
+                @Override
+                public void run() {
+                    TargetDataLine targetDataLine;
+                    try {
+                        targetDataLine = getTargetDataLine(audioDevice);
+                        if (targetDataLine == null) {
+                            targetDataLine = getTargetDataLine(previsouAudipDevice);
+                            if (targetDataLine == null) {
+                                targetDataLine = getFirstTargetDataLine();
+                            } else {
+                                System.out.println("Using previous audio device : " + previsouAudipDevice);
+                            }
+                            if (targetDataLine == null) {
+                                JOptionPane.showMessageDialog(null, "Cannot find any input audio device");
+                                setRecording(false);
+                                return;
+                            } else {
+                                System.out.println("Using default audio device");
+                            }
+                        } else {
+                            System.out.println("Using audio device : " + audioDevice);
+                        }
+
+                        final ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+                        try {
+                            targetDataLine.open(MobMateWhisp.this.audioFormat);
+                            targetDataLine.start();
+
+                            setRecording(true);
+
+                            // 0.25s
+                            byte[] data = new byte[3000];
+                            boolean detectSilence = MobMateWhisp.this.prefs.getBoolean("silence-detection", false);
+                            if (detectSilence) {
+                                while (isRecording()) {
+                                    int numBytesRead = targetDataLine.read(data, 0, data.length);
+                                    if (numBytesRead > 0) {
+                                        byteArrayOutputStream.write(data, 0, numBytesRead);
+                                    }
+                                    // === NEW: 強制 periodic flush ===
+                                    // 0.4秒ごとに分割して Whisper に送る
+                                    if (byteArrayOutputStream.size() > 16000 * 3) {
+                                        final byte[] chunk = byteArrayOutputStream.toByteArray();
+                                        byteArrayOutputStream.reset();
+
+                                        executorService.execute(() -> {
+                                            try {
+                                                String partial = transcribe(chunk, action, false);
+
+                                                if (partial != null && !partial.isEmpty()) {
+                                                    // === Real-time update here ===
+                                                    SwingUtilities.invokeLater(() -> {
+//                                                        history.add(partial);
+                                                        fireHistoryChanged();
+                                                        window.setTitle(partial);
+                                                    });
+                                                }
+                                            } catch (IOException e) {
+                                                e.printStackTrace();
+                                            }
+                                        });
+                                    }
+                                    Thread.sleep(10); // 推奨: 3〜10ms
+                                }
+                            } else {
+                                while (isRecording()) {
+                                    int numBytesRead = targetDataLine.read(data, 0, data.length);
+                                    if (numBytesRead > 0) {
+                                        byteArrayOutputStream.write(data, 0, numBytesRead);
+                                    }
+                                }
+                            }
+
+                        } catch (LineUnavailableException e) {
+                            System.out.println("Audio input device not available (used by an other process?)");
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        } finally {
+                            try {
+                                targetDataLine.stop();
+                            } catch (Exception e) {
+                                e.printStackTrace();
+                            }
+                            try {
+                                targetDataLine.close();
+                            } catch (Exception e) {
+                                e.printStackTrace();
+                            }
+                        }
+                        final byte[] audioData = byteArrayOutputStream.toByteArray();
+                        setRecording(false);
+
+                        MobMateWhisp.this.executorService.execute(new Runnable() {
+
+                            @Override
+                            public void run() {
+                                try {
+                                    transcribe(audioData, action, true);
+                                } catch (IOException e) {
+                                    e.printStackTrace();
+                                }
+                            }
+                        });
+
+                    } catch (Exception e) {
+                        e.printStackTrace();
+
+                    }
+                    setRecording(false);
+                    setTranscribing(false);
+
+                }
+            });
+
+        } catch (Exception e) {
+            setRecording(false);
+            e.printStackTrace();
+            JOptionPane.showMessageDialog(null, "Error starting recording: " + e.getMessage());
+        }
+    }
+
+    public String transcribe(byte[] audioData, final Action action, boolean isEndOfCapture) throws IOException {
+        int threshold = loadSettingInt("silence_hard", 100);
+        if (detectSilence(audioData, audioData.length, threshold)) {
+            if (this.debug) {
+                System.out.println("Silence detected");
+            }
+            // ★ 喋り終わってないなら無視
+            if (!isEndOfCapture) return "";
+            return "";
+        }
+        int maxAmp = getMaxAmplitude(audioData);
+        if (maxAmp < threshold + 500) {   // ←閾値。600〜1500推奨
+            if (debug) {
+                System.out.println("Filtered low amplitude segment: " + maxAmp);
+            }
+            return "";
+        }
+        if (audioData.length < MIN_AUDIO_DATA_LENGTH) {
+            byte[] n = new byte[MIN_AUDIO_DATA_LENGTH];
+            System.arraycopy(audioData, 0, n, 0, audioData.length);
+            audioData = n;
+        }
+
+        setTranscribing(true);
+
+        String str;
+        if (MobMateWhisp.this.remoteUrl == null) {
+            str = this.w.transcribeRaw(audioData);
+        } else {
+            // Save the recorded audio to a WAV file for remote
+            String timestamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+            String fileName = timestamp + ".wav";
+            final File out = File.createTempFile("rec_", fileName);
+            try (AudioInputStream audioInputStream = new AudioInputStream(new ByteArrayInputStream(audioData), this.audioFormat, audioData.length / this.audioFormat.getFrameSize())) {
+                AudioSystem.write(audioInputStream, AudioFileFormat.Type.WAVE, out);
+                str = processRemote(out, action);
+            } catch (Exception e) {
+                JOptionPane.showMessageDialog(null, "Error processing record : " + e.getMessage());
+                e.printStackTrace();
+                setTranscribing(false);
+                return "";
+            } finally {
+                if (this.debug) {
+                    System.out.println("Audio record stored in : " + out.getAbsolutePath());
+                } else {
+                    boolean deleted = out.delete();
+                    if (!deleted) {
+                        Logger.getGlobal().warning("cannot delete " + out.getAbsolutePath());
+                    }
+                }
+            }
+        }
+        str = str.replace('\n', ' ');
+        str = str.replace('\r', ' ');
+        str = str.replace('\t', ' ');
+        str = str.trim();
+        // if (str.matches("[A-Za-z& ]+")) return "";
+        // === dedupe ===
+        if (lastOutput != null && lastOutput.equals(str)) {
+            if (debug) System.out.println("Duplicate skipped: " + str);
+            return "";
+        }
+        // === early noise filters ===
+        if (str.matches("^\\[.*\\]$")) {
+            if (debug) System.out.println("Bracket noise skipped: " + str);
+            return "";
+        }
+        // 英字だけの短いやつ（例: AZ, A&G, TEST は OKだが短すぎるものは弾く）
+        if (str.matches("^[A-Za-z0-9& ]{1,12}$")) {
+            // 長さ < 4 は捨てる
+            if (str.length() < 2) {
+                if (debug) System.out.println("Short alpha skipped: " + str);
+                return "";
+            }
+        }
+        lastOutput = str;
+
+        final String suffix = "Thank you.";
+        if (str.endsWith(suffix)) {
+            str = str.substring(0, str.length() - suffix.length());
+        }
+        final String finalStr = str;
+
+        // if (!isEndOfCapture) {
+        //     str += " ";
+        // }
+        // === partial output ===
+        SwingUtilities.invokeLater(() -> {
+            if (action.equals(Action.TYPE_STRING)) {
+                // same
+            } else if (action.equals(Action.COPY_TO_CLIPBOARD_AND_PASTE)) {
+                // same
+            }
+
+            // === NEW: interim immediate output ===
+
+            // === GUI update ===
+            if (finalStr == null || finalStr.trim().isEmpty()) {
+                return;
+            }
+            history.add(finalStr);
+            fireHistoryChanged();
+            window.setTitle(finalStr);
+        });
+
+        SwingUtilities.invokeLater(new Runnable() {
+
+            @Override
+            public void run() {
+                if (action.equals(Action.TYPE_STRING)) {
+                    try {
+                        RobotTyper typer = new RobotTyper();
+                        System.out.println("Typing : " + finalStr);
+                        typer.typeString(finalStr, 11);
+                    } catch (AWTException e) {
+                        e.printStackTrace();
+                    }
+                } else if (action.equals(Action.COPY_TO_CLIPBOARD_AND_PASTE)) {
+                    Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+                    Transferable previous;
+                    try {
+                        previous = clipboard.getContents(null);
+                    } catch (Exception e) {
+                        previous = null;
+                        try {
+                            GlobalScreen.registerNativeHook();
+                        } catch (NativeHookException e1) {
+                            e1.printStackTrace();
+                        }
+                        System.out.println("Warning : cannot get previous clipboard content");
+                    }
+                    final Transferable toPaste = previous;
+                    clipboard.setContents(new StringSelection(finalStr), null);
+                    try {
+                        Robot robot = new Robot();
+                        System.out.println("Pasting : " + finalStr);
+                        robot.keyPress(KeyEvent.VK_CONTROL);
+                        robot.keyPress(KeyEvent.VK_V);
+                        try {
+                            Thread.sleep(20);
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                        robot.keyRelease(KeyEvent.VK_V);
+                        robot.keyRelease(KeyEvent.VK_CONTROL);
+                        System.out.println("Pasting : " + finalStr + " DONE");
+
+                    } catch (AWTException e) {
+                        e.printStackTrace();
+                    }
+                    if (toPaste != null) {
+                        Thread t = new Thread(new Runnable() {
+                            public void run() {
+                                if (toPaste != null) {
+                                    try {
+                                        Thread.sleep(100);
+                                    } catch (InterruptedException e) {
+                                        e.printStackTrace();
+                                    }
+                                    System.out.println("Restoring previous clipboard content");
+                                    clipboard.setContents(toPaste, null);
+
+                                }
+                            }
+                        });
+                        t.start();
+                    }
+
+                }
+                // Invoke later to be sure paste is done
+                SwingUtilities.invokeLater(new Runnable() {
+
+                    @Override
+                    public void run() {
+                        // === LOG APPEND ===
+                        try {
+                            String s = finalStr == null ? "" : finalStr.trim();
+                            if (!s.isEmpty()) {   // ★ 空行ガード追加
+                                Path logFile = Paths.get(System.getProperty("user.dir"), "_outtts.txt");
+                                Files.write(
+                                        logFile,
+                                        (s + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
+                                        StandardOpenOption.CREATE,
+                                        StandardOpenOption.APPEND
+                                );
+                            }
+                        } catch (IOException e) {
+                            e.printStackTrace();
+                        }
+
+                        // === GUI UPDATE: append + autoscroll ===
+                        if (MobMateWhisp.this.window != null) {
+                            SwingUtilities.invokeLater(() -> {
+                                java.awt.Container c = MobMateWhisp.this.window.getContentPane();
+                                if (c instanceof JPanel) {
+                                    // とりあえず単純な方法: title書き換え
+                                    MobMateWhisp.this.window.setTitle(finalStr);
+                                }
+                            });
+                        }
+//                        MobMateWhisp.this.history.add(finalStr);
+                        fireHistoryChanged();
+                    }
+                });
+            }
+        });
+
+        setTranscribing(false);
+        return finalStr;
+
+    }
+
+    protected synchronized void setTranscribing(boolean b) {
+        this.transcribing = b;
+        updateIcon();
+    }
+
+    public synchronized boolean isTranscribing() {
+        return this.transcribing;
+    }
+
+    public synchronized boolean isRecording() {
+        return this.recording;
+    }
+
+    public synchronized void setRecording(boolean b) {
+        this.recording = b;
+        updateIcon();
+    }
+
+    private void updateIcon() {
+        SwingUtilities.invokeLater(new Runnable() {
+
+            @Override
+            public void run() {
+                if (MobMateWhisp.this.window != null) {
+                    if (isRecording()) {
+                        MobMateWhisp.this.button.setText("\uD83D\uDFE2 Stop");
+                        MobMateWhisp.this.label.setText("\uD83C\uDFA4 Recording");
+                    } else {
+                        MobMateWhisp.this.button.setText("\uD83C\uDFA4 Start");
+
+                        if (isTranscribing()) {
+                            MobMateWhisp.this.label.setText("\uD83D\uDD34 Transcribing");
+                        } else {
+                            MobMateWhisp.this.label.setText("\uD83D\uDFE2 Idle");
+                        }
+
+                    }
+                    if (isRecording()) {
+                        MobMateWhisp.this.window.setIconImage(MobMateWhisp.this.imageRecording);
+                    } else {
+                        if (isTranscribing()) {
+                            MobMateWhisp.this.window.setIconImage(MobMateWhisp.this.imageTranscribing);
+                        } else {
+                            MobMateWhisp.this.window.setIconImage(MobMateWhisp.this.imageInactive);
+                        }
+
+                    }
+
+                }
+                if (MobMateWhisp.this.trayIcon != null) {
+                    if (isRecording()) {
+                        MobMateWhisp.this.trayIcon.setImage(MobMateWhisp.this.imageRecording);
+                    } else {
+                        if (isTranscribing()) {
+                            MobMateWhisp.this.trayIcon.setImage(MobMateWhisp.this.imageTranscribing);
+                        } else {
+                            MobMateWhisp.this.trayIcon.setImage(MobMateWhisp.this.imageInactive);
+                        }
+
+                    }
+                }
+
+            }
+        });
+
+    }
+
+    private String processRemote(File out, Action action) throws IOException {
+        long t1 = System.currentTimeMillis();
+        String string = new RemoteWhisperCPP(this.remoteUrl).transcribe(out, 0.0, 0.01);
+        long t2 = System.currentTimeMillis();
+        System.out.println("Response from remote whisper.cpp (" + (t2 - t1) + " ms): " + string);
+        return string.trim();
+
+    }
+
+    private void stopRecording() {
+        if (!this.isRecording()) {
+            return;
+        }
+        setRecording(false);
+    }
+
+    public void setModelPref(String name) {
+
+        this.prefs.put("model", name);
+        try {
+            this.prefs.flush();
+        } catch (BackingStoreException e) {
+            e.printStackTrace();
+            JOptionPane.showMessageDialog(null, "Cannot save preferences");
+        }
+    }
+
+    public void addHistoryListener(ChangeListener l) {
+        this.historyListeners.add(l);
+    }
+
+    public void removeHistoryListener(ChangeListener l) {
+        this.historyListeners.remove(l);
+    }
+
+    public void clearHistory() {
+        if (!SwingUtilities.isEventDispatchThread()) {
+            throw new IllegalAccessError("Must be called from EDT");
+        }
+        this.history.clear();
+        fireHistoryChanged();
+    }
+
+    public void fireHistoryChanged() {
+        for (ChangeListener l : this.historyListeners) {
+            l.stateChanged(new ChangeEvent(this));
+        }
+    }
+
+    public List<String> getHistory() {
+        return this.history;
+    }
+
+    public static void main(String[] args) {
+
+        SwingUtilities.invokeLater(() -> {
+            try {
+                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+            } catch (ClassNotFoundException | InstantiationException | IllegalAccessException | UnsupportedLookAndFeelException e) {
+                e.printStackTrace();
+            }
+            try {
+                Boolean debug = false;
+                String url = null;
+                boolean forceOpenWindow = false;
+                for (int i = 0; i < args.length; i++) {
+                    final String arg = args[i];
+                    if (!arg.startsWith("-D")) {
+
+                        if (arg.startsWith("http")) {
+                            url = arg;
+                        } else if (arg.equals("--window")) {
+                            forceOpenWindow = true;
+                        } else if (arg.equals("--debug")) {
+                            debug = true;
+                        }
+                    }
+                }
+                final MobMateWhisp r = new MobMateWhisp(url);
+                r.debug = debug;
+                r.autoStartVoiceVox();  // ← 追加
+                r.startPsServer();
+
+                boolean openWindow = r.prefs.getBoolean("open-window", true);
+                if (forceOpenWindow) {
+                    openWindow = true;
+                }
+                try {
+                    r.createTrayIcon();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+
+                if (openWindow) {
+                    r.openWindow();
+                }
+
+            } catch (Throwable e) {
+                JOptionPane.showMessageDialog(null, "Error :\n" + e.getMessage());
+                e.printStackTrace();
+            }
+        });
+
+    }
+
+    private void openWindow() {
+        this.window = new JFrame("MobMateWhispTalk");
+        this.window.setIconImage(this.imageInactive);
+        this.window.setFocusable(false);
+        this.window.setFocusableWindowState(false);
+        JPanel p = new JPanel();
+        p.setPreferredSize(new Dimension(350, 30));
+        p.setLayout(new FlowLayout(FlowLayout.RIGHT));
+        p.add(this.label);
+        p.add(this.button);
+
+        final JButton historyButton = new JButton("\uD83D\uDCDC History");
+        p.add(historyButton);
+
+        final JButton prefButton = new JButton("⚙ Prefs");
+        p.add(prefButton);
+        this.window.setContentPane(p);
+        this.label.setText("\uD83D\uDD34 Transcribing..");
+        this.window.pack();
+        this.label.setText("\uD83D\uDFE2 Idle");
+        this.window.setResizable(false);
+        this.window.setVisible(true);
+        this.window.setLocationRelativeTo(null);
+        this.window.setVisible(true);
+        this.window.toFront();
+        this.window.requestFocus();
+        this.window.setLocation(15, 15);
+
+        final PopupMenu popup = createPopupMenu();
+        prefButton.add(popup);
+        this.button.addActionListener(new ActionListener() {
+
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                final String strAction = MobMateWhisp.this.prefs.get("action", "paste");
+                Action action = Action.NOTHING;
+                if (strAction.equals("paste")) {
+                    action = Action.COPY_TO_CLIPBOARD_AND_PASTE;
+                } else if (strAction.equals("type")) {
+                    action = Action.TYPE_STRING;
+                }
+
+                if (!isRecording()) {
+                    MobMateWhisp.this.recordingStartTime = System.currentTimeMillis();
+                    startRecording(action);
+                } else {
+                    stopRecording();
+                }
+
+            }
+        });
+        historyButton.addActionListener(new ActionListener() {
+
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                showHistory();
+            }
+        });
+
+        prefButton.addActionListener(new ActionListener() {
+
+            @Override
+            public void actionPerformed(ActionEvent e) {
+
+                popup.show((Component) e.getSource(), 0, 0);
+
+            }
+        });
+
+        this.window.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowActivated(WindowEvent e) {
+                bringToFront(window);
+            }
+        });
+
+        startTtsWatcher();
+        this.window.setDefaultCloseOperation(WindowConstants.EXIT_ON_CLOSE);
+        this.window.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                if (isRecording()) {
+                    stopRecording();
+                }
+                //TODO PowerShell server stop
+                //stopPsServer();
+
+                System.exit(0);
+            }
+        });
+    }
+    public static void bringToFront(JFrame frame) {
+        SwingUtilities.invokeLater(() -> {
+            frame.setVisible(true);
+            frame.setExtendedState(JFrame.NORMAL);
+
+            frame.setAlwaysOnTop(true);
+            frame.toFront();
+            frame.requestFocus();
+
+            new Timer(50, ev -> {
+                frame.setAlwaysOnTop(false);
+            }).start();
+        });
+    }
+
+    public void showHistory() {
+        if (historyFrame != null && historyFrame.isShowing()) {
+            historyFrame.toFront();
+            historyFrame.requestFocus();
+            return;
+        }
+        historyFrame = new HistoryFrame(MobMateWhisp.this);
+        historyFrame.setSize(300, 400);
+        historyFrame.setLocation(15, 80);
+        historyFrame.setVisible(true);
+    }
+
+    private static boolean detectSilence(byte[] buffer, int bytesRead, int threshold) {
+        int maxAmplitude = 0;
+        // 16-bit audio = 2 bytes per sample
+        for (int i = 0; i < bytesRead; i += 2) {
+            int sample = (buffer[i + 1] << 8) | (buffer[i] & 0xFF);
+            maxAmplitude = Math.max(maxAmplitude, Math.abs(sample));
+        }
+//        System.out.println("max=" + maxAmplitude + " thresh=" + threshold);
+        return maxAmplitude < threshold;
+    }
+
+    private static String loadSetting(String key, String defaultValue) {
+        File f = new File("_outtts.txt");
+        if (!f.exists()) return defaultValue;
+
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.startsWith(key + "=")) {
+                    String v = line.substring((key + "=").length()).trim();
+
+                    // === QUOTE STRIP ===
+                    if ((v.startsWith("\"") && v.endsWith("\"")) ||
+                            (v.startsWith("'") && v.endsWith("'"))) {
+                        v = v.substring(1, v.length() - 1).trim();
+                    }
+
+                    return v;
+                }
+                if (line.startsWith("---")) break;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return defaultValue;
+    }
+    private static int loadSettingInt(String key, int defaultValue) {
+        String v = loadSetting(key, "" + defaultValue);
+        try {
+            return Integer.parseInt(v.trim());
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
+    private static int getMaxAmplitude(byte[] buffer) {
+        int max = 0;
+        for (int i = 0; i < buffer.length; i += 2) {
+            int sample = (buffer[i + 1] << 8) | (buffer[i] & 0xFF);
+            max = Math.max(max, Math.abs(sample));
+        }
+        return max;
+    }
+
+    private void startTtsWatcher() {
+        Thread t = new Thread(() -> {
+            Path watchFile = Paths.get("_outtts.txt");
+            String last = "";
+
+            while (true) {
+                try {
+                    if (!Files.exists(watchFile)) {
+                        Thread.sleep(200);
+                        continue;
+                    }
+
+                    List<String> lines =
+                            Files.readAllLines(watchFile, StandardCharsets.UTF_8);
+
+                    if (lines.isEmpty()) {
+                        Thread.sleep(200);
+                        continue;
+                    }
+
+                    String cur = lines.get(lines.size() - 1).trim();
+
+                    if (!cur.isEmpty() && !cur.equals(last)) {
+                        String finalStr = cur.trim();
+                        if (!finalStr.isEmpty()) {
+                            speak(finalStr);
+                            logToHistory("speak:" + finalStr);
+                        }
+                        last = finalStr;
+                    }
+
+                    Thread.sleep(200);
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+            }
+        });
+
+        t.setDaemon(true);
+        t.start();
+    }
+    private void speakVoiceVox(String text, String speakerId, String base) {
+        try {
+            // 1) audio_query
+            String queryUrl = base + "/audio_query?text=" +
+                    URLEncoder.encode(text, "UTF-8") +
+                    "&speaker=" + speakerId;
+
+            HttpURLConnection q = (HttpURLConnection) new URL(queryUrl).openConnection();
+            q.setRequestMethod("POST");
+            q.setDoOutput(true);
+            q.getOutputStream().write(new byte[0]);
+
+            String queryJson = new String(q.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+
+            // 2) synthesis
+            String synthUrl = base + "/synthesis?speaker=" + speakerId;
+            HttpURLConnection s = (HttpURLConnection) new URL(synthUrl).openConnection();
+            s.setRequestMethod("POST");
+            s.setDoOutput(true);
+            s.setRequestProperty("Content-Type", "application/json");
+            s.getOutputStream().write(queryJson.getBytes(StandardCharsets.UTF_8));
+
+            Path tmp = Files.createTempFile("vv_", ".wav");
+            try (InputStream in = s.getInputStream();
+                 OutputStream out = Files.newOutputStream(tmp, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
+
+                byte[] buf = new byte[4096];
+                int len;
+
+                while ((len = in.read(buf)) != -1) {
+                    out.write(buf, 0, len);
+                }
+            }
+
+//            logToHistory("[VV] saved: " + tmp);;
+            if (!waitForValidWav(tmp.toFile(), 3000)) {
+                logToHistory("[VV] WAV invalid timeout");
+                return;
+            }
+            System.out.println("[VV] saved: " + tmp);
+
+//            playWav(tmp.toFile());
+            playViaPowerShell(tmp.toFile());
+
+            new Thread(() -> {
+                try {
+                    Thread.sleep(3000);
+                    Files.deleteIfExists(tmp);
+                } catch (Exception ignore) {}
+            }).start();
+
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            logToHistory("[VV ERROR] " + ex.getMessage());
+        }
+    }
+//    private void playWav(File f) throws Exception {
+//
+//        String deviceName = prefs.get("audio.output.device", "").trim();
+//        Mixer.Info targetMixerInfo = null;
+//
+//        for (Mixer.Info info : AudioSystem.getMixerInfo()) {
+//            if (info.getName().equals(deviceName)) {
+//                targetMixerInfo = info;
+//                break;
+//            }
+//        }
+//
+//        Mixer mixer = null;
+//        Clip clip = null;
+//
+//        if (targetMixerInfo != null) {
+//            mixer = AudioSystem.getMixer(targetMixerInfo);
+//            mixer.open();
+//            clip = (Clip) mixer.getLine(new Line.Info(Clip.class));
+//            System.out.println("Using mixer: " + targetMixerInfo.getName());
+//        } else {
+//            clip = AudioSystem.getClip();
+//            System.out.println("Using DEFAULT mixer");
+//        }
+//
+//        AudioInputStream ais = AudioSystem.getAudioInputStream(f);
+//
+//        AudioFormat base = ais.getFormat();
+//        AudioFormat decoded = new AudioFormat(
+//                AudioFormat.Encoding.PCM_SIGNED,
+//                base.getSampleRate(),
+//                16,
+//                base.getChannels(),
+//                base.getChannels() * 2,
+//                base.getSampleRate(),
+//                false
+//        );
+//
+//        AudioInputStream dais = AudioSystem.getAudioInputStream(decoded, ais);
+//
+//        clip.open(dais);
+//        clip.start();
+//        clip.drain();
+//
+//        while (clip.isRunning()) {
+//            Thread.sleep(100);
+//        }
+//        System.out.println("[VV] speaked");
+//        clip.close();
+//        dais.close();
+//        ais.close();
+//
+//        if (mixer != null) mixer.close();
+//    }
+    private void speakWindows(String text) {
+        try {
+            Path tmp = Files.createTempFile("win_", ".wav");
+            String wavPath = tmp.toAbsolutePath().toString().replace("\\", "\\\\");
+
+            // PowerShell
+            String ps =
+                    "Add-Type -AssemblyName System.Speech;" +
+                            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;" +
+                            "$s.SetOutputToWaveFile('" + wavPath + "');" +
+                            "$s.Speak('" + text.replace("'", "''") + "');" +
+                            "$s.Dispose();";
+
+            new ProcessBuilder("powershell", "-NoLogo", "-NoProfile", "-Command", ps)
+                    .redirectErrorStream(true)
+                    .start()
+                    .waitFor();
+            if (!waitForValidWav(tmp.toFile(), 3000)) {
+                logToHistory("[WIN] WAV invalid timeout");
+                return;
+            }
+
+//            playWav(tmp.toFile());
+            playViaPowerShell(tmp.toFile());
+
+            new Thread(() -> {
+                try {
+                    Thread.sleep(3000);
+                    Files.deleteIfExists(tmp);
+                } catch (Exception ignore) {}
+            }).start();
+
+        } catch (Exception ex) {
+            ex.printStackTrace();
+            logToHistory("[WIN ERROR] " + ex.getMessage());
+        }
+    }
+//    private void playViaPowerShell(File wavFile) {
+//        try {
+//            String deviceName = prefs.get("audio.output.device", "").trim();
+//            int devIndex = findOutputDeviceIndex(deviceName);
+//            new ProcessBuilder(
+//                    "powershell",
+//                    "-ExecutionPolicy", "Bypass",
+//                    "-File", "PlayWav.ps1",
+//                    "-WavPath", wavFile.getAbsolutePath(),
+//                    "-DeviceNumber", "" + devIndex
+//            ).start();
+//            System.out.println("[VV] playViaPowerShell:" + "PlayWav.ps1_" + wavFile.getAbsolutePath() + "-DeviceNumber" + devIndex);
+//
+//        } catch (Exception ex) {
+//            ex.printStackTrace();
+//        }
+//    }
+    private void playViaPowerShell(File wavFile) {
+        try {
+            startPsServer();
+
+            int devIndex = findOutputDeviceIndex(prefs.get("audio.output.device", ""));
+
+            psWriter.write(
+                    "PLAY \"" + wavFile.getAbsolutePath() + "\" " + devIndex + "\n"
+            );
+            psWriter.flush();
+
+            String resp = psReader.readLine();
+            if (!"DONE".equals(resp)) {
+//                System.out.println("ERR? " + resp);
+            }
+
+        } catch (Exception e) {
+            System.out.println("Pipe dead → restarting...");
+            psProcess = null;
+            try {
+                startPsServer();
+            } catch (Exception e2) {}
+        }
+    }
+    private void playLaughSound(String path) {
+        try {
+            Path base = Paths.get(System.getProperty("user.dir"));
+            Path p = base.resolve(path);
+            File f = p.toFile();
+
+            if (!f.exists()) {
+                System.out.println("NOT FOUND: " + f.getAbsolutePath());
+                return;
+            }
+            playViaPowerShell(f);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+    public void speak(String text) {
+        if (text == null || text.trim().isEmpty()) return;
+
+        text = normalizeLaugh(text);
+        text = w.applyDictionary(text); // Dictorary apply
+
+        if (isVoiceVoxAvailable()) {
+            speakVoiceVox(text, loadSetting("voicevox.speaker", "3"), loadSetting("voicevox.api", ""));
+        } else {
+            speakWindows(text);
+        }
+    }
+    private boolean isVoiceVoxAvailable() {
+        try {
+            URL url = new URL(loadSetting("voicevox.api", "") + "/speakers");
+            logToHistory(url.toString());
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(200);
+            conn.connect();
+            return conn.getResponseCode() == 200;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    private void logToHistory(String msg) {
+        if (debug) {
+            System.out.println(msg);
+            SwingUtilities.invokeLater(() -> {
+                history.add(msg);
+                fireHistoryChanged();
+            });
+        }
+    }
+    private void autoStartVoiceVox() {
+        String vvExe = loadSetting("voicevox.exe", "").trim();
+        if (vvExe.isEmpty()) {
+            System.out.println("VOICEVOX dir not set.");
+            return;
+        }
+        File f = new File(vvExe);
+        if (!f.exists()) {
+            System.out.println("VOICEVOX exe not found: " + vvExe);
+            return;
+        }
+        try {
+            System.out.println("Starting VOICEVOX: " + vvExe);
+
+            ProcessBuilder pb = new ProcessBuilder(
+                    "cmd", "/c", "start", "/min", vvExe
+            );
+            pb.directory(f.getParentFile());
+            pb.start();
+
+            System.out.println("VOICEVOX started.");
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+    }
+    private boolean waitForValidWav(File f, int timeoutMs) {
+        long start = System.currentTimeMillis();
+
+        while (System.currentTimeMillis() - start < timeoutMs) {
+            try (FileInputStream fis = new FileInputStream(f)) {
+                byte[] header = new byte[12];
+                int read = fis.read(header);
+                if (read == 12) {
+                    String riff = new String(header, 0, 4);
+                    String wave = new String(header, 8, 4);
+                    if ("RIFF".equals(riff) && "WAVE".equals(wave)) {
+                        return true;
+                    }
+                }
+            } catch (Exception ignore) {}
+
+            try { Thread.sleep(50); } catch (InterruptedException ignore) {}
+        }
+        return false;
+    }
+    private int findOutputDeviceIndex(String deviceName) {
+        List<String> outputMixers = getOutputMixerNames();
+        for (int i = 0; i < outputMixers.size(); i++) {
+            if (outputMixers.get(i).equals(deviceName)) {
+                return i -1;
+            }
+        }
+        return -1;
+    }
+    public static void testOutputDevices(File f) throws Exception {
+        System.out.println("=== OUTPUT DEVICE TEST ===");
+
+        for (Mixer.Info info : AudioSystem.getMixerInfo()) {
+            try {
+                Mixer mixer = AudioSystem.getMixer(info);
+                Line.Info lineInfo = new Line.Info(Clip.class);
+
+                if (!mixer.isLineSupported(lineInfo)) {
+                    System.out.println("NG  : " + info.getName() + " (Clip not supported)");
+                    continue;
+                }
+
+                System.out.println("TRY : " + info.getName());
+
+                Clip clip = (Clip) mixer.getLine(lineInfo);
+
+                AudioInputStream ais = AudioSystem.getAudioInputStream(f);
+                clip.open(ais);
+                clip.start();
+
+                long t = System.currentTimeMillis();
+                while (clip.isRunning() && System.currentTimeMillis() - t < 2000) {
+                    Thread.sleep(50);
+                }
+
+                clip.close();
+                ais.close();
+
+                System.out.println("OK  : " + info.getName());
+
+            } catch (Exception ex) {
+                System.out.println("ERR : " + info.getName() + " -> " + ex.getMessage());
+            }
+        }
+
+        System.out.println("=== DONE ===");
+    }
+    private void startPsServer() throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+                "powershell",
+                "-NoLogo",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-File", "tts_agent.ps1"
+        );
+        pb.redirectErrorStream(true);
+
+        psProcess = pb.start();
+        psWriter = new BufferedWriter(
+                new OutputStreamWriter(psProcess.getOutputStream(), StandardCharsets.UTF_8)
+        );
+        psReader = new BufferedReader(
+                new InputStreamReader(psProcess.getInputStream(), StandardCharsets.UTF_8)
+        );
+    }
+    private String normalizeLaugh(String s) {
+        if (laughOptions == null || laughOptions.length == 0) {
+            return s;
+        }
+        if (s == null) return s;
+
+        boolean isLaugh =
+                s.contains("（笑）") ||
+                        s.contains("(笑)") ||
+                        s.matches(".*笑+$") ||
+                        s.contains("www") ||
+                        s.contains("L�v") ||
+                        s.contains("草");
+        if (!isLaugh) return s;
+        String pick = laughOptions[rnd.nextInt(laughOptions.length)];
+        if (pick.contains("/") || pick.contains("\\")) {
+            playLaughSound(pick);
+            return pick;
+        } else {
+            return pick;
+        }
+    }
+
+}
