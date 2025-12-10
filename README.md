@@ -1,4 +1,4 @@
-# ![MobMateWhispTalk]([https://github.com/zufall-upon/MobMate/blob/main/logo01.png](https://github.com/zufall-upon/MobMate/releases/tag/release))
+# ![MobMateWhispTalk](https://github.com/zufall-upon/MobMate/releases/tag/release)
 For quiet players who still want to be loud.
 
 
@@ -23,6 +23,9 @@ Whisper.cpp / Java / NAudio を利用しています。
   Visual C++ 2015–2022 (x64) 必須
   
   https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+## 🚀 ダウンロード
+![MobMateWhispTalk](https://github.com/zufall-upon/MobMate/releases/tag/release)
 
 ## 🚀 起動方法
 
