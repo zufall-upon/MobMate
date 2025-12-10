@@ -2,13 +2,15 @@
 For quiet players who still want to be loud.
 
 
-![MobMateWhispTalk](https://raw.githubusercontent.com/zufall-upon/MobMate/refs/heads/main/logo01.png)
-![MobMateWhispTalk](https://raw.githubusercontent.com/zufall-upon/MobMate/refs/heads/main/mov01.gif)
+![MobMateWhispTalk](https://github.com/zufall-upon/MobMate/blob/main/logo01.png)
 
 ローカルで動く音声認識STT＋TTS（匿名発声）ツールです。  
 Whisper.cpp / Java / NAudio を利用しています。  
 ゲームなどのVCで、話している内容をリアルタイムで **匿名発声→音声出力** します。
 短い応答・リアクション専門でのVCコミュニケーションを想定しています。
+
+
+![MobMateWhispTalk](https://raw.githubusercontent.com/zufall-upon/MobMate/refs/heads/main/mov01.gif)
 
 ---
 
