@@ -35,6 +35,9 @@ Whisper.cpp / Java / NAudio を利用しています。
 ### 🔹 Whisperモデルの配置
 
 `models` フォルダに以下を配置してください：
+<ul>
+    <li>ggml-small.bin: <a href="https://huggingface.co/ggerganov/whisper.cpp/tree/main" target="_blank" rel="noopener noreferrer">link</a></li>
+</ul>
 
 
 <img width="466" height="570" alt="tips01" src="https://github.com/user-attachments/assets/1acfed6b-8035-460a-a1ed-f41b400e3532" />
@@ -50,7 +53,15 @@ Whisper.cpp / Java / NAudio を利用しています。
 - Medium：巨大 & 遅い
 - Small：最適バランス（推奨）
 
-- 
+
+## Virtual Audio Setup
+MobMate requires a virtual audio device to send TTS output into games or voice chat.
+
+Recommended tools:
+<ul>
+    <li>VB-Audio Virtual Cable (Windows): <a href="https://vb-audio.com/Cable/" target="_blank" rel="noopener noreferrer">link</a></li>
+    <li>SteelSeries Sonorus Virtual Mixer (Windows): <a href="https://jp.steelseries.com/gg/sonar" target="_blank" rel="noopener noreferrer">link</a> 既定デバイスが毎回変更される方向け</li>
+</ul>
 
 ---
 
@@ -84,6 +95,10 @@ voicevox.speaker=3 // 3 ずんだもん, 26 Whitecal びえん
 - API ポートは 50021（デフォルト）
 
 ※ VOICEVOX は第三者製ツールです **
+
+<ul>
+    <li>VOICEVOX: <a href="https://voicevox.hiroshiba.jp/" target="_blank" rel="noopener noreferrer">link</a> zip版でok</li>
+</ul>
 
 ---
 
