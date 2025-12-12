@@ -1,4 +1,4 @@
-package Whisper;
+package whisper;
 
 import java.awt.AWTException;
 import java.awt.Robot;

@@ -1,4 +1,4 @@
-package Whisper;
+package whisper;
 
 import java.awt.*;
 import java.awt.Window.Type;
@@ -14,11 +14,7 @@ import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.IOException;
+import java.io.*;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.text.SimpleDateFormat;
@@ -36,16 +32,8 @@ import java.nio.file.StandardOpenOption;
 import java.nio.charset.StandardCharsets;
 import javax.sound.sampled.AudioInputStream;
 import javax.sound.sampled.AudioSystem;
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.FileReader;
 import java.net.*;
 import javax.sound.sampled.Clip;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.FileInputStream;
-import java.io.OutputStreamWriter;
-import java.io.InputStreamReader;
 
 import javax.swing.*;
 import javax.sound.sampled.AudioFileFormat;
@@ -64,17 +52,21 @@ import com.github.kwhat.jnativehook.keyboard.NativeKeyEvent;
 import com.github.kwhat.jnativehook.keyboard.NativeKeyListener;
 
 public class MobMateWhisp implements NativeKeyListener {
+    private static PrintWriter LOG;
     static {
         try {
-            // DLL のパス（配布 ZIP の中のフォルダ）
-            Path dll = Paths.get("win32-x86-64", "whisper.dll").toAbsolutePath();
+            File out = new File("_log.txt");
+            LOG = new PrintWriter(new FileWriter(out, true));
+            LOG.println("=== MobMateWhisp Started ===");
+            LOG.flush();
+        } catch (Exception e) {}
+    }
 
-            // ロードする
-            System.load(dll.toString());
-
-            System.out.println("Loaded whisper.dll from: " + dll);
-        } catch (Throwable t) {
-            t.printStackTrace();
+    static private void log(String s) {
+        System.out.println(s);
+        if (LOG != null) {
+            LOG.println(s);
+            LOG.flush();
         }
     }
     private static final int MIN_AUDIO_DATA_LENGTH = (int) (16000 * 2.1);
@@ -142,6 +134,9 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
     public MobMateWhisp(String remoteUrl) throws FileNotFoundException, NativeHookException {
+        // whisper.dll loadcpu/cuda/vulkan
+        loadWhisperNative();
+
         if (MobMateWhisp.ALLOWED_HOTKEYS.length != MobMateWhisp.ALLOWED_HOTKEYS_CODE.length) {
             throw new IllegalStateException("ALLOWED_HOTKEYS size mismatch");
         }
@@ -206,6 +201,22 @@ public class MobMateWhisp implements NativeKeyListener {
                 }
                 System.exit(0);
             }
+            if (!hasVirtualAudioDevice()) {
+                JOptionPane.showMessageDialog(
+                        null,
+                        "Virtual audio device not found.\n" +
+                                "MobMate needs a virtual microphone/cable to send synthesized voice to games.\n\n" +
+                                "Setup guide:\nhttps://github.com/zufall-upon/MobMate#virtual-audio-setup",
+                        "MobMate Setup",
+                        JOptionPane.INFORMATION_MESSAGE
+                );
+
+                if (Desktop.isDesktopSupported()) {
+                    try {
+                        Desktop.getDesktop().browse(new URI("https://github.com/zufall-upon/MobMate#virtual-audio-setup"));
+                    } catch (Exception ex) {}
+                }
+            }
 
             if (!new File(dir, this.model).exists()) {
                 for (File f : dir.listFiles()) {
@@ -218,9 +229,9 @@ public class MobMateWhisp implements NativeKeyListener {
             }
 
             this.w = new LocalWhisperCPP(new File(dir, this.model));
-            System.out.println("MobMateWhispTalk using WhisperCPP with " + this.model);
+            log("MobMateWhispTalk using WhisperCPP with " + this.model);
         } else {
-            System.out.println("MobMateWhispTalk using remote speech to text service : " + remoteUrl);
+            log("MobMateWhispTalk using remote speech to text service : " + remoteUrl);
         }
     }
 
@@ -252,7 +263,7 @@ public class MobMateWhisp implements NativeKeyListener {
             frame.setVisible(true);
             tray.add(this.trayIcon);
         } catch (AWTException ex) {
-            System.out.println("TrayIcon could not be added.\n" + ex.getMessage());
+            log("TrayIcon could not be added.\n" + ex.getMessage());
         }
         trayIcon.addActionListener(e -> bringToFront(window));
 
@@ -276,11 +287,11 @@ public class MobMateWhisp implements NativeKeyListener {
             @Override
             public void itemStateChanged(ItemEvent e) {
                 if (e.getSource().equals(autoPaste) && e.getStateChange() == ItemEvent.SELECTED) {
-                    System.out.println("itemStateChanged() PASTE " + e.toString());
+                    log("itemStateChanged() PASTE " + e.toString());
                     MobMateWhisp.this.prefs.put("action", "paste");
                     autoType.setState(false);
                 } else if (e.getSource().equals(autoType) && e.getStateChange() == ItemEvent.SELECTED) {
-                    System.out.println("itemStateChanged() TYPE " + e.toString());
+                    log("itemStateChanged() TYPE " + e.toString());
                     MobMateWhisp.this.prefs.put("action", "type");
                     autoPaste.setState(false);
                 } else {
@@ -678,7 +689,7 @@ public class MobMateWhisp implements NativeKeyListener {
         if (this.trayIcon != null) {
             MobMateWhisp.this.trayIcon.setToolTip(tooltip);
         }
-        System.out.println(tooltip);
+        log(tooltip);
     }
 
     private List<String> getInputsMixerNames() {
@@ -863,7 +874,7 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
     private void startRecording(Action action) {
-        System.out.println("MobMateWhispTalk.startRecording()" + action);
+        log("MobMateWhispTalk.startRecording()" + action);
         if (isRecording()) {
             // Prevent multiple recordings
             return;
@@ -887,17 +898,17 @@ public class MobMateWhisp implements NativeKeyListener {
                             if (targetDataLine == null) {
                                 targetDataLine = getFirstTargetDataLine();
                             } else {
-                                System.out.println("Using previous audio device : " + previsouAudipDevice);
+                                log("Using previous audio device : " + previsouAudipDevice);
                             }
                             if (targetDataLine == null) {
                                 JOptionPane.showMessageDialog(null, "Cannot find any input audio device");
                                 setRecording(false);
                                 return;
                             } else {
-                                System.out.println("Using default audio device");
+                                log("Using default audio device");
                             }
                         } else {
-                            System.out.println("Using audio device : " + audioDevice);
+                            log("Using audio device : " + audioDevice);
                         }
 
                         final ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
@@ -939,7 +950,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                             }
                                         });
                                     }
-                                    Thread.sleep(10); // 推奨: 3〜10ms
+                                    Thread.sleep(10);
                                 }
                             } else {
                                 while (isRecording()) {
@@ -951,7 +962,7 @@ public class MobMateWhisp implements NativeKeyListener {
                             }
 
                         } catch (LineUnavailableException e) {
-                            System.out.println("Audio input device not available (used by an other process?)");
+                            log("Audio input device not available (used by an other process?)");
                         } catch (Exception e) {
                             e.printStackTrace();
                         } finally {
@@ -1002,7 +1013,7 @@ public class MobMateWhisp implements NativeKeyListener {
         int threshold = loadSettingInt("silence_hard", 100);
         if (detectSilence(audioData, audioData.length, threshold)) {
             if (this.debug) {
-                System.out.println("Silence detected");
+                log("Silence detected");
             }
             // ★ 喋り終わってないなら無視
             if (!isEndOfCapture) return "";
@@ -1011,7 +1022,7 @@ public class MobMateWhisp implements NativeKeyListener {
         int maxAmp = getMaxAmplitude(audioData);
         if (maxAmp < threshold + 500) {   // ←閾値。600〜1500推奨
             if (debug) {
-                System.out.println("Filtered low amplitude segment: " + maxAmp);
+                log("Filtered low amplitude segment: " + maxAmp);
             }
             return "";
         }
@@ -1041,7 +1052,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 return "";
             } finally {
                 if (this.debug) {
-                    System.out.println("Audio record stored in : " + out.getAbsolutePath());
+                    log("Audio record stored in : " + out.getAbsolutePath());
                 } else {
                     boolean deleted = out.delete();
                     if (!deleted) {
@@ -1057,19 +1068,19 @@ public class MobMateWhisp implements NativeKeyListener {
         // if (str.matches("[A-Za-z& ]+")) return "";
         // === dedupe ===
         if (lastOutput != null && lastOutput.equals(str)) {
-            if (debug) System.out.println("Duplicate skipped: " + str);
+            if (debug) log("Duplicate skipped: " + str);
             return "";
         }
         // === early noise filters ===
         if (str.matches("^\\[.*\\]$")) {
-            if (debug) System.out.println("Bracket noise skipped: " + str);
+            if (debug) log("Bracket noise skipped: " + str);
             return "";
         }
         // 英字だけの短いやつ（例: AZ, A&G, TEST は OKだが短すぎるものは弾く）
         if (str.matches("^[A-Za-z0-9& ]{1,12}$")) {
             // 長さ < 4 は捨てる
             if (str.length() < 2) {
-                if (debug) System.out.println("Short alpha skipped: " + str);
+                if (debug) log("Short alpha skipped: " + str);
                 return "";
             }
         }
@@ -1110,7 +1121,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 if (action.equals(Action.TYPE_STRING)) {
                     try {
                         RobotTyper typer = new RobotTyper();
-                        System.out.println("Typing : " + finalStr);
+                        log("Typing : " + finalStr);
                         typer.typeString(finalStr, 11);
                     } catch (AWTException e) {
                         e.printStackTrace();
@@ -1127,13 +1138,13 @@ public class MobMateWhisp implements NativeKeyListener {
                         } catch (NativeHookException e1) {
                             e1.printStackTrace();
                         }
-                        System.out.println("Warning : cannot get previous clipboard content");
+                        log("Warning : cannot get previous clipboard content");
                     }
                     final Transferable toPaste = previous;
                     clipboard.setContents(new StringSelection(finalStr), null);
                     try {
                         Robot robot = new Robot();
-                        System.out.println("Pasting : " + finalStr);
+                        log("Pasting : " + finalStr);
                         robot.keyPress(KeyEvent.VK_CONTROL);
                         robot.keyPress(KeyEvent.VK_V);
                         try {
@@ -1143,7 +1154,7 @@ public class MobMateWhisp implements NativeKeyListener {
                         }
                         robot.keyRelease(KeyEvent.VK_V);
                         robot.keyRelease(KeyEvent.VK_CONTROL);
-                        System.out.println("Pasting : " + finalStr + " DONE");
+                        log("Pasting : " + finalStr + " DONE");
 
                     } catch (AWTException e) {
                         e.printStackTrace();
@@ -1157,7 +1168,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                     } catch (InterruptedException e) {
                                         e.printStackTrace();
                                     }
-                                    System.out.println("Restoring previous clipboard content");
+                                    log("Restoring previous clipboard content");
                                     clipboard.setContents(toPaste, null);
 
                                 }
@@ -1281,7 +1292,7 @@ public class MobMateWhisp implements NativeKeyListener {
         long t1 = System.currentTimeMillis();
         String string = new RemoteWhisperCPP(this.remoteUrl).transcribe(out, 0.0, 0.01);
         long t2 = System.currentTimeMillis();
-        System.out.println("Response from remote whisper.cpp (" + (t2 - t1) + " ms): " + string);
+        log("Response from remote whisper.cpp (" + (t2 - t1) + " ms): " + string);
         return string.trim();
 
     }
@@ -1507,7 +1518,7 @@ public class MobMateWhisp implements NativeKeyListener {
             int sample = (buffer[i + 1] << 8) | (buffer[i] & 0xFF);
             maxAmplitude = Math.max(maxAmplitude, Math.abs(sample));
         }
-//        System.out.println("max=" + maxAmplitude + " thresh=" + threshold);
+//        log("max=" + maxAmplitude + " thresh=" + threshold);
         return maxAmplitude < threshold;
     }
 
@@ -1633,7 +1644,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 logToHistory("[VV] WAV invalid timeout");
                 return;
             }
-            System.out.println("[VV] saved: " + tmp);
+            log("[VV] saved: " + tmp);
 
 //            playWav(tmp.toFile());
             playViaPowerShell(tmp.toFile());
@@ -1669,10 +1680,10 @@ public class MobMateWhisp implements NativeKeyListener {
 //            mixer = AudioSystem.getMixer(targetMixerInfo);
 //            mixer.open();
 //            clip = (Clip) mixer.getLine(new Line.Info(Clip.class));
-//            System.out.println("Using mixer: " + targetMixerInfo.getName());
+//            log("Using mixer: " + targetMixerInfo.getName());
 //        } else {
 //            clip = AudioSystem.getClip();
-//            System.out.println("Using DEFAULT mixer");
+//            log("Using DEFAULT mixer");
 //        }
 //
 //        AudioInputStream ais = AudioSystem.getAudioInputStream(f);
@@ -1697,7 +1708,7 @@ public class MobMateWhisp implements NativeKeyListener {
 //        while (clip.isRunning()) {
 //            Thread.sleep(100);
 //        }
-//        System.out.println("[VV] speaked");
+//        log("[VV] speaked");
 //        clip.close();
 //        dais.close();
 //        ais.close();
@@ -1752,7 +1763,7 @@ public class MobMateWhisp implements NativeKeyListener {
 //                    "-WavPath", wavFile.getAbsolutePath(),
 //                    "-DeviceNumber", "" + devIndex
 //            ).start();
-//            System.out.println("[VV] playViaPowerShell:" + "PlayWav.ps1_" + wavFile.getAbsolutePath() + "-DeviceNumber" + devIndex);
+//            log("[VV] playViaPowerShell:" + "PlayWav.ps1_" + wavFile.getAbsolutePath() + "-DeviceNumber" + devIndex);
 //
 //        } catch (Exception ex) {
 //            ex.printStackTrace();
@@ -1771,11 +1782,11 @@ public class MobMateWhisp implements NativeKeyListener {
 
             String resp = psReader.readLine();
             if (!"DONE".equals(resp)) {
-//                System.out.println("ERR? " + resp);
+//                log("ERR? " + resp);
             }
 
         } catch (Exception e) {
-            System.out.println("Pipe dead → restarting...");
+            log("Pipe dead → restarting...");
             psProcess = null;
             try {
                 startPsServer();
@@ -1789,7 +1800,7 @@ public class MobMateWhisp implements NativeKeyListener {
             File f = p.toFile();
 
             if (!f.exists()) {
-                System.out.println("NOT FOUND: " + f.getAbsolutePath());
+                log("NOT FOUND: " + f.getAbsolutePath());
                 return;
             }
             playViaPowerShell(f);
@@ -1823,7 +1834,7 @@ public class MobMateWhisp implements NativeKeyListener {
     }
     private void logToHistory(String msg) {
         if (debug) {
-            System.out.println(msg);
+            log(msg);
             SwingUtilities.invokeLater(() -> {
                 history.add(msg);
                 fireHistoryChanged();
@@ -1833,16 +1844,16 @@ public class MobMateWhisp implements NativeKeyListener {
     private void autoStartVoiceVox() {
         String vvExe = loadSetting("voicevox.exe", "").trim();
         if (vvExe.isEmpty()) {
-            System.out.println("VOICEVOX dir not set.");
+            log("VOICEVOX dir not set.");
             return;
         }
         File f = new File(vvExe);
         if (!f.exists()) {
-            System.out.println("VOICEVOX exe not found: " + vvExe);
+            log("VOICEVOX exe not found: " + vvExe);
             return;
         }
         try {
-            System.out.println("Starting VOICEVOX: " + vvExe);
+            log("Starting VOICEVOX: " + vvExe);
 
             ProcessBuilder pb = new ProcessBuilder(
                     "cmd", "/c", "start", "/min", vvExe
@@ -1850,7 +1861,7 @@ public class MobMateWhisp implements NativeKeyListener {
             pb.directory(f.getParentFile());
             pb.start();
 
-            System.out.println("VOICEVOX started.");
+            log("VOICEVOX started.");
         } catch (Exception ex) {
             ex.printStackTrace();
         }
@@ -1885,7 +1896,7 @@ public class MobMateWhisp implements NativeKeyListener {
         return -1;
     }
     public static void testOutputDevices(File f) throws Exception {
-        System.out.println("=== OUTPUT DEVICE TEST ===");
+        log("=== OUTPUT DEVICE TEST ===");
 
         for (Mixer.Info info : AudioSystem.getMixerInfo()) {
             try {
@@ -1893,11 +1904,11 @@ public class MobMateWhisp implements NativeKeyListener {
                 Line.Info lineInfo = new Line.Info(Clip.class);
 
                 if (!mixer.isLineSupported(lineInfo)) {
-                    System.out.println("NG  : " + info.getName() + " (Clip not supported)");
+                    log("NG  : " + info.getName() + " (Clip not supported)");
                     continue;
                 }
 
-                System.out.println("TRY : " + info.getName());
+                log("TRY : " + info.getName());
 
                 Clip clip = (Clip) mixer.getLine(lineInfo);
 
@@ -1913,14 +1924,14 @@ public class MobMateWhisp implements NativeKeyListener {
                 clip.close();
                 ais.close();
 
-                System.out.println("OK  : " + info.getName());
+                log("OK  : " + info.getName());
 
             } catch (Exception ex) {
-                System.out.println("ERR : " + info.getName() + " -> " + ex.getMessage());
+                log("ERR : " + info.getName() + " -> " + ex.getMessage());
             }
         }
 
-        System.out.println("=== DONE ===");
+        log("=== DONE ===");
     }
     private void startPsServer() throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
@@ -1961,6 +1972,154 @@ public class MobMateWhisp implements NativeKeyListener {
         } else {
             return pick;
         }
+    }
+    boolean hasVirtualAudioDevice() {
+        Mixer.Info[] mixers = AudioSystem.getMixerInfo();
+        for (Mixer.Info info : mixers) {
+            String name = info.getName().toLowerCase();
+            if (name.contains("virtual") || name.contains("sonar")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void loadWhisperNative() {
+        File exeDir = getExeDir();
+        File libsDir = new File(exeDir, "libs");
+        log("ExeDir = " + exeDir);
+        log("LibsDir = " + libsDir);
+        log("=== MobMateWhisp Started ===");
+        Backend[] backends = new Backend[]{
+                new Backend("CUDA", new File(libsDir, "cuda"),
+                        new String[]{
+                                "ggml-cuda.dll",
+                                "ggml-base.dll",
+                                "ggml-cpu.dll",
+                                "ggml.dll",
+                                "cudart64_110.dll"
+                        },
+                        "whisper.dll"
+                ),
+                new Backend("Vulkan", new File(libsDir, "vulkan"),
+                        new String[]{
+                                "ggml-vulkan.dll",
+                                "ggml-base.dll",
+                                "ggml-cpu.dll",
+                                "ggml.dll",
+                                "vulkan-1.dll",
+                        },
+                        "whisper.dll"
+                ),
+                new Backend("CPU", new File(libsDir, "cpu"),
+                        new String[]{
+                                "ggml-base.dll",
+                                "ggml-cpu.dll",
+                                "ggml.dll"
+                        },
+                        "whisper.dll"
+                )
+        };
+        for (Backend b : backends) {
+            log("Checking backend: " + b.name + " in " + b.dir);
+            if (!b.dir.exists()) {
+                log(" → Directory does not exist, skipping.");
+                continue;
+            }
+            log("Copying backend DLLs to exe folder...");
+            List<File> copied = copyDllsToExeDir(b, exeDir);
+            try{ Thread.sleep(300); } catch (Exception e) {}
+            log("Trying to load backend: " + b.name);
+            if (safeLoad(b.dir + File.separator + b.mainDll)) {
+                System.out.println("Loaded " + b.name + " backend successfully.");
+                return;
+            }
+        }
+        JOptionPane.showMessageDialog(
+                null,
+                "Cannot load Whisper backend.\n\n" +
+                        "MobMate requires CPU / CUDA / Vulkan backend files.\n" +
+                        "libsDir = " + libsDir,
+                "MobMate Error",
+                JOptionPane.ERROR_MESSAGE
+        );
+
+        Runtime.getRuntime().halt(1);
+    }
+    private File getExeDir() {
+        try {
+            String path = MobMateWhisp.class
+                    .getProtectionDomain()
+                    .getCodeSource()
+                    .getLocation()
+                    .toURI()
+                    .getPath();
+            File f = new File(path);
+            if (f.getName().toLowerCase().endsWith(".exe")) {
+                return f.getParentFile();
+            }
+            if (f.getName().toLowerCase().endsWith(".jar")) {
+                return f.getParentFile();
+            }
+            return new File(System.getProperty("user.dir"));
+        } catch (Exception e) {
+            return new File(System.getProperty("user.dir"));
+        }
+    }
+    // Backend データ構造
+    static class Backend {
+        String name;
+        File dir;
+        String[] deps;
+        String mainDll;
+
+        Backend(String name, File dir, String[] deps, String mainDll) {
+            this.name = name;
+            this.dir = dir;
+            this.deps = deps;
+            this.mainDll = mainDll;
+        }
+    }
+    private boolean safeLoad(String path) {
+        File f = new File(path);
+        log("safeLoad: " + path);
+        if (!f.exists()) return false;
+        try {
+            System.load(f.getAbsolutePath());
+            return true;
+        } catch (UnsatisfiedLinkError e) {
+            log("Failed to load: " + path + " (" + e.getMessage() + ")");
+            return false;
+        }
+    }private List<File> copyDllsToExeDir(Backend b, File exeDir) {
+        List<File> copied = new ArrayList<>();
+        for (String dep : b.deps) {
+            File src = new File(b.dir, dep);
+            File dst = new File(exeDir, dep);
+
+            if (dst.exists()) dst.delete();
+
+            if (src.exists()) {
+                try {
+                    Files.copy(src.toPath(), dst.toPath());
+//                    log("Copied: " + src + " → " + dst);
+                    copied.add(dst);
+                } catch (Exception e) {
+                    log("Copy failed: " + e.getMessage());
+                }
+            }
+        }
+        File mainSrc = new File(b.dir, b.mainDll);
+        File mainDst = new File(exeDir, b.mainDll);
+        if (mainDst.exists()) mainDst.delete();
+        try {
+            Files.copy(mainSrc.toPath(), mainDst.toPath());
+//            log("Copied main DLL: " + mainDst);
+            copied.add(mainDst);
+        } catch (Exception e) {
+            log("Copy failed: " + e.getMessage());
+        }
+        return copied;
     }
 
 }

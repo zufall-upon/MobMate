@@ -1,10 +1,6 @@
-package Whisper;
+package whisper;
 
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.IOException;
-import java.io.BufferedReader;
-import java.io.FileReader;
+import java.io.*;
 import java.util.*;
 
 import javax.sound.sampled.AudioInputStream;
@@ -17,6 +13,24 @@ import io.github.ggerganov.whispercpp.params.WhisperFullParams;
 import io.github.ggerganov.whispercpp.params.WhisperSamplingStrategy;
 
 public class LocalWhisperCPP {
+
+    private static PrintWriter LOG;
+    static {
+        try {
+            File out = new File("_log.txt");
+            LOG = new PrintWriter(new FileWriter(out, true));
+            LOG.println("=== MobMateWhisp Started ===");
+            LOG.flush();
+        } catch (Exception e) {}
+    }
+
+    static private void log(String s) {
+        System.out.println(s);
+        if (LOG != null) {
+            LOG.println(s);
+            LOG.flush();
+        }
+    }
 
     private String language;
     private String initialPrompt;
@@ -41,7 +55,7 @@ public class LocalWhisperCPP {
         float[] floats = new float[b.length / 2];
 
         WhisperFullParams params = whisper.getFullDefaultParams(WhisperSamplingStrategy.WHISPER_SAMPLING_BEAM_SEARCH);
-        params.setProgressCallback((ctx, state, progress, user_data) -> System.out.println("progress: " + progress));
+        params.setProgressCallback((ctx, state, progress, user_data) -> log("progress: " + progress));
         params.print_progress = CBool.FALSE;
         params.language = this.language;
         params.initial_prompt = initialPrompt;
@@ -61,10 +75,9 @@ public class LocalWhisperCPP {
 
             // === Post-filter ignore words ===
             List<String> ignoreWords = loadIgnoreWords();
-
             for (String w : ignoreWords) {
                 if (result.contains(w)) {
-                    if (true) System.out.println("Ignored by word filter: " + w);
+                    if (true) log("Ignored by word filter: " + w);
                     return "";
                 }
             }
@@ -85,7 +98,7 @@ public class LocalWhisperCPP {
         }
 
         WhisperFullParams params = whisper.getFullDefaultParams(WhisperSamplingStrategy.WHISPER_SAMPLING_GREEDY);
-//        params.setProgressCallback((ctx, state, progress, user_data) -> System.out.println("progress: " + progress));
+//        params.setProgressCallback((ctx, state, progress, user_data) -> log("progress: " + progress));
         params.print_progress = CBool.FALSE;
         params.language = this.language;
         params.initial_prompt = initialPrompt;
@@ -98,13 +111,13 @@ public class LocalWhisperCPP {
         // ---- transcribe ----
         String raw = whisper.fullTranscribe(params, floats);
 //        raw = filterLowConfidenceTokens(raw);
-//        System.out.println("(raw): " + whisper.fullTranscribeWithTime(params, floats));
+//        log("(raw): " + whisper.fullTranscribeWithTime(params, floats));
 
         // === Post-filter ignore words ===
         List<String> ignoreWords = loadIgnoreWords();
         for (String w : ignoreWords) {
             if (!w.isEmpty() && raw.contains(w)) {
-//                System.out.println("Ignored by word filter(raw): " + w);
+//                log("Ignored by word filter(raw): " + w);
                 return "";
             }
         }
@@ -112,14 +125,14 @@ public class LocalWhisperCPP {
     }
 
     public static void main(String[] args) throws Exception {
-        System.out.println("-1");
+        log("-1");
         LocalWhisperCPP w = new LocalWhisperCPP(new File("models", "ggml-small.bin"));
-        System.out.println("-");
+        log("-");
         w.transcribe(new File("jfk.wav"));
         long t1 = System.currentTimeMillis();
         w.transcribe(new File("jfk.wav"));
         long t2 = System.currentTimeMillis();
-        System.out.println("LocalWhisperCPP.main() " + (t2 - t1) + " ms");
+        log("LocalWhisperCPP.main() " + (t2 - t1) + " ms");
     }
 
     private static String loadSetting(String key, String defaultValue) {
