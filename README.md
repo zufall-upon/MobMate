@@ -1,193 +1,361 @@
 # ![MobMateWhispTalk](https://github.com/zufall-upon/MobMate/releases/tag/release)
-For quiet players who still want to be loud.
-
+**For quiet players who still want to be loud.**
 
 ![MobMateWhispTalk](https://github.com/zufall-upon/MobMate/blob/main/logo01.png)
 
-ローカルで動く音声認識STT＋TTS（匿名発声）ツールです。  
-Whisper.cpp / Java / NAudio を利用しています。  
-ゲームなどのVCで、話している内容をリアルタイムで **匿名発声→音声出力** します。
+ローカルで動作する **STT + TTS（匿名発声）ツール** です。  
+This is a **local-only speech-to-text + text-to-speech (anonymous voice)** tool.
 
-短い応答・リアクション専門でのVCコミュニケーションを想定しています。
+Whisper.cpp / Java / NAudio を使用しています。  
+Built with Whisper.cpp / Java / NAudio.
 
+ゲームなどのVCで、話した内容をリアルタイムに  
+**匿名音声として再発声**します。  
+It converts your voice into **anonymous synthesized speech** in real time for voice chats (VC).
+
+短いリアクション・応答向けのVC利用を想定しています。  
+Designed mainly for **short reactions and quick responses**.
 
 ![MobMateWhispTalk](https://raw.githubusercontent.com/zufall-upon/MobMate/refs/heads/main/mov01.gif)
 
----
+## 💡 Why MobMate / コンセプト
 
-## 🟢 動作環境
+### 🇯🇵 日本語
 
-- Windows 10 / 11（64bit）
-  🧩 必要環境
-  
-  Visual C++ 2015–2022 (x64) 必須
-  
-  https://aka.ms/vs/17/release/vc_redist.x64.exe
+MobMate は、**完全ローカルで動作する音声認識（STT）＋音声合成（TTS）による匿名発声ツール**です。  
+Whisper.cpp / Java / NAudio を利用し、ボイスチャット上の音声をリアルタイムに  
+**「音声 → テキスト → 別の声で再発声」** します。
 
-## 🚀 ダウンロード
-![MobMateWhispTalk](https://github.com/zufall-upon/MobMate/releases/tag/release)
+リアルタイム配信における「コメント読み上げ」のような仕組みを、  
+**ゲーム内ボイスチャット（VC）向けに再構成**したツールです。
 
-## 🚀 起動方法
+ゲームなどのVC上で、自分の声の特徴（声質・年齢・性別など）を直接出さずに、  
+テキストを合成音声として流すことができます。
 
-1. zip を展開
-2. `_run.bat` をダブルクリック
+たとえば以下のような用途を想定しています：
 
-### 🔹 Whisperモデルの配置
+- 「了解」「待って」「敵いた」などの短い指示
+- 笑い声などの軽いリアクション
+- VCに積極的に参加しづらい状況での意思表示
 
-`models` フォルダに以下を配置してください：
-<ul>
-    <li>ggml-small.bin: <a href="https://huggingface.co/ggerganov/whisper.cpp/tree/main" target="_blank" rel="noopener noreferrer">link</a></li>
-</ul>
-
-
-👉 **推奨モデル： `ggml-small.bin`**
-
-- Tiny：精度不足
-- Medium：巨大 & 遅い
-- Small：最適バランス（推奨）
-
-
-## Virtual Audio Setup
-MobMate requires a virtual audio device to send TTS output into games or voice chat.
-
-Recommended tools:
-<ul>
-    <li>VB-Audio Virtual Cable (Windows): <a href="https://vb-audio.com/Cable/" target="_blank" rel="noopener noreferrer">link</a></li>
-    <li>SteelSeries Sonorus Virtual Mixer (Windows): <a href="https://jp.steelseries.com/gg/sonar" target="_blank" rel="noopener noreferrer">link</a> 既定デバイスが毎回変更される方向け</li>
-</ul>
+話すことにハードルを感じる理由があっても、  
+**コミュニケーションそのものを諦めなくていい**。  
+MobMate は、そんな「聞き専寄り」の人のための  
+**汎用・擬似ラジオチャットツール**です。
 
 ---
 
-## 🎤 基本的な使い方
+### 🇺🇸 English
 
-- Prefsボタンから設定を行ってください。お勧め設定は以下。
-    - AutoPaste off
-    - Auto type off
-    - Slience detection ON!
-    - Key trigger mode → start/ stop
-    - Audio Inputs → ご使用のマイクを指定
-    - Audio outputs → ↑とは違う仮想マイクを指定。 VBAudio Cable等。SteelSeries Sonarでテストしています。
-- ホットキー（初期 F9）または「Start」ボタンで録音開始
-- 音声認識 → テキストから音声発声。
-- `_outtts.txt` の末尾に認識結果が追記される
-- その最新行を監視して TTS を再生します
+MobMate is a **fully local Speech-to-Text (STT) and Text-to-Speech (TTS) tool** designed for anonymous voice output.  
+Using Whisper.cpp, Java, and NAudio, it converts your voice in real time from  
+**speech → text → synthesized anonymous voice**.
+
+You can think of it as a *live comment reader*—  
+but reimagined for **in-game voice chat**.
+
+Instead of transmitting your raw voice, MobMate outputs synthesized speech,  
+allowing you to communicate without revealing your natural voice characteristics  
+(such as tone, age, or gender).
+
+Typical use cases include:
+
+- Short commands like “OK”, “Wait”, or “Enemy spotted”
+- Simple reactions such as laughter
+- Participating in VC when speaking directly feels difficult
+
+Even if you have reasons to stay quiet,  
+**you shouldn’t have to give up communicating altogether**.
+
+MobMate is designed as a  
+**general-purpose pseudo radio-style chat tool**  
+for players who usually just listen—but still want to be heard.
 
 ---
 
-## 🔊 匿名発声（TTS）について
+### 🧩 Features at a glance / 主な特徴
 
-VOICEVOX と連携できます（任意）。
-```
+#### 🇯🇵 日本語
+- **完全ローカル動作**（クラウド送信なし・Ping安定）
+- **Whisper.cpp による音声認識（STT）**
+- **VOICEVOX API 連携による TTS（匿名発声）** に対応（任意）
+- **短い応答・リアクション専用**の VC コミュニケーションを想定
+
+#### 🇺🇸 English
+- **Fully local execution** (no cloud, stable ping)
+- **Speech recognition powered by Whisper.cpp (STT)**
+- **Optional TTS via VOICEVOX API** (anonymous voice output)
+- Designed for **short responses and quick reactions** in voice chat
+
+---
+
+## 🟢 動作環境 / System Requirements
+
+- Windows 10 / 11 (64bit)
+
+### 🧩 必須ランタイム / Required Runtime
+Visual C++ 2015–2022 (x64)
+
+https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+---
+
+## 🚀 ダウンロード / Download
+https://github.com/zufall-upon/MobMate/releases/tag/release
+
+---
+
+## 🚀 起動方法 / How to Run
+
+1. zip を展開  
+   Extract the zip file
+2. `_run.bat` をダブルクリック  
+   Double-click `_run.bat`
+
+---
+
+## 🔹 Whisperモデルの配置 / Whisper Model Setup
+
+`models` フォルダに以下を配置してください：  
+Place the model file inside the `models` folder:
+
+- `ggml-small.bin`  
+  https://huggingface.co/ggerganov/whisper.cpp/tree/main
+
+### 👉 推奨モデル / Recommended Model
+`ggml-small.bin`
+
+- Tiny：精度不足 / Low accuracy  
+- Medium：巨大 & 遅い / Too large & slow  
+- Small：最適バランス / Best balance ⭐
+
+---
+
+## 🎧 Virtual Audio Setup / 仮想オーディオ設定
+
+MobMate requires a **virtual audio device** to route TTS output into games or voice chat software.  
+MobMate は、TTS の音声をゲームやボイスチャットに送るために  
+**仮想オーディオデバイス**が必要です。
+
+---
+
+### Recommended tools / 推奨ツール
+
+- **VB-Audio Virtual Cable (Windows)**  
+  https://vb-audio.com/Cable/  
+
+  Simple and lightweight virtual audio cable.  
+  シンプルで軽量な定番の仮想オーディオケーブルです。
+
+- **SteelSeries Sonar (Windows)**  
+  https://jp.steelseries.com/gg/sonar  
+
+  Useful if Windows keeps changing the default audio device.  
+  Windows が毎回既定のオーディオデバイスを変更してしまう場合に便利です。
+
+  ※ Recommended for users who struggle with unstable default device switching  
+  ※ 既定デバイスが勝手に変わる環境の方向け
+
+---
+
+### Setup concept / 設定の考え方
+- **Audio Input**: Your physical microphone  
+  入力：実際に話すマイク
+- **Audio Output**: Virtual audio device  
+  出力：仮想オーディオデバイス
+- Configure your game or voice chat app to use the virtual device as its microphone  
+  ゲームや VC 側では、その仮想デバイスをマイクとして設定します
+
+---
+
+## 🎤 Basic Usage / 基本的な使い方
+
+### Initial setup / 初期設定
+Open the **Prefs** button and configure the following recommended settings.  
+**Prefs ボタンから以下の推奨設定を行ってください。**
+
+**Recommended settings / 推奨設定**
+- **AutoPaste**: OFF  
+  自動貼り付けを無効にします
+- **Auto type**: OFF  
+  自動入力を無効にします
+- **Silence detection**: ON  
+  無音検出を有効にします
+- **Key trigger mode**: Start / Stop  
+  キーで録音の開始・停止を切り替えます
+- **Audio Inputs**: Select your physical microphone  
+  使用するマイクを指定してください
+- **Audio Outputs**: Select a virtual audio device  
+  別の仮想マイクを指定します  
+  （VB-Audio Virtual Cable や SteelSeries Sonar で動作確認済み）
+
+---
+
+### How to use / 使い方
+- Press the hotkey (**Default: F9**) or click **Start** to begin recording  
+  ホットキー（初期設定：F9）または「Start」ボタンで録音を開始します
+- Your voice is transcribed (STT) and converted into speech (TTS)  
+  音声が認識され、テキスト化された後に音声として再生されます
+- Recognition results are appended to the end of `_outtts.txt`  
+  認識結果は `_outtts.txt` の末尾に追記されます
+- The program monitors the latest line and plays it via TTS  
+  ファイルの最新行を監視し、その内容を TTS で再生します
+
+---
+
+### Notes / 補足
+- Designed for **short reactions and quick voice responses**  
+  短いリアクションや即時発声向けに設計されています
+
+---
+
+## 🔊 匿名発声（TTS） / Anonymous TTS
+
+MobMate can optionally integrate with **VOICEVOX** for text-to-speech output.  
+MobMate は **VOICEVOX** と連携して匿名発声（TTS）を行うことができます（任意）。
+
+---
+
+### VOICEVOX Integration / VOICEVOX 連携
+
+```ini
 voicevox.exe="M:\VOICEVOX\VOICEVOX.exe"
 voicevox.api="http://127.0.0.1:50021"
-voicevox.speaker=3 // 3 ずんだもん, 26 Whitecal びえん
+voicevox.speaker=3
+laughs=HAHAHAHA,hehe,laughsounds/laughter_lady01.wav
+initial_prompt=This is an in-game radio communication. Speak briefly and clearly. Do not output subtitles, background music, sound effects, or emoticons. Laughter is allowed. Focus only on spoken content. Common words include "roger", "enemy", "ally", "help".
 ```
 
-- VOICEVOX を起動するだけで自動認識します（voicevox.exeに有効なパスがあればプログラム起動時に同時起動します）
-- speaker は話者ID（検索して調べてください）
-- API ポートは 50021（デフォルト）
-
-※ VOICEVOX は第三者製ツールです **
-
-<ul>
-    <li>VOICEVOX: <a href="https://voicevox.hiroshiba.jp/" target="_blank" rel="noopener noreferrer">link</a> zip版でok</li>
-</ul>
-
----
-
-## ⚙ 設定ファイル `_outtts.txt`
-
-このファイルは **設定＋ログ** を兼ねています。
-
-ファイルの **先頭付近に設定を書くと読み込まれます**。  
-それより下はログ領域です。
-
-### 🔧 設定例
-```
-language=ja
-silence=3200
-silence_hard=100
+```ini
 voicevox.exe="M:\VOICEVOX\VOICEVOX.exe"
 voicevox.api="http://127.0.0.1:50021"
 voicevox.speaker=3
 laughs=ワハハハハハ,ふふふっ,laughsounds/laughter_lady01.wav
 initial_prompt=これはゲーム内の無線チャットです。短く簡潔に話す。字幕、BGM、効果音、顔文字は出力しないで。笑い声は出していい。話している内容だけに集中してください。使われる単語は「了解、敵、味方、助けて」
-
-```
 --------------------------↑設定↓ログ--------------------------
+```
+## 📝 Configuration Options / 各項目の説明
 
-📝 各項目の説明
-
-| 設定 | 説明                                    |
-|------|---------------------------------------|
-| `language=ja` | Whisperへの言語ヒント                        |
-| `silence` | 無音判定（大きいほど判定甘くなる）                     |
-| `silence_hard` | ハード無音判定（ノイズと誤認識を減らす）                  |
-| `voicevox.exe` | VOICEVOX本体のパス                         |
-| `voicevox.api` | APIのURL                               |
-| `voicevox.speaker` | 話者ID                                  |
-| `initial_prompt` | 事前プロンプト（短いほど安定）                       |
-| `laughs` | 笑い声のパターン。カレントディレクトリからのパスでwavファイル指定可能。 |
+The `_outtts.txt` file works as both **configuration** and **log**.  
+設定はファイル上部に記述してください。下部はログ領域になります。
 
 ---
 
-## 📄 `_ignore.txt` について
+### 🔧 Available Settings / 設定項目一覧
 
-このファイルに **無視したい単語** を1行ずつ書きます。
+| Setting | Description (EN) | 説明 (JP) |
+|--------|------------------|-----------|
+| `language=en` | Language hint for Whisper | Whisper への言語ヒント |
+| `silence` | Silence detection threshold (higher = more tolerant) | 無音判定（大きいほど判定が甘くなる） |
+| `silence_hard` | Hard silence detection to reduce noise misdetection | ハード無音判定（ノイズ誤認識を減らす） |
+| `voicevox.exe` | Path to VOICEVOX executable | VOICEVOX 本体のパス |
+| `voicevox.api` | VOICEVOX API URL | VOICEVOX API の URL |
+| `voicevox.speaker` | Speaker ID | 話者 ID |
+| `initial_prompt` | Initial prompt for Whisper (shorter is more stable) | 事前プロンプト（短いほど安定） |
+| `laughs` | Laugh patterns (text or WAV path relative to working dir) | 笑い声パターン（テキスト or WAV。カレントディレクトリ基準） |
+
+---
+
+### 🔊 VOICEVOX Notes / VOICEVOX に関する注意
+
+- VOICEVOX is automatically detected if `voicevox.exe` path is valid  
+  `voicevox.exe` に有効なパスが設定されていれば自動認識されます
+- VOICEVOX will be launched automatically when MobMate starts  
+  MobMate 起動時に VOICEVOX も自動起動します
+- Default API port is **50021**  
+  API ポートのデフォルトは **50021** です
+- Speaker ID must be checked separately  
+  話者 ID は VOICEVOX 側で調べてください
+
+⚠ **VOICEVOX is a third-party tool**  
+⚠ **VOICEVOX は第三者製ツールです**
+
+https://voicevox.hiroshiba.jp/
+
+---
+
+---
+
+## 📄 `_ignore.txt` (Ignored Words)
+
+このファイルには **無視したい単語やフレーズ** を 1 行ずつ記述します。  
+Write **words or phrases to be ignored**, one per line.
+
+例 / Example:  
+```ini
+えーと  uh
+あのー  um
+えっと  aa
+```
+
+このリストに含まれる語句は、**ログにも TTS 出力にも表示・再生されません**。  
+Any phrase listed here will be **excluded from both logs and TTS output**.
+
+短いフィラー音（例: “uh”, “um”, “えーと”）を除外する用途に向いています。  
+Useful for filtering filler words such as “uh”, “um”, etc.
+
+
+---
+
+## 📄 `_dictionary.txt` (Word Replacement Dictionary)
+
+このファイルには **発声時に変換したい単語** を 1 行ずつ記述します。  
+Write **words you want to be replaced during TTS output**, one per line.
+
+一致した語句は **音声発声時に自動的に変換** されます。  
+Matched words will be **automatically replaced at TTS playback time**.
+
+※ 動作しない場合、`_ignore.txt` が優先されている可能性があります。  
+※ If it does not work, the word may be overridden by `_ignore.txt`.
+
+語句の登録先は用途に応じて調整してください。  
+Adjust which file to use depending on your purpose.
 
 例：
 ```
-えーと
-あのー
-えっと
+frag=フラグ, グレネード, 手りゅう弾        # frag → grenade / explosive
+tango=敵                                   # tango → enemy (NATO phonetic slang)
+fuck=チョメ, Fワード                       # fuck → censored / softened expression
 ```
+---
+## 🔖 License / ライセンス
 
-一致した語句はログにもTTSにも出なくなります。
+本ツールは、複数のオープンソースソフトウェア（OSS）を組み合わせて構成されています。  
+This tool is built using multiple open-source software components.
 
+### 📦 Included OSS / 使用している主なOSS
+
+- MisterWhisper — MIT License  
+- Whisper.cpp — MIT License  
+- JNA — Apache License 2.0  
+- NAudio — MIT License  
+- JNativeHook — BSD License  
+- VOICEVOX API — Subject to each character's individual license  
+
+### 📄 Distribution / 配布について
+
+本ツール自体の配布は **MIT 相当ライセンス**で可能です。  
+This tool itself may be distributed under an MIT-equivalent license.
+
+VOICEVOX の話者（キャラクター）利用については、  
+**各キャラクターごとのライセンス条件に従ってください。**  
+Usage of VOICEVOX voices must comply with each character's license terms.
 
 ---
 
-## 📄 `_dictionary.txt` について
+🙏 **Thanks / 謝辞**
 
-このファイルに **変換したい単語** を1行ずつ書きます。
-
-例：
-```
-frag=フラグ, グレネード, 手りゅう弾
-tango=敵
-fuck=チョメ, Fワード
-```
-一致した語句は発声時に変換されます。
-動作しない場合は_ignore.txtが優先されるため。語句登録先は適宜調整してください。
-
+- Whisper.cpp  
+- VOICEVOX  
+- GPT の友達 / GPT, my coding companion  
 
 ---
-## 🔖 ライセンス
 
-本ツールはオープンソースコンポーネントを組み合わせています。
+### 🔗 Based on / ベースプロジェクト
 
-含まれる主なOSS：
-- MisterWhisper	MIT
-- Whisper.cpp (MIT)
-- JNA (Apache 2.0)
-- NAudio (MIT)
-- JNativeHook (BSD)
-- VOICEVOX API（各話者ライセンスに従う）
+This project is based on **MisterWhisper** by openConcerto.  
+本プロジェクトは openConcerto による MisterWhisper をベースにしています。
 
-本ツール自体の配布は MIT 相当で可能です。  
-VOICEVOX の話者利用は各キャラのライセンスに従ってください。
-
-🙏 Thanks
-
-Whisper.cpp
-
-VOICEVOX
-
-GPTの友達
-
-
-This project is based on MisterWhisper by openConcerto
-Original repository:
+Original repository:  
 https://github.com/openconcerto/MisterWhisper
 
----
