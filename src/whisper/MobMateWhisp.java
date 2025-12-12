@@ -134,6 +134,8 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
     public MobMateWhisp(String remoteUrl) throws FileNotFoundException, NativeHookException {
+        log("JVM: " + System.getProperty("java.vm.name"));
+        log("JVM vendor: " + System.getProperty("java.vm.vendor"));
         // whisper.dll loadcpu/cuda/vulkan
         loadWhisperNative();
 
