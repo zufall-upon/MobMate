@@ -89,6 +89,65 @@ for players who usually just listen—but still want to be heard.
 
 ---
 
+### 😂 笑い検知・置換機能 / Natural Laugh Detection
+
+MobMateWhispTalk には、
+話している最中の「自然な笑い声」を自動で検知し、別の表現に変換する機能があります。
+
+MobMateWhispTalk includes a natural laugh detection feature
+that detects actual laughter in your voice and converts it into text or sound.
+
+Whisper.cpp（ggml-small.bin など）の特性により、
+マイクの前で 「フフッ」「ハハッ」などと笑うだけで
+音声認識結果に 「(笑)」のような表現が含まれることがあります。
+
+Thanks to Whisper.cpp models such as ggml-small.bin,
+natural laughter like “haha” or “heh” is often recognized automatically
+as a laugh token in the transcription.
+
+MobMate はこの挙動を利用し、
+意図的に言葉を発しなくても、感情としての「笑い」を拾って処理します。
+
+MobMate leverages this behavior to capture emotional laughter,
+even when you are not explicitly saying words like “lol” or “haha”.
+
+#### ⚙ 笑いの変換処理 / Laugh Replacement
+
+検知された笑い表現は、
+任意の文字列または WAV ファイルに置き換えられます。
+
+Detected laughter can be replaced with custom text or WAV sound effects.
+
+```
+laughs.enable=true
+laughs.detect=（笑）,(笑),笑,草,ｗ,www,L�v,lol,lolol,lmao,rofl,laugh
+laughs.detect.auto=（笑）,笑,草,ｗ,www,lol,lmao,rofl,ㅋㅋ,ㅎㅎ,哈哈,呵呵
+laugh.replace=ワハハハ,ふふふっ,laughsounds/laughter01.wav
+```
+
+- 自然な笑い声 → Whisper が (笑) 等を生成
+- MobMate がそれを検知して変換
+- VC には 別の声・効果音として再生
+
+Natural laughter → Whisper generates a laugh marker
+→ MobMate detects it → replaces it with another voice or sound
+
+#### 🎯 この機能の意図 / Why this matters
+
+- 実際に声を張らなくても感情を伝えられる
+- 笑い声だけで VC に参加している空気感を出せる
+- 匿名音声でも「反応している人」になれる
+
+This feature allows you to:
+- Express emotion without speaking loudly
+- React naturally in voice chat
+- Participate without revealing your real voice
+
+MobMate は、
+「話すこと」ではなく「反応すること」も VC の一部だと考えています。
+
+MobMate treats reactions themselves as valid communication.
+
 ## 🟢 動作環境 / System Requirements
 
 - Windows 10 / 11 (64bit)
@@ -222,7 +281,6 @@ MobMate は **VOICEVOX** と連携して匿名発声（TTS）を行うことが�
 voicevox.exe="M:\VOICEVOX\VOICEVOX.exe"
 voicevox.api="http://127.0.0.1:50021"
 voicevox.speaker=3
-laughs=HAHAHAHA,hehe,laughsounds/laughter_lady01.wav
 initial_prompt=This is an in-game radio communication. Speak briefly and clearly. Do not output subtitles, background music, sound effects, or emoticons. Laughter is allowed. Focus only on spoken content. Common words include "roger", "enemy", "ally", "help".
 ```
 
@@ -230,7 +288,6 @@ initial_prompt=This is an in-game radio communication. Speak briefly and clearly
 voicevox.exe="M:\VOICEVOX\VOICEVOX.exe"
 voicevox.api="http://127.0.0.1:50021"
 voicevox.speaker=3
-laughs=ワハハハハハ,ふふふっ,laughsounds/laughter_lady01.wav
 initial_prompt=これはゲーム内の無線チャットです。短く簡潔に話す。字幕、BGM、効果音、顔文字は出力しないで。笑い声は出していい。話している内容だけに集中してください。使われる単語は「了解、敵、味方、助けて」
 --------------------------↑設定↓ログ--------------------------
 ```
