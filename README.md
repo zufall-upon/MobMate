@@ -2,7 +2,7 @@
 # ![MobMateWhispTalk](https://github.com/zufall-upon/MobMate/releases/tag/release)
 **For quiet players who still want to be loud.**
 
-![MobMateWhispTalk](https://github.com/zufall-upon/MobMate/blob/main/logo01.png)
+![MobMateWhispTalk](https://raw.githubusercontent.com/zufall-upon/MobMate/refs/heads/main/logo01.png)
 
 ローカルで動作する **STT + TTS（匿名発声）ツール** です。  
 This is a **local-only speech-to-text + text-to-speech (anonymous voice)** tool.
