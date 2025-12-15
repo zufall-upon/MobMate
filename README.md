@@ -88,35 +88,35 @@ for players who usually just listen—but still want to be heard.
 - Designed for **short responses and quick reactions** in voice chat
 
 ---
-
 ### 😂 笑い検知・置換機能 / Natural Laugh Detection
 
-MobMateWhispTalk には、
-話している最中の「自然な笑い声」を自動で検知し、別の表現に変換する機能があります。
+MobMateWhispTalk には、話している最中の **自然な笑い声** を自動で検知し、
+別の表現（テキストまたは効果音）に変換する機能があります。
 
-MobMateWhispTalk includes a natural laugh detection feature
+MobMateWhispTalk includes a **natural laugh detection** feature  
 that detects actual laughter in your voice and converts it into text or sound.
 
-Whisper.cpp（ggml-small.bin など）の特性により、
-マイクの前で 「フフッ」「ハハッ」などと笑うだけで
-音声認識結果に 「(笑)」のような表現が含まれることがあります。
+Whisper.cpp（例: ggml-small.bin）の特性により、  
+マイクの前で「フフッ」「ハハッ」と笑うだけで、  
+音声認識結果に `(笑)` や `LOL` といった **笑いトークン** が含まれることがあります。
 
-Thanks to Whisper.cpp models such as ggml-small.bin,
-natural laughter like “haha” or “heh” is often recognized automatically
-as a laugh token in the transcription.
+Thanks to Whisper.cpp models (e.g. ggml-small.bin),  
+natural laughter like “haha” or “heh” is often automatically recognized  
+as laugh tokens such as `(笑)` or `LOL` in the transcription.
 
-MobMate はこの挙動を利用し、
-意図的に言葉を発しなくても、感情としての「笑い」を拾って処理します。
+MobMate はこの挙動を利用し、  
+**意図的に言葉を発しなくても**、感情としての「笑い」を拾って処理します。
 
-MobMate leverages this behavior to capture emotional laughter,
+MobMate leverages this behavior to capture **emotional laughter**,  
 even when you are not explicitly saying words like “lol” or “haha”.
 
 #### ⚙ 笑いの変換処理 / Laugh Replacement
 
-検知された笑い表現は、
-任意の文字列または WAV ファイルに置き換えられます。
+検知された笑い表現は、  
+あらかじめ設定した **文字列** または **WAV ファイル** に置き換えられます。
 
-Detected laughter can be replaced with custom text or WAV sound effects.
+Detected laughter can be replaced with custom **text expressions**  
+or **WAV-based sound effects**.
 
 ```
 laughs.enable=true
@@ -131,22 +131,6 @@ laugh.replace=ワハハハ,ふふふっ,laughsounds/laughter01.wav
 
 Natural laughter → Whisper generates a laugh marker
 → MobMate detects it → replaces it with another voice or sound
-
-#### 🎯 この機能の意図 / Why this matters
-
-- 実際に声を張らなくても感情を伝えられる
-- 笑い声だけで VC に参加している空気感を出せる
-- 匿名音声でも「反応している人」になれる
-
-This feature allows you to:
-- Express emotion without speaking loudly
-- React naturally in voice chat
-- Participate without revealing your real voice
-
-MobMate は、
-「話すこと」ではなく「反応すること」も VC の一部だと考えています。
-
-MobMate treats reactions themselves as valid communication.
 
 ## 🟢 動作環境 / System Requirements
 
@@ -175,18 +159,41 @@ https://github.com/zufall-upon/MobMate/releases/tag/release
 
 ## 🔹 Whisperモデルの配置 / Whisper Model Setup
 
-`models` フォルダに以下を配置してください：  
-Place the model file inside the `models` folder:
+`models` フォルダに Whisper のモデルファイルを配置してください。  
+Place the Whisper model file inside the `models` folder.
 
 - `ggml-small.bin`  
   https://huggingface.co/ggerganov/whisper.cpp/tree/main
 
-### 👉 推奨モデル / Recommended Model
-`ggml-small.bin`
+---
 
-- Tiny：精度不足 / Low accuracy  
-- Medium：巨大 & 遅い / Too large & slow  
-- Small：最適バランス / Best balance ⭐
+### 👉 推奨モデル / Recommended Model
+
+**`ggml-small.bin`（推奨 / Recommended）**
+
+精度・速度・安定性のバランスが最も良く、  
+MobMateWhispTalk の用途（短い発話・リアクション）に最適です。
+
+Offers the best balance of accuracy, speed, and stability,  
+and is well suited for short voice chat interactions.
+
+#### 他モデルとの比較 / Model Comparison
+
+- **Tiny**  
+  精度不足で誤認識が多い  
+  Low accuracy, frequent misrecognition
+
+- **Medium**  
+  正常動作するが、サイズが大きく動作が重い  
+  Works correctly, but large and noticeably slower
+
+- **Large / Large-v3-turbo**  
+  出力が不安定でスパム的な認識が増えやすい  
+  Unstable output, prone to repetitive or spam-like transcription
+
+👉 **結論 / Conclusion**  
+まずは `ggml-small.bin` の使用を強く推奨します ⭐
+
 
 ---
 
