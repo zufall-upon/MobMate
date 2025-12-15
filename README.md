@@ -160,6 +160,25 @@ https://github.com/zufall-upon/MobMate/releases/tag/release
 2. `_run.bat` をダブルクリック  
    Double-click `_run.bat`
 
+### 🟢 First Launch / 初回起動について
+
+On first launch, if `_outtts.txt` does not exist,
+MobMate will ask you to select a language.
+
+初回起動時、`_outtts.txt` が存在しない場合は  
+言語選択ダイアログが表示されます。
+
+- English
+- 日本語
+- 中文・简体 (Chinese Simplified),
+- 中文・繁體 (Chinese Traditional),
+- 한국어 (Korean)
+
+Based on your selection, a preset configuration file
+will be copied automatically.
+
+選択した言語に応じた初期設定ファイルが自動で作成されます。
+
 ---
 
 ## 🔹 Whisperモデルの配置 / Whisper Model Setup
