@@ -17,6 +17,7 @@ import java.awt.event.WindowEvent;
 import java.io.*;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.nio.file.*;
 import java.text.SimpleDateFormat;
 import java.util.*;
 import java.util.List;
@@ -25,15 +26,10 @@ import java.util.concurrent.Executors;
 import java.util.logging.Logger;
 import java.util.prefs.BackingStoreException;
 import java.util.prefs.Preferences;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.Files;
-import java.nio.file.StandardOpenOption;
 import java.nio.charset.StandardCharsets;
 import javax.sound.sampled.AudioInputStream;
 import javax.sound.sampled.AudioSystem;
 import java.net.*;
-import javax.sound.sampled.Clip;
 
 import javax.swing.*;
 import javax.sound.sampled.AudioFileFormat;
@@ -52,27 +48,11 @@ import com.github.kwhat.jnativehook.keyboard.NativeKeyEvent;
 import com.github.kwhat.jnativehook.keyboard.NativeKeyListener;
 
 public class MobMateWhisp implements NativeKeyListener {
-    private static PrintWriter LOG;
-    static {
-        try {
-            File out = new File("_log.txt");
-            LOG = new PrintWriter(new FileWriter(out, true));
-            LOG.println("=== MobMateWhisp Started ===");
-            LOG.flush();
-        } catch (Exception e) {}
-    }
-
-    static private void log(String s) {
-        System.out.println(s);
-        if (LOG != null) {
-            LOG.println(s);
-            LOG.flush();
-        }
-    }
     private static final int MIN_AUDIO_DATA_LENGTH = (int) (16000 * 2.1);
 
     private Preferences prefs;
     private String lastOutput = null;
+    private String cpugpumode = "";
     private Random rnd = new Random();
     private String[] laughOptions;
     private HistoryFrame historyFrame;
@@ -134,10 +114,13 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
     public MobMateWhisp(String remoteUrl) throws FileNotFoundException, NativeHookException {
-        log("JVM: " + System.getProperty("java.vm.name"));
-        log("JVM vendor: " + System.getProperty("java.vm.vendor"));
+        Config.log("JVM: " + System.getProperty("java.vm.name"));
+        Config.log("JVM vendor: " + System.getProperty("java.vm.vendor"));
         // whisper.dll loadcpu/cuda/vulkan
         loadWhisperNative();
+
+        String lang = Config.get("language");
+        if (lang == null) lang = "auto";
 
         if (MobMateWhisp.ALLOWED_HOTKEYS.length != MobMateWhisp.ALLOWED_HOTKEYS_CODE.length) {
             throw new IllegalStateException("ALLOWED_HOTKEYS size mismatch");
@@ -152,7 +135,7 @@ public class MobMateWhisp implements NativeKeyListener {
         GlobalScreen.registerNativeHook();
         GlobalScreen.addNativeKeyListener(this);
 
-        String laughSetting = loadSetting("laughs", "ワハハハハハ");
+        String laughSetting = Config.getString("laughs", "ワハハハハハ");
         laughOptions = laughSetting.split(",");
         // trim
         for (int i = 0; i < laughOptions.length; i++) {
@@ -231,9 +214,9 @@ public class MobMateWhisp implements NativeKeyListener {
             }
 
             this.w = new LocalWhisperCPP(new File(dir, this.model));
-            log("MobMateWhispTalk using WhisperCPP with " + this.model);
+            Config.log("MobMateWhispTalk using WhisperCPP with " + this.model);
         } else {
-            log("MobMateWhispTalk using remote speech to text service : " + remoteUrl);
+            Config.log("MobMateWhispTalk using remote speech to text service : " + remoteUrl);
         }
     }
 
@@ -265,14 +248,14 @@ public class MobMateWhisp implements NativeKeyListener {
             frame.setVisible(true);
             tray.add(this.trayIcon);
         } catch (AWTException ex) {
-            log("TrayIcon could not be added.\n" + ex.getMessage());
+            Config.log("TrayIcon could not be added.\n" + ex.getMessage());
         }
         trayIcon.addActionListener(e -> bringToFront(window));
 
     }
 
     protected PopupMenu createPopupMenu() {
-        final String strAction = this.prefs.get("action", "paste");
+        final String strAction = this.prefs.get("action", "noting");
 
         final PopupMenu popup = new PopupMenu();
 
@@ -289,11 +272,11 @@ public class MobMateWhisp implements NativeKeyListener {
             @Override
             public void itemStateChanged(ItemEvent e) {
                 if (e.getSource().equals(autoPaste) && e.getStateChange() == ItemEvent.SELECTED) {
-                    log("itemStateChanged() PASTE " + e.toString());
+                    Config.log("itemStateChanged() PASTE " + e.toString());
                     MobMateWhisp.this.prefs.put("action", "paste");
                     autoType.setState(false);
                 } else if (e.getSource().equals(autoType) && e.getStateChange() == ItemEvent.SELECTED) {
-                    log("itemStateChanged() TYPE " + e.toString());
+                    Config.log("itemStateChanged() TYPE " + e.toString());
                     MobMateWhisp.this.prefs.put("action", "type");
                     autoPaste.setState(false);
                 } else {
@@ -302,6 +285,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
                 try {
                     MobMateWhisp.this.prefs.sync();
+//                    MobMateWhisp.this.prefs.clear();
                 } catch (BackingStoreException e1) {
                     e1.printStackTrace();
                     JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
@@ -312,7 +296,7 @@ public class MobMateWhisp implements NativeKeyListener {
         autoType.addItemListener(typeListener);
 
         CheckboxMenuItem detectSilece = new CheckboxMenuItem("Silence detection");
-        detectSilece.setState(this.prefs.getBoolean("silence-detection", false));
+        detectSilece.setState(this.prefs.getBoolean("silence-detection", true));
         detectSilece.addItemListener(new ItemListener() {
 
             @Override
@@ -455,7 +439,7 @@ public class MobMateWhisp implements NativeKeyListener {
         final CheckboxMenuItem pushToTalkDoubleTapItem = new CheckboxMenuItem("Push to talk + double tap");
         final CheckboxMenuItem startStopItem = new CheckboxMenuItem("Start / Stop");
 
-        String currentMode = this.prefs.get("trigger-mode", PUSH_TO_TALK);
+        String currentMode = this.prefs.get("trigger-mode", START_STOP);
 
         pushToTalkItem.setState(PUSH_TO_TALK.equals(currentMode));
         pushToTalkDoubleTapItem.setState(PUSH_TO_TALK_DOUBLE_TAP.equals(currentMode));
@@ -691,7 +675,7 @@ public class MobMateWhisp implements NativeKeyListener {
         if (this.trayIcon != null) {
             MobMateWhisp.this.trayIcon.setToolTip(tooltip);
         }
-        log(tooltip);
+        Config.log(tooltip);
     }
 
     private List<String> getInputsMixerNames() {
@@ -808,7 +792,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
                     @Override
                     public void run() {
-                        final String strAction = MobMateWhisp.this.prefs.get("action", "paste");
+                        final String strAction = MobMateWhisp.this.prefs.get("action", "noting");
                         Action action = Action.NOTHING;
                         if (strAction.equals("paste")) {
                             action = Action.COPY_TO_CLIPBOARD_AND_PASTE;
@@ -876,7 +860,7 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
     private void startRecording(Action action) {
-        log("MobMateWhispTalk.startRecording()" + action);
+        Config.log("MobMateWhispTalk.startRecording()" + action);
         if (isRecording()) {
             // Prevent multiple recordings
             return;
@@ -900,17 +884,17 @@ public class MobMateWhisp implements NativeKeyListener {
                             if (targetDataLine == null) {
                                 targetDataLine = getFirstTargetDataLine();
                             } else {
-                                log("Using previous audio device : " + previsouAudipDevice);
+                                Config.log("Using previous audio device : " + previsouAudipDevice);
                             }
                             if (targetDataLine == null) {
                                 JOptionPane.showMessageDialog(null, "Cannot find any input audio device");
                                 setRecording(false);
                                 return;
                             } else {
-                                log("Using default audio device");
+                                Config.log("Using default audio device");
                             }
                         } else {
-                            log("Using audio device : " + audioDevice);
+                            Config.log("Using audio device : " + audioDevice);
                         }
 
                         final ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
@@ -922,15 +906,14 @@ public class MobMateWhisp implements NativeKeyListener {
 
                             // 0.25s
                             byte[] data = new byte[3000];
-                            boolean detectSilence = MobMateWhisp.this.prefs.getBoolean("silence-detection", false);
+                            boolean detectSilence = MobMateWhisp.this.prefs.getBoolean("silence-detection", true);
                             if (detectSilence) {
                                 while (isRecording()) {
                                     int numBytesRead = targetDataLine.read(data, 0, data.length);
                                     if (numBytesRead > 0) {
                                         byteArrayOutputStream.write(data, 0, numBytesRead);
                                     }
-                                    // === NEW: 強制 periodic flush ===
-                                    // 0.4秒ごとに分割して Whisper に送る
+                                    // === periodic flush ===
                                     if (byteArrayOutputStream.size() > 16000 * 3) {
                                         final byte[] chunk = byteArrayOutputStream.toByteArray();
                                         byteArrayOutputStream.reset();
@@ -964,7 +947,7 @@ public class MobMateWhisp implements NativeKeyListener {
                             }
 
                         } catch (LineUnavailableException e) {
-                            log("Audio input device not available (used by an other process?)");
+                            Config.log("Audio input device not available (used by an other process?)");
                         } catch (Exception e) {
                             e.printStackTrace();
                         } finally {
@@ -1012,19 +995,18 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
     public String transcribe(byte[] audioData, final Action action, boolean isEndOfCapture) throws IOException {
-        int threshold = loadSettingInt("silence_hard", 100);
+        int threshold = Config.getInt("silence_hard", 100);
         if (detectSilence(audioData, audioData.length, threshold)) {
             if (this.debug) {
-                log("Silence detected");
+                Config.logDebug("Silence detected");
             }
-            // ★ 喋り終わってないなら無視
             if (!isEndOfCapture) return "";
             return "";
         }
         int maxAmp = getMaxAmplitude(audioData);
         if (maxAmp < threshold + 500) {   // ←閾値。600〜1500推奨
             if (debug) {
-                log("Filtered low amplitude segment: " + maxAmp);
+                Config.logDebug("Filtered low amplitude segment: " + maxAmp);
             }
             return "";
         }
@@ -1054,7 +1036,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 return "";
             } finally {
                 if (this.debug) {
-                    log("Audio record stored in : " + out.getAbsolutePath());
+                    Config.logDebug("Audio record stored in : " + out.getAbsolutePath());
                 } else {
                     boolean deleted = out.delete();
                     if (!deleted) {
@@ -1070,19 +1052,17 @@ public class MobMateWhisp implements NativeKeyListener {
         // if (str.matches("[A-Za-z& ]+")) return "";
         // === dedupe ===
         if (lastOutput != null && lastOutput.equals(str)) {
-            if (debug) log("Duplicate skipped: " + str);
+            if (debug) Config.log("Duplicate skipped: " + str);
             return "";
         }
         // === early noise filters ===
         if (str.matches("^\\[.*\\]$")) {
-            if (debug) log("Bracket noise skipped: " + str);
+            if (debug) Config.log("Bracket noise skipped: " + str);
             return "";
         }
-        // 英字だけの短いやつ（例: AZ, A&G, TEST は OKだが短すぎるものは弾く）
         if (str.matches("^[A-Za-z0-9& ]{1,12}$")) {
-            // 長さ < 4 は捨てる
             if (str.length() < 2) {
-                if (debug) log("Short alpha skipped: " + str);
+                if (debug) Config.log("Short alpha skipped: " + str);
                 return "";
             }
         }
@@ -1123,7 +1103,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 if (action.equals(Action.TYPE_STRING)) {
                     try {
                         RobotTyper typer = new RobotTyper();
-                        log("Typing : " + finalStr);
+                        Config.log("Typing : " + finalStr);
                         typer.typeString(finalStr, 11);
                     } catch (AWTException e) {
                         e.printStackTrace();
@@ -1140,13 +1120,13 @@ public class MobMateWhisp implements NativeKeyListener {
                         } catch (NativeHookException e1) {
                             e1.printStackTrace();
                         }
-                        log("Warning : cannot get previous clipboard content");
+                        Config.log("Warning : cannot get previous clipboard content");
                     }
                     final Transferable toPaste = previous;
                     clipboard.setContents(new StringSelection(finalStr), null);
                     try {
                         Robot robot = new Robot();
-                        log("Pasting : " + finalStr);
+                        Config.log("Pasting : " + finalStr);
                         robot.keyPress(KeyEvent.VK_CONTROL);
                         robot.keyPress(KeyEvent.VK_V);
                         try {
@@ -1156,7 +1136,7 @@ public class MobMateWhisp implements NativeKeyListener {
                         }
                         robot.keyRelease(KeyEvent.VK_V);
                         robot.keyRelease(KeyEvent.VK_CONTROL);
-                        log("Pasting : " + finalStr + " DONE");
+                        Config.log("Pasting : " + finalStr + " DONE");
 
                     } catch (AWTException e) {
                         e.printStackTrace();
@@ -1170,7 +1150,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                     } catch (InterruptedException e) {
                                         e.printStackTrace();
                                     }
-                                    log("Restoring previous clipboard content");
+                                    Config.log("Restoring previous clipboard content");
                                     clipboard.setContents(toPaste, null);
 
                                 }
@@ -1186,27 +1166,14 @@ public class MobMateWhisp implements NativeKeyListener {
                     @Override
                     public void run() {
                         // === LOG APPEND ===
-                        try {
-                            String s = finalStr == null ? "" : finalStr.trim();
-                            if (!s.isEmpty()) {   // ★ 空行ガード追加
-                                Path logFile = Paths.get(System.getProperty("user.dir"), "_outtts.txt");
-                                Files.write(
-                                        logFile,
-                                        (s + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
-                                        StandardOpenOption.CREATE,
-                                        StandardOpenOption.APPEND
-                                );
-                            }
-                        } catch (IOException e) {
-                            e.printStackTrace();
-                        }
+                        String s = finalStr == null ? "" : finalStr;
+                        Config.appendOutTts(finalStr);
 
                         // === GUI UPDATE: append + autoscroll ===
                         if (MobMateWhisp.this.window != null) {
                             SwingUtilities.invokeLater(() -> {
                                 java.awt.Container c = MobMateWhisp.this.window.getContentPane();
                                 if (c instanceof JPanel) {
-                                    // とりあえず単純な方法: title書き換え
                                     MobMateWhisp.this.window.setTitle(finalStr);
                                 }
                             });
@@ -1294,7 +1261,7 @@ public class MobMateWhisp implements NativeKeyListener {
         long t1 = System.currentTimeMillis();
         String string = new RemoteWhisperCPP(this.remoteUrl).transcribe(out, 0.0, 0.01);
         long t2 = System.currentTimeMillis();
-        log("Response from remote whisper.cpp (" + (t2 - t1) + " ms): " + string);
+        Config.log("Response from remote whisper.cpp (" + (t2 - t1) + " ms): " + string);
         return string.trim();
 
     }
@@ -1344,6 +1311,7 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
     public static void main(String[] args) {
+        ensureInitialConfig();
 
         SwingUtilities.invokeLater(() -> {
             try {
@@ -1370,7 +1338,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 }
                 final MobMateWhisp r = new MobMateWhisp(url);
                 r.debug = debug;
-                r.autoStartVoiceVox();  // ← 追加
+                r.autoStartVoiceVox();
                 r.startPsServer();
 
                 boolean openWindow = r.prefs.getBoolean("open-window", true);
@@ -1406,6 +1374,8 @@ public class MobMateWhisp implements NativeKeyListener {
         p.add(this.label);
         p.add(this.button);
 
+        MobMateWhisp.this.window.setTitle(cpugpumode);
+
         final JButton historyButton = new JButton("\uD83D\uDCDC History");
         p.add(historyButton);
 
@@ -1429,7 +1399,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
             @Override
             public void actionPerformed(ActionEvent e) {
-                final String strAction = MobMateWhisp.this.prefs.get("action", "paste");
+                final String strAction = MobMateWhisp.this.prefs.get("action", "noting");
                 Action action = Action.NOTHING;
                 if (strAction.equals("paste")) {
                     action = Action.COPY_TO_CLIPBOARD_AND_PASTE;
@@ -1523,40 +1493,6 @@ public class MobMateWhisp implements NativeKeyListener {
 //        log("max=" + maxAmplitude + " thresh=" + threshold);
         return maxAmplitude < threshold;
     }
-
-    private static String loadSetting(String key, String defaultValue) {
-        File f = new File("_outtts.txt");
-        if (!f.exists()) return defaultValue;
-
-        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
-            String line;
-            while ((line = br.readLine()) != null) {
-                if (line.startsWith(key + "=")) {
-                    String v = line.substring((key + "=").length()).trim();
-
-                    // === QUOTE STRIP ===
-                    if ((v.startsWith("\"") && v.endsWith("\"")) ||
-                            (v.startsWith("'") && v.endsWith("'"))) {
-                        v = v.substring(1, v.length() - 1).trim();
-                    }
-
-                    return v;
-                }
-                if (line.startsWith("---")) break;
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
-        return defaultValue;
-    }
-    private static int loadSettingInt(String key, int defaultValue) {
-        String v = loadSetting(key, "" + defaultValue);
-        try {
-            return Integer.parseInt(v.trim());
-        } catch (NumberFormatException e) {
-            return defaultValue;
-        }
-    }
     private static int getMaxAmplitude(byte[] buffer) {
         int max = 0;
         for (int i = 0; i < buffer.length; i += 2) {
@@ -1646,7 +1582,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 logToHistory("[VV] WAV invalid timeout");
                 return;
             }
-            log("[VV] saved: " + tmp);
+            Config.log("[VV] saved: " + tmp);
 
 //            playWav(tmp.toFile());
             playViaPowerShell(tmp.toFile());
@@ -1682,10 +1618,10 @@ public class MobMateWhisp implements NativeKeyListener {
 //            mixer = AudioSystem.getMixer(targetMixerInfo);
 //            mixer.open();
 //            clip = (Clip) mixer.getLine(new Line.Info(Clip.class));
-//            log("Using mixer: " + targetMixerInfo.getName());
+//            Config.log("Using mixer: " + targetMixerInfo.getName());
 //        } else {
 //            clip = AudioSystem.getClip();
-//            log("Using DEFAULT mixer");
+//            Config.log("Using DEFAULT mixer");
 //        }
 //
 //        AudioInputStream ais = AudioSystem.getAudioInputStream(f);
@@ -1710,7 +1646,7 @@ public class MobMateWhisp implements NativeKeyListener {
 //        while (clip.isRunning()) {
 //            Thread.sleep(100);
 //        }
-//        log("[VV] speaked");
+//        Config.log("[VV] speaked");
 //        clip.close();
 //        dais.close();
 //        ais.close();
@@ -1765,7 +1701,7 @@ public class MobMateWhisp implements NativeKeyListener {
 //                    "-WavPath", wavFile.getAbsolutePath(),
 //                    "-DeviceNumber", "" + devIndex
 //            ).start();
-//            log("[VV] playViaPowerShell:" + "PlayWav.ps1_" + wavFile.getAbsolutePath() + "-DeviceNumber" + devIndex);
+//            Config.log("[VV] playViaPowerShell:" + "PlayWav.ps1_" + wavFile.getAbsolutePath() + "-DeviceNumber" + devIndex);
 //
 //        } catch (Exception ex) {
 //            ex.printStackTrace();
@@ -1784,11 +1720,11 @@ public class MobMateWhisp implements NativeKeyListener {
 
             String resp = psReader.readLine();
             if (!"DONE".equals(resp)) {
-//                log("ERR? " + resp);
+//                Config.log("ERR? " + resp);
             }
 
         } catch (Exception e) {
-            log("Pipe dead → restarting...");
+            Config.log("Pipe dead → restarting...");
             psProcess = null;
             try {
                 startPsServer();
@@ -1802,7 +1738,7 @@ public class MobMateWhisp implements NativeKeyListener {
             File f = p.toFile();
 
             if (!f.exists()) {
-                log("NOT FOUND: " + f.getAbsolutePath());
+                Config.log("NOT FOUND: " + f.getAbsolutePath());
                 return;
             }
             playViaPowerShell(f);
@@ -1817,14 +1753,14 @@ public class MobMateWhisp implements NativeKeyListener {
         text = w.applyDictionary(text); // Dictorary apply
 
         if (isVoiceVoxAvailable()) {
-            speakVoiceVox(text, loadSetting("voicevox.speaker", "3"), loadSetting("voicevox.api", ""));
+            speakVoiceVox(text, Config.getString("voicevox.speaker", "3"), Config.getString("voicevox.api", ""));
         } else {
             speakWindows(text);
         }
     }
     private boolean isVoiceVoxAvailable() {
         try {
-            URL url = new URL(loadSetting("voicevox.api", "") + "/speakers");
+            URL url = new URL(Config.getString("voicevox.api", "") + "/speakers");
             logToHistory(url.toString());
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setConnectTimeout(200);
@@ -1836,7 +1772,7 @@ public class MobMateWhisp implements NativeKeyListener {
     }
     private void logToHistory(String msg) {
         if (debug) {
-            log(msg);
+            Config.log(msg);
             SwingUtilities.invokeLater(() -> {
                 history.add(msg);
                 fireHistoryChanged();
@@ -1844,26 +1780,24 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
     private void autoStartVoiceVox() {
-        String vvExe = loadSetting("voicevox.exe", "").trim();
+        String vvExe = Config.getString("voicevox.exe", "").trim();
         if (vvExe.isEmpty()) {
-            log("VOICEVOX dir not set.");
+            Config.logDebug("VOICEVOX dir not set.");
             return;
         }
         File f = new File(vvExe);
         if (!f.exists()) {
-            log("VOICEVOX exe not found: " + vvExe);
+            Config.logDebug("VOICEVOX exe not found: " + vvExe);
             return;
         }
         try {
-            log("Starting VOICEVOX: " + vvExe);
-
+            Config.logDebug("Starting VOICEVOX: " + vvExe);
             ProcessBuilder pb = new ProcessBuilder(
                     "cmd", "/c", "start", "/min", vvExe
             );
             pb.directory(f.getParentFile());
             pb.start();
-
-            log("VOICEVOX started.");
+            Config.logDebug("VOICEVOX started.");
         } catch (Exception ex) {
             ex.printStackTrace();
         }
@@ -1897,44 +1831,6 @@ public class MobMateWhisp implements NativeKeyListener {
         }
         return -1;
     }
-    public static void testOutputDevices(File f) throws Exception {
-        log("=== OUTPUT DEVICE TEST ===");
-
-        for (Mixer.Info info : AudioSystem.getMixerInfo()) {
-            try {
-                Mixer mixer = AudioSystem.getMixer(info);
-                Line.Info lineInfo = new Line.Info(Clip.class);
-
-                if (!mixer.isLineSupported(lineInfo)) {
-                    log("NG  : " + info.getName() + " (Clip not supported)");
-                    continue;
-                }
-
-                log("TRY : " + info.getName());
-
-                Clip clip = (Clip) mixer.getLine(lineInfo);
-
-                AudioInputStream ais = AudioSystem.getAudioInputStream(f);
-                clip.open(ais);
-                clip.start();
-
-                long t = System.currentTimeMillis();
-                while (clip.isRunning() && System.currentTimeMillis() - t < 2000) {
-                    Thread.sleep(50);
-                }
-
-                clip.close();
-                ais.close();
-
-                log("OK  : " + info.getName());
-
-            } catch (Exception ex) {
-                log("ERR : " + info.getName() + " -> " + ex.getMessage());
-            }
-        }
-
-        log("=== DONE ===");
-    }
     private void startPsServer() throws Exception {
         ProcessBuilder pb = new ProcessBuilder(
                 "powershell",
@@ -1953,28 +1849,39 @@ public class MobMateWhisp implements NativeKeyListener {
                 new InputStreamReader(psProcess.getInputStream(), StandardCharsets.UTF_8)
         );
     }
-    private String normalizeLaugh(String s) {
-        if (laughOptions == null || laughOptions.length == 0) {
-            return s;
-        }
-        if (s == null) return s;
 
-        boolean isLaugh =
-                s.contains("（笑）") ||
-                        s.contains("(笑)") ||
-                        s.matches(".*笑+$") ||
-                        s.contains("www") ||
-                        s.contains("L�v") ||
-                        s.contains("草");
-        if (!isLaugh) return s;
-        String pick = laughOptions[rnd.nextInt(laughOptions.length)];
+    String[] laughDetectJa;
+    String[] laughDetectAuto;
+    String[] laughReplace;
+    boolean laughEnable = true;
+    private String normalizeLaugh(String s) {
+        if (s == null || s.isEmpty()) return s;
+        if (!Config.getBool("laughs.enable", true)) return s;
+        String[] replace = Config.splitCsv(Config.get("laughs.replace"));
+        if (replace == null || replace.length == 0) return s;
+        if (!isLaughDetected(s)) return s;
+
+        String pick = replace[rnd.nextInt(replace.length)];
         if (pick.contains("/") || pick.contains("\\")) {
             playLaughSound(pick);
-            return pick;
+        }
+        return pick;
+    }
+    private boolean isLaughDetected(String s) {
+        String lang = Config.get("language");
+        if (lang == null || lang.isBlank()) lang = "auto";
+        if ("auto".equalsIgnoreCase(lang)) {
+            String[] keys = Config.splitCsv(Config.get("laughs.detect.auto"));
+            if (keys == null || keys.length == 0) {
+                keys = Config.splitCsv(Config.get("laughs.detect"));
+            }
+            return Config.matchAny(s, keys) || Config.matchAny(s.toLowerCase(Locale.ROOT), keys);
         } else {
-            return pick;
+            String[] keys = Config.splitCsv(Config.get("laughs.detect"));
+            return Config.matchAny(s, keys) || Config.matchAny(s.toLowerCase(Locale.ROOT), keys);
         }
     }
+
     boolean hasVirtualAudioDevice() {
         Mixer.Info[] mixers = AudioSystem.getMixerInfo();
         for (Mixer.Info info : mixers) {
@@ -1989,9 +1896,9 @@ public class MobMateWhisp implements NativeKeyListener {
     private void loadWhisperNative() {
         File exeDir = getExeDir();
         File libsDir = new File(exeDir, "libs");
-        log("ExeDir = " + exeDir);
-        log("LibsDir = " + libsDir);
-        log("=== MobMateWhisp Started ===");
+        Config.log("=== MobMateWhisp Started ===");
+        Config.log("ExeDir = " + exeDir);
+        Config.log("LibsDir = " + libsDir);
         Backend[] backends = new Backend[]{
                 new Backend("CUDA", new File(libsDir, "cuda"),
                         new String[]{
@@ -2023,17 +1930,20 @@ public class MobMateWhisp implements NativeKeyListener {
                 )
         };
         for (Backend b : backends) {
-            log("Checking backend: " + b.name + " in " + b.dir);
+            Config.log("Checking backend: " + b.name + " in " + b.dir);
             if (!b.dir.exists()) {
-                log(" → Directory does not exist, skipping.");
+                Config.log(" → Directory does not exist, skipping.");
                 continue;
             }
-            log("Copying backend DLLs to exe folder...");
+            Config.log("Copying backend DLLs to exe folder...");
             List<File> copied = copyDllsToExeDir(b, exeDir);
             try{ Thread.sleep(300); } catch (Exception e) {}
-            log("Trying to load backend: " + b.name);
+            Config.log("Trying to load backend: " + b.name);
             if (safeLoad(b.dir + File.separator + b.mainDll)) {
                 System.out.println("Loaded " + b.name + " backend successfully.");
+                if (b.name != "CPU") {
+                    cpugpumode = b.name + " MODE";
+                }
                 return;
             }
         }
@@ -2084,13 +1994,13 @@ public class MobMateWhisp implements NativeKeyListener {
     }
     private boolean safeLoad(String path) {
         File f = new File(path);
-        log("safeLoad: " + path);
+        Config.log("safeLoad: " + path);
         if (!f.exists()) return false;
         try {
             System.load(f.getAbsolutePath());
             return true;
         } catch (UnsatisfiedLinkError e) {
-            log("Failed to load: " + path + " (" + e.getMessage() + ")");
+            Config.logError("Failed to load: " + path + " (" + e.getMessage() + ")", e);
             return false;
         }
     }private List<File> copyDllsToExeDir(Backend b, File exeDir) {
@@ -2104,10 +2014,10 @@ public class MobMateWhisp implements NativeKeyListener {
             if (src.exists()) {
                 try {
                     Files.copy(src.toPath(), dst.toPath());
-//                    log("Copied: " + src + " → " + dst);
+//                    Config.log("Copied: " + src + " → " + dst);
                     copied.add(dst);
                 } catch (Exception e) {
-                    log("Copy failed: " + e.getMessage());
+                    Config.logError("Copy failed: " + e.getMessage(),e);
                 }
             }
         }
@@ -2116,12 +2026,105 @@ public class MobMateWhisp implements NativeKeyListener {
         if (mainDst.exists()) mainDst.delete();
         try {
             Files.copy(mainSrc.toPath(), mainDst.toPath());
-//            log("Copied main DLL: " + mainDst);
+//            Config.log("Copied main DLL: " + mainDst);
             copied.add(mainDst);
         } catch (Exception e) {
-            log("Copy failed: " + e.getMessage());
+            Config.logError("Copy failed: " + e.getMessage(), e);
         }
         return copied;
     }
 
+    private static void ensureInitialConfig() {
+        File outtts = new File("_outtts.txt");
+        if (outtts.exists()) return;
+
+        int choice = showLanguageSelectDialog();
+        if (choice < 0) {
+            System.exit(0);
+        }
+        String suffix;
+        switch (choice) {
+            case 1: suffix = "_ja"; break;
+            case 2: suffix = "_zh_cn"; break;
+            case 3: suffix = "_zh_tw"; break;
+            case 4: suffix = "_ko"; break;
+            case 0:
+            default: suffix = "_en"; break;
+        }
+        copyPreset("libs/preset/_outtts" + suffix + ".txt", "_outtts.txt");
+        copyPreset("libs/preset/_dictionary" + suffix + ".txt", "_dictionary.txt");
+        copyPreset("libs/preset/_ignore" + suffix + ".txt", "_ignore.txt");
+
+        JOptionPane.showMessageDialog(
+                null,
+                "Initial configuration created.\nThe application will restart.",
+                "MobMate",
+                JOptionPane.INFORMATION_MESSAGE
+        );
+
+        restartSelf();
+    }
+    private static void copyPreset(String srcName, String dstName) {
+        try {
+            Path src = Paths.get(srcName);
+            Path dst = Paths.get(dstName);
+            if (!Files.exists(src)) return;
+
+            Files.copy(src, dst, StandardCopyOption.REPLACE_EXISTING);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+    private static void restartSelf() {
+        try {
+            String javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java";
+            File current = new File(
+                    MobMateWhisp.class
+                            .getProtectionDomain()
+                            .getCodeSource()
+                            .getLocation()
+                            .toURI()
+            );
+            ProcessBuilder pb;
+            if (current.getName().endsWith(".exe")) {
+                // launch4j exe
+                pb = new ProcessBuilder(current.getAbsolutePath());
+            } else {
+                // jar 実行
+                pb = new ProcessBuilder(
+                        javaBin,
+                        "-jar",
+                        current.getAbsolutePath()
+                );
+            }
+            pb.start();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        System.exit(0);
+    }
+    private static int showLanguageSelectDialog() {
+        String[] options = {
+                "English",
+                "日本語 (Japanese)",
+                "中文・简体 (Chinese Simplified)",
+                "中文・繁體 (Chinese Traditional)",
+                "한국어 (Korean)"
+        };
+        JComboBox<String> combo = new JComboBox<>(options);
+        JPanel panel = new JPanel(new BorderLayout(8, 8));
+        panel.add(new JLabel("Select your language / 言語選択"), BorderLayout.NORTH);
+        panel.add(combo, BorderLayout.CENTER);
+        int result = JOptionPane.showConfirmDialog(
+                null,
+                panel,
+                "MobMate Initial Setup",
+                JOptionPane.OK_CANCEL_OPTION,
+                JOptionPane.PLAIN_MESSAGE
+        );
+        if (result != JOptionPane.OK_OPTION) {
+            return -1;
+        }
+        return combo.getSelectedIndex();
+    }
 }

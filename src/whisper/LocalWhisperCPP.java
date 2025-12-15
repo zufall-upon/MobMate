@@ -2,6 +2,8 @@ package whisper;
 
 import java.io.*;
 import java.util.*;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 import javax.sound.sampled.AudioInputStream;
 import javax.sound.sampled.AudioSystem;
@@ -14,24 +16,6 @@ import io.github.ggerganov.whispercpp.params.WhisperSamplingStrategy;
 
 public class LocalWhisperCPP {
 
-    private static PrintWriter LOG;
-    static {
-        try {
-            File out = new File("_log.txt");
-            LOG = new PrintWriter(new FileWriter(out, true));
-            LOG.println("=== MobMateWhisp Started ===");
-            LOG.flush();
-        } catch (Exception e) {}
-    }
-
-    static private void log(String s) {
-        System.out.println(s);
-        if (LOG != null) {
-            LOG.println(s);
-            LOG.flush();
-        }
-    }
-
     private String language;
     private String initialPrompt;
     private Map<String, List<String>> dictMap = new HashMap<>();
@@ -42,8 +26,9 @@ public class LocalWhisperCPP {
     public LocalWhisperCPP(File model) throws FileNotFoundException {
         whisper.initContext(model);
 
-        this.language = loadSetting("language", "ja");
+        this.language = loadSetting("language", "en");
         this.initialPrompt = loadSetting("initial_prompt", "");
+        Config.log("=== Whisper init  === lang=" + this.language + ";");
         loadDictionary();
     }
 
@@ -55,7 +40,7 @@ public class LocalWhisperCPP {
         float[] floats = new float[b.length / 2];
 
         WhisperFullParams params = whisper.getFullDefaultParams(WhisperSamplingStrategy.WHISPER_SAMPLING_BEAM_SEARCH);
-        params.setProgressCallback((ctx, state, progress, user_data) -> log("progress: " + progress));
+        params.setProgressCallback((ctx, state, progress, user_data) -> Config.log("progress: " + progress));
         params.print_progress = CBool.FALSE;
         params.language = this.language;
         params.initial_prompt = initialPrompt;
@@ -74,11 +59,27 @@ public class LocalWhisperCPP {
             result = whisper.fullTranscribe(params, floats);
 
             // === Post-filter ignore words ===
+            String ignoreMode = Config.get("ignore.mode", "simple"); // simple | regex
             List<String> ignoreWords = loadIgnoreWords();
-            for (String w : ignoreWords) {
-                if (result.contains(w)) {
-                    if (true) log("Ignored by word filter: " + w);
-                    return "";
+            if ("regex".equalsIgnoreCase(ignoreMode)) {
+                for (String rule : ignoreWords) {
+                    try {
+                        Pattern p = Pattern.compile(rule);
+                        if (p.matcher(result).find()) {
+                            Config.log("Ignored by regex filter: " + rule);
+                            return "";
+                        }
+                    } catch (PatternSyntaxException e) {
+                        Config.logError("Invalid regex ignored: " + rule,e);
+                    }
+                }
+            } else {
+                // simple mode
+                for (String w : ignoreWords) {
+                    if (result.contains(w)) {
+                        Config.log("Ignored by word filter: " + w);
+                        return "";
+                    }
                 }
             }
 
@@ -125,14 +126,14 @@ public class LocalWhisperCPP {
     }
 
     public static void main(String[] args) throws Exception {
-        log("-1");
+        Config.logDebug("-1");
         LocalWhisperCPP w = new LocalWhisperCPP(new File("models", "ggml-small.bin"));
-        log("-");
+        Config.logDebug("-");
         w.transcribe(new File("jfk.wav"));
         long t1 = System.currentTimeMillis();
         w.transcribe(new File("jfk.wav"));
         long t2 = System.currentTimeMillis();
-        log("LocalWhisperCPP.main() " + (t2 - t1) + " ms");
+        Config.logDebug("LocalWhisperCPP.main() " + (t2 - t1) + " ms");
     }
 
     private static String loadSetting(String key, String defaultValue) {
