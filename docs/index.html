@@ -1,1 +1,733 @@
-
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>MobMateWhispTalk</title>
+  <style>
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      background-color: #1a1a1a;
+      border: none;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+    /* CSS for syntax highlighting */
+    pre > code.sourceCode { white-space: pre; position: relative; }
+    pre > code.sourceCode > span { line-height: 1.25; }
+    pre > code.sourceCode > span:empty { height: 1.2em; }
+    .sourceCode { overflow: visible; }
+    code.sourceCode > span { color: inherit; text-decoration: inherit; }
+    div.sourceCode { margin: 1em 0; }
+    pre.sourceCode { margin: 0; }
+    @media screen {
+    div.sourceCode { overflow: auto; }
+    }
+    @media print {
+    pre > code.sourceCode { white-space: pre-wrap; }
+    pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+    }
+    pre.numberSource code
+      { counter-reset: source-line 0; }
+    pre.numberSource code > span
+      { position: relative; left: -4em; counter-increment: source-line; }
+    pre.numberSource code > span > a:first-child::before
+      { content: counter(source-line);
+        position: relative; left: -1em; text-align: right; vertical-align: baseline;
+        border: none; display: inline-block;
+        -webkit-touch-callout: none; -webkit-user-select: none;
+        -khtml-user-select: none; -moz-user-select: none;
+        -ms-user-select: none; user-select: none;
+        padding: 0 4px; width: 4em;
+        color: #aaaaaa;
+      }
+    pre.numberSource { margin-left: 3em; border-left: 1px solid #aaaaaa;  padding-left: 4px; }
+    div.sourceCode
+      {   }
+    @media screen {
+    pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+    }
+    code span.al { color: #ff0000; font-weight: bold; } /* Alert */
+    code span.an { color: #60a0b0; font-weight: bold; font-style: italic; } /* Annotation */
+    code span.at { color: #7d9029; } /* Attribute */
+    code span.bn { color: #40a070; } /* BaseN */
+    code span.bu { color: #008000; } /* BuiltIn */
+    code span.cf { color: #007020; font-weight: bold; } /* ControlFlow */
+    code span.ch { color: #4070a0; } /* Char */
+    code span.cn { color: #880000; } /* Constant */
+    code span.co { color: #60a0b0; font-style: italic; } /* Comment */
+    code span.cv { color: #60a0b0; font-weight: bold; font-style: italic; } /* CommentVar */
+    code span.do { color: #ba2121; font-style: italic; } /* Documentation */
+    code span.dt { color: #902000; } /* DataType */
+    code span.dv { color: #40a070; } /* DecVal */
+    code span.er { color: #ff0000; font-weight: bold; } /* Error */
+    code span.ex { } /* Extension */
+    code span.fl { color: #40a070; } /* Float */
+    code span.fu { color: #06287e; } /* Function */
+    code span.im { color: #008000; font-weight: bold; } /* Import */
+    code span.in { color: #60a0b0; font-weight: bold; font-style: italic; } /* Information */
+    code span.kw { color: #007020; font-weight: bold; } /* Keyword */
+    code span.op { color: #666666; } /* Operator */
+    code span.ot { color: #007020; } /* Other */
+    code span.pp { color: #bc7a00; } /* Preprocessor */
+    code span.sc { color: #4070a0; } /* SpecialChar */
+    code span.ss { color: #bb6688; } /* SpecialString */
+    code span.st { color: #4070a0; } /* String */
+    code span.va { color: #19177c; } /* Variable */
+    code span.vs { color: #4070a0; } /* VerbatimString */
+    code span.wa { color: #60a0b0; font-weight: bold; font-style: italic; } /* Warning */
+  </style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">MobMateWhispTalk</h1>
+</header>
+<h1 id="mobmatewhisptalk"><img
+src="https://github.com/zufall-upon/MobMate/releases/tag/release"
+alt="MobMateWhispTalk" /></h1>
+<p><strong>For quiet players who still want to be loud.</strong></p>
+<p><img
+src="https://github.com/zufall-upon/MobMate/blob/main/logo01.png"
+alt="MobMateWhispTalk" /></p>
+<p>ローカルで動作する <strong>STT + TTS（匿名発声）ツール</strong>
+です。<br />
+This is a <strong>local-only speech-to-text + text-to-speech (anonymous
+voice)</strong> tool.</p>
+<p>Whisper.cpp / Java / NAudio を使用しています。<br />
+Built with Whisper.cpp / Java / NAudio.</p>
+<p>ゲームなどのVCで、話した内容をリアルタイムに<br />
+<strong>匿名音声として再発声</strong>します。<br />
+It converts your voice into <strong>anonymous synthesized
+speech</strong> in real time for voice chats (VC).</p>
+<p>短いリアクション・応答向けのVC利用を想定しています。<br />
+Designed mainly for <strong>short reactions and quick
+responses</strong>.</p>
+<p>ラジオチャット（聞き専・コメント主体）のコミュニケーションに慣れたユーザーが、
+無理なくボイスチャットに参加するためのツールです。 Designed for users
+who are comfortable with radio-style, listener-based communication, and
+want a low-pressure way to participate in voice chat.</p>
+<p><img
+src="https://raw.githubusercontent.com/zufall-upon/MobMate/refs/heads/main/mov01.gif"
+alt="MobMateWhispTalk" /></p>
+<h2 id="-why-mobmate--コンセプト">💡 Why MobMate / コンセプト</h2>
+<h3 id="-日本語">🇯🇵 日本語</h3>
+<p>MobMate
+は、<strong>完全ローカルで動作する音声認識（STT）＋音声合成（TTS）による匿名発声ツール</strong>です。<br />
+Whisper.cpp / Java / NAudio
+を利用し、ボイスチャット上の音声をリアルタイムに<br />
+<strong>「音声 → テキスト → 別の声で再発声」</strong> します。</p>
+<p>リアルタイム配信における「コメント読み上げ」のような仕組みを、<br />
+<strong>ゲーム内ボイスチャット（VC）向けに再構成</strong>したツールです。</p>
+<p>ゲームなどのVC上で、自分の声の特徴（声質・年齢・性別など）を直接出さずに、<br />
+テキストを合成音声として流すことができます。</p>
+<p>たとえば以下のような用途を想定しています：</p>
+<ul>
+<li>「了解」「待って」「敵いた」などの短い指示</li>
+<li>笑い声などの軽いリアクション</li>
+<li>VCに積極的に参加しづらい状況での意思表示</li>
+</ul>
+<p>話すことにハードルを感じる理由があっても、<br />
+<strong>コミュニケーションそのものを諦めなくていい</strong>。<br />
+MobMate は、そんな「聞き専寄り」の人のための<br />
+<strong>汎用・擬似ラジオチャットツール</strong>です。</p>
+<hr />
+<h3 id="-english">🇺🇸 English</h3>
+<p>MobMate is a <strong>fully local Speech-to-Text (STT) and
+Text-to-Speech (TTS) tool</strong> designed for anonymous voice
+output.<br />
+Using Whisper.cpp, Java, and NAudio, it converts your voice in real time
+from<br />
+<strong>speech → text → synthesized anonymous voice</strong>.</p>
+<p>You can think of it as a <em>live comment reader</em>—<br />
+but reimagined for <strong>in-game voice chat</strong>.</p>
+<p>Instead of transmitting your raw voice, MobMate outputs synthesized
+speech,<br />
+allowing you to communicate without revealing your natural voice
+characteristics<br />
+(such as tone, age, or gender).</p>
+<p>Typical use cases include:</p>
+<ul>
+<li>Short commands like “OK”, “Wait”, or “Enemy spotted”</li>
+<li>Simple reactions such as laughter</li>
+<li>Participating in VC when speaking directly feels difficult</li>
+</ul>
+<p>Even if you have reasons to stay quiet,<br />
+<strong>you shouldn’t have to give up communicating
+altogether</strong>.</p>
+<p>MobMate is designed as a<br />
+<strong>general-purpose pseudo radio-style chat tool</strong><br />
+for players who usually just listen—but still want to be heard.</p>
+<hr />
+<h3 id="-features-at-a-glance--主な特徴">🧩 Features at a glance /
+主な特徴</h3>
+<h4 id="-日本語-1">🇯🇵 日本語</h4>
+<ul>
+<li><strong>完全ローカル動作</strong>（クラウド送信なし・Ping安定）</li>
+<li><strong>Whisper.cpp による音声認識（STT）</strong></li>
+<li><strong>VOICEVOX API 連携による TTS（匿名発声）</strong>
+に対応（任意）</li>
+<li><strong>短い応答・リアクション専用</strong>の VC
+コミュニケーションを想定</li>
+</ul>
+<h4 id="-english-1">🇺🇸 English</h4>
+<ul>
+<li><strong>Fully local execution</strong> (no cloud, stable ping)</li>
+<li><strong>Speech recognition powered by Whisper.cpp
+(STT)</strong></li>
+<li><strong>Optional TTS via VOICEVOX API</strong> (anonymous voice
+output)</li>
+<li>Designed for <strong>short responses and quick reactions</strong> in
+voice chat</li>
+</ul>
+<hr />
+<h3 id="-笑い検知置換機能--natural-laugh-detection">😂
+笑い検知・置換機能 / Natural Laugh Detection</h3>
+<p>MobMateWhispTalk には、話している最中の <strong>自然な笑い声</strong>
+を自動で検知し、
+別の表現（テキストまたは効果音）に変換する機能があります。</p>
+<p>MobMateWhispTalk includes a <strong>natural laugh detection</strong>
+feature<br />
+that detects actual laughter in your voice and converts it into text or
+sound.</p>
+<p>Whisper.cpp（例: ggml-small.bin）の特性により、<br />
+マイクの前で「フフッ」「ハハッ」と笑うだけで、<br />
+音声認識結果に <code>(笑)</code> や <code>LOL</code> といった
+<strong>笑いトークン</strong> が含まれることがあります。</p>
+<p>Thanks to Whisper.cpp models (e.g. ggml-small.bin),<br />
+natural laughter like “haha” or “heh” is often automatically
+recognized<br />
+as laugh tokens such as <code>(笑)</code> or <code>LOL</code> in the
+transcription.</p>
+<p>MobMate はこの挙動を利用し、<br />
+<strong>意図的に言葉を発しなくても</strong>、感情としての「笑い」を拾って処理します。</p>
+<p>MobMate leverages this behavior to capture <strong>emotional
+laughter</strong>,<br />
+even when you are not explicitly saying words like “lol” or “haha”.</p>
+<h4 id="-笑いの変換処理--laugh-replacement">⚙ 笑いの変換処理 / Laugh
+Replacement</h4>
+<p>検知された笑い表現は、<br />
+あらかじめ設定した <strong>文字列</strong> または <strong>WAV
+ファイル</strong> に置き換えられます。</p>
+<p>Detected laughter can be replaced with custom <strong>text
+expressions</strong><br />
+or <strong>WAV-based sound effects</strong>.</p>
+<pre><code>laughs.enable=true
+laughs.detect=（笑）,(笑),笑,草,ｗ,www,L�v,lol,lolol,lmao,rofl,laugh
+laughs.detect.auto=（笑）,笑,草,ｗ,www,lol,lmao,rofl,ㅋㅋ,ㅎㅎ,哈哈,呵呵
+laugh.replace=ワハハハ,ふふふっ,laughsounds/laughter01.wav</code></pre>
+<ul>
+<li>自然な笑い声 → Whisper が (笑) 等を生成</li>
+<li>MobMate がそれを検知して変換</li>
+<li>VC には 別の声・効果音として再生</li>
+</ul>
+<p>Natural laughter → Whisper generates a laugh marker → MobMate detects
+it → replaces it with another voice or sound</p>
+<h2 id="-動作環境--system-requirements">🟢 動作環境 / System
+Requirements</h2>
+<ul>
+<li>Windows 10 / 11 (64bit)</li>
+</ul>
+<h3 id="-必須ランタイム--required-runtime">🧩 必須ランタイム / Required
+Runtime</h3>
+<p>Visual C++ 2015–2022 (x64)</p>
+<p><a
+href="https://aka.ms/vs/17/release/vc_redist.x64.exe">https://aka.ms/vs/17/release/vc_redist.x64.exe</a></p>
+<hr />
+<h2 id="-ダウンロード--download">🚀 ダウンロード / Download</h2>
+<p><a
+href="https://github.com/zufall-upon/MobMate/releases/tag/release">https://github.com/zufall-upon/MobMate/releases/tag/release</a></p>
+<hr />
+<h2 id="-起動方法--how-to-run">🚀 起動方法 / How to Run</h2>
+<ol type="1">
+<li>zip を展開<br />
+Extract the zip file</li>
+<li><code>_run.bat</code> をダブルクリック<br />
+Double-click <code>_run.bat</code></li>
+</ol>
+<h3 id="-first-launch--初回起動について">🟢 First Launch /
+初回起動について</h3>
+<p>On first launch, if <code>_outtts.txt</code> does not exist, MobMate
+will ask you to select a language.</p>
+<p>初回起動時、<code>_outtts.txt</code> が存在しない場合は<br />
+言語選択ダイアログが表示されます。</p>
+<ul>
+<li>English</li>
+<li>日本語</li>
+<li>中文・简体 (Chinese Simplified),</li>
+<li>中文・繁體 (Chinese Traditional),</li>
+<li>한국어 (Korean)</li>
+</ul>
+<p>Based on your selection, a preset configuration file will be copied
+automatically.</p>
+<p>選択した言語に応じた初期設定ファイルが自動で作成されます。</p>
+<hr />
+<h2 id="-whisperモデルの配置--whisper-model-setup">🔹
+Whisperモデルの配置 / Whisper Model Setup</h2>
+<p><code>models</code> フォルダに Whisper
+のモデルファイルを配置してください。<br />
+Place the Whisper model file inside the <code>models</code> folder.</p>
+<ul>
+<li><code>ggml-small.bin</code><br />
+<a
+href="https://huggingface.co/ggerganov/whisper.cpp/tree/main">https://huggingface.co/ggerganov/whisper.cpp/tree/main</a></li>
+</ul>
+<hr />
+<h3 id="-推奨モデル--recommended-model">👉 推奨モデル / Recommended
+Model</h3>
+<p><strong><code>ggml-small.bin</code>（推奨 /
+Recommended）</strong></p>
+<p>精度・速度・安定性のバランスが最も良く、<br />
+MobMateWhispTalk の用途（短い発話・リアクション）に最適です。</p>
+<p>Offers the best balance of accuracy, speed, and stability,<br />
+and is well suited for short voice chat interactions.</p>
+<h4 id="他モデルとの比較--model-comparison">他モデルとの比較 / Model
+Comparison</h4>
+<ul>
+<li><p><strong>Tiny</strong><br />
+精度不足で誤認識が多い<br />
+Low accuracy, frequent misrecognition</p></li>
+<li><p><strong>Medium</strong><br />
+正常動作するが、サイズが大きく動作が重い<br />
+Works correctly, but large and noticeably slower</p></li>
+<li><p><strong>Large / Large-v3-turbo</strong><br />
+出力が不安定でスパム的な認識が増えやすい<br />
+Unstable output, prone to repetitive or spam-like transcription</p></li>
+</ul>
+<p>👉 <strong>結論 / Conclusion</strong><br />
+まずは <code>ggml-small.bin</code> の使用を強く推奨します ⭐</p>
+<hr />
+<h2 id="-virtual-audio-setup--仮想オーディオ設定">🎧 Virtual Audio Setup
+/ 仮想オーディオ設定</h2>
+<p>MobMate requires a <strong>virtual audio device</strong> to route TTS
+output into games or voice chat software.<br />
+MobMate は、TTS の音声をゲームやボイスチャットに送るために<br />
+<strong>仮想オーディオデバイス</strong>が必要です。</p>
+<hr />
+<h3 id="recommended-tools--推奨ツール">Recommended tools /
+推奨ツール</h3>
+<ul>
+<li><p><strong>VB-Audio Virtual Cable (Windows)</strong><br />
+<a
+href="https://vb-audio.com/Cable/">https://vb-audio.com/Cable/</a></p>
+<p>Simple and lightweight virtual audio cable.<br />
+シンプルで軽量な定番の仮想オーディオケーブルです。</p></li>
+<li><p><strong>SteelSeries Sonar (Windows)</strong><br />
+<a
+href="https://jp.steelseries.com/gg/sonar">https://jp.steelseries.com/gg/sonar</a></p>
+<p>Useful if Windows keeps changing the default audio device.<br />
+Windows
+が毎回既定のオーディオデバイスを変更してしまう場合に便利です。</p>
+<p>※ Recommended for users who struggle with unstable default device
+switching<br />
+※ 既定デバイスが勝手に変わる環境の方向け</p></li>
+</ul>
+<hr />
+<h3 id="setup-concept--設定の考え方">Setup concept / 設定の考え方</h3>
+<ul>
+<li><strong>Audio Input</strong>: Your physical microphone<br />
+入力：実際に話すマイク</li>
+<li><strong>Audio Output</strong>: Virtual audio device<br />
+出力：仮想オーディオデバイス</li>
+<li>Configure your game or voice chat app to use the virtual device as
+its microphone<br />
+ゲームや VC 側では、その仮想デバイスをマイクとして設定します</li>
+</ul>
+<hr />
+<h2 id="-basic-usage--基本的な使い方">🎤 Basic Usage /
+基本的な使い方</h2>
+<h3 id="initial-setup--初期設定">Initial setup / 初期設定</h3>
+<p>Open the <strong>Prefs</strong> button and configure the following
+recommended settings.<br />
+<strong>Prefs ボタンから以下の推奨設定を行ってください。</strong></p>
+<p><strong>Recommended settings / 推奨設定</strong></p>
+<ul>
+<li><strong>AutoPaste</strong>: OFF<br />
+自動貼り付けを無効にします</li>
+<li><strong>Auto type</strong>: OFF<br />
+自動入力を無効にします</li>
+<li><strong>Silence detection</strong>: ON<br />
+無音検出を有効にします</li>
+<li><strong>Key trigger mode</strong>: Start / Stop<br />
+キーで録音の開始・停止を切り替えます</li>
+<li><strong>Audio Inputs</strong>: Select your physical microphone<br />
+使用するマイクを指定してください</li>
+<li><strong>Audio Outputs</strong>: Select a virtual audio device<br />
+別の仮想マイクを指定します<br />
+（VB-Audio Virtual Cable や SteelSeries Sonar で動作確認済み）</li>
+</ul>
+<hr />
+<h3 id="how-to-use--使い方">How to use / 使い方</h3>
+<ul>
+<li>Press the hotkey (<strong>Default: F9</strong>) or click
+<strong>Start</strong> to begin recording<br />
+ホットキー（初期設定：F9）または「Start」ボタンで録音を開始します</li>
+<li>Your voice is transcribed (STT) and converted into speech
+(TTS)<br />
+音声が認識され、テキスト化された後に音声として再生されます</li>
+<li>Recognition results are appended to the end of
+<code>_outtts.txt</code><br />
+認識結果は <code>_outtts.txt</code> の末尾に追記されます</li>
+<li>The program monitors the latest line and plays it via TTS<br />
+ファイルの最新行を監視し、その内容を TTS で再生します</li>
+</ul>
+<hr />
+<h3 id="notes--補足">Notes / 補足</h3>
+<ul>
+<li>Designed for <strong>short reactions and quick voice
+responses</strong><br />
+短いリアクションや即時発声向けに設計されています</li>
+</ul>
+<hr />
+<h2 id="-匿名発声tts--anonymous-tts">🔊 匿名発声（TTS） / Anonymous
+TTS</h2>
+<p>MobMate can optionally integrate with <strong>VOICEVOX</strong> for
+text-to-speech output.<br />
+MobMate は <strong>VOICEVOX</strong>
+と連携して匿名発声（TTS）を行うことができます（任意）。</p>
+<hr />
+<h3 id="voicevox-integration--voicevox-連携">VOICEVOX Integration /
+VOICEVOX 連携</h3>
+<div class="sourceCode" id="cb2"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a><span class="dt">voicevox.exe</span><span class="ot">=</span><span class="st">&quot;M:\VOICEVOX\VOICEVOX.exe&quot;</span></span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a><span class="dt">voicevox.api</span><span class="ot">=</span><span class="st">&quot;http://127.0.0.1:50021&quot;</span></span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a><span class="dt">voicevox.speaker</span><span class="ot">=</span><span class="dv">3</span></span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a><span class="dt">initial_prompt</span><span class="ot">=</span><span class="st">This is an in-game radio communication. Speak briefly and clearly. Do not output subtitles, background music, sound effects, or emoticons. Laughter is allowed. Focus only on spoken content. Common words include &quot;roger&quot;, &quot;enemy&quot;, &quot;ally&quot;, &quot;help&quot;.</span></span></code></pre></div>
+<div class="sourceCode" id="cb3"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb3-1"><a href="#cb3-1" aria-hidden="true" tabindex="-1"></a><span class="dt">voicevox.exe</span><span class="ot">=</span><span class="st">&quot;M:\VOICEVOX\VOICEVOX.exe&quot;</span></span>
+<span id="cb3-2"><a href="#cb3-2" aria-hidden="true" tabindex="-1"></a><span class="dt">voicevox.api</span><span class="ot">=</span><span class="st">&quot;http://127.0.0.1:50021&quot;</span></span>
+<span id="cb3-3"><a href="#cb3-3" aria-hidden="true" tabindex="-1"></a><span class="dt">voicevox.speaker</span><span class="ot">=</span><span class="dv">3</span></span>
+<span id="cb3-4"><a href="#cb3-4" aria-hidden="true" tabindex="-1"></a><span class="dt">initial_prompt</span><span class="ot">=</span><span class="st">これはゲーム内の無線チャットです。短く簡潔に話す。字幕、BGM、効果音、顔文字は出力しないで。笑い声は出していい。話している内容だけに集中してください。使われる単語は「了解、敵、味方、助けて」</span></span>
+<span id="cb3-5"><a href="#cb3-5" aria-hidden="true" tabindex="-1"></a><span class="dt">--------------------------↑設定↓ログ--------------------------</span></span></code></pre></div>
+<h2 id="-configuration-options--各項目の説明">📝 Configuration Options /
+各項目の説明</h2>
+<p>The <code>_outtts.txt</code> file works as both
+<strong>configuration</strong> and <strong>log</strong>.<br />
+設定はファイル上部に記述してください。下部はログ領域になります。</p>
+<hr />
+<h3 id="-available-settings--設定項目一覧">🔧 Available Settings /
+設定項目一覧</h3>
+<table>
+<thead>
+<tr class="header">
+<th>Setting</th>
+<th>Description (EN)</th>
+<th>説明 (JP)</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>language</code></td>
+<td>Whisper language hint (<code>ja / en / ko / zh / auto</code>)</td>
+<td>Whisper の言語ヒント（ja / en / ko / zh / auto）</td>
+</tr>
+<tr class="even">
+<td><code>initial_prompt</code></td>
+<td>Initial prompt for Whisper (shorter = more stable)</td>
+<td>Whisper 用の事前プロンプト（短いほど安定）</td>
+</tr>
+<tr class="odd">
+<td><code>silence</code></td>
+<td>Silence detection threshold (ms, higher = more tolerant)</td>
+<td>無音判定（ミリ秒。大きいほど判定が甘くなる）</td>
+</tr>
+<tr class="even">
+<td><code>silence_hard</code></td>
+<td>Hard silence detection to suppress noise</td>
+<td>ハード無音判定（ノイズ誤認識を抑制）</td>
+</tr>
+<tr class="odd">
+<td><code>voicevox.exe</code></td>
+<td>Path to VOICEVOX executable (optional)</td>
+<td>VOICEVOX 実行ファイルのパス（任意）</td>
+</tr>
+<tr class="even">
+<td><code>voicevox.api</code></td>
+<td>VOICEVOX API endpoint</td>
+<td>VOICEVOX API の URL</td>
+</tr>
+<tr class="odd">
+<td><code>voicevox.speaker</code></td>
+<td>VOICEVOX speaker ID</td>
+<td>VOICEVOX 話者 ID</td>
+</tr>
+<tr class="even">
+<td><code>laughs.enable</code></td>
+<td>Enable natural laugh detection</td>
+<td>笑い検知機能の有効 / 無効</td>
+</tr>
+<tr class="odd">
+<td><code>laughs.detect</code></td>
+<td>Laugh tokens for the selected language</td>
+<td>言語別の笑い検知トークン</td>
+</tr>
+<tr class="even">
+<td><code>laughs.detect.auto</code></td>
+<td>Laugh tokens for auto language mode</td>
+<td>auto モード用の多言語笑い検知</td>
+</tr>
+<tr class="odd">
+<td><code>laughs.replace</code></td>
+<td>Replacement text or WAV paths for laughter</td>
+<td>笑いを置換する文字列または WAV</td>
+</tr>
+<tr class="even">
+<td><code>ignore.mode</code></td>
+<td>Ignore filter mode (<code>simple</code> or <code>regex</code>)</td>
+<td>無視フィルタ方式（simple / regex）</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h3 id="-voicevox-notes--voicevox-に関する注意">🔊 VOICEVOX Notes /
+VOICEVOX に関する注意</h3>
+<ul>
+<li>VOICEVOX is automatically detected if <code>voicevox.exe</code> path
+is valid<br />
+<code>voicevox.exe</code>
+に有効なパスが設定されていれば自動認識されます</li>
+<li>VOICEVOX will be launched automatically when MobMate starts<br />
+MobMate 起動時に VOICEVOX も自動起動します</li>
+<li>Default API port is <strong>50021</strong><br />
+API ポートのデフォルトは <strong>50021</strong> です</li>
+<li>Speaker ID must be checked separately<br />
+話者 ID は VOICEVOX 側で調べてください</li>
+</ul>
+<p>⚠ <strong>VOICEVOX is a third-party tool</strong><br />
+⚠ <strong>VOICEVOX は第三者製ツールです</strong></p>
+<p><a
+href="https://voicevox.hiroshiba.jp/">https://voicevox.hiroshiba.jp/</a></p>
+<hr />
+<hr />
+<h2 id="-_ignoretxt-ignored-words">📄 <code>_ignore.txt</code> (Ignored
+Words)</h2>
+<p>このファイルには <strong>無視したい単語やフレーズ</strong> を 1
+行ずつ記述します。<br />
+Write <strong>words or phrases to be ignored</strong>, one per line.</p>
+<p>例 / Example: simple(部分一致）</p>
+<div class="sourceCode" id="cb4"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a><span class="dt">えーと  uh</span></span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a><span class="dt">あのー  um</span></span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a><span class="dt">えっと  aa</span></span></code></pre></div>
+<p>例 / Example: regex(正規表現)</p>
+<div class="sourceCode" id="cb5"><pre
+class="sourceCode ini"><code class="sourceCode ini"><span id="cb5-1"><a href="#cb5-1" aria-hidden="true" tabindex="-1"></a><span class="dt">ん$　　　Aa$</span></span>
+<span id="cb5-2"><a href="#cb5-2" aria-hidden="true" tabindex="-1"></a><span class="dt">^えー+   Ye$</span></span></code></pre></div>
+<p>このリストに含まれる語句は、<strong>ログにも TTS
+出力にも表示・再生されません</strong>。<br />
+Any phrase listed here will be <strong>excluded from both logs and TTS
+output</strong>.</p>
+<p>短いフィラー音（例: “uh”, “um”,
+“えーと”）を除外する用途に向いています。<br />
+Useful for filtering filler words such as “uh”, “um”, etc.</p>
+<hr />
+<h2 id="-_dictionarytxt-word-replacement-dictionary">📄
+<code>_dictionary.txt</code> (Word Replacement Dictionary)</h2>
+<p>このファイルには <strong>発声時に変換したい単語</strong> を 1
+行ずつ記述します。<br />
+Write <strong>words you want to be replaced during TTS output</strong>,
+one per line.</p>
+<p>一致した語句は <strong>音声発声時に自動的に変換</strong>
+されます。<br />
+Matched words will be <strong>automatically replaced at TTS playback
+time</strong>.</p>
+<p>※ 動作しない場合、<code>_ignore.txt</code>
+が優先されている可能性があります。<br />
+※ If it does not work, the word may be overridden by
+<code>_ignore.txt</code>.</p>
+<p>語句の登録先は用途に応じて調整してください。<br />
+Adjust which file to use depending on your purpose.</p>
+<p>例：</p>
+<pre><code>frag=フラグ, グレネード, 手りゅう弾        # frag → grenade / explosive
+tango=敵                                   # tango → enemy (NATO phonetic slang)
+fuck=チョメ, Fワード                       # fuck → censored / softened expression</code></pre>
+<hr />
+<h2 id="-license--ライセンス">🔖 License / ライセンス</h2>
+<p>本ツールは、複数のオープンソースソフトウェア（OSS）を組み合わせて構成されています。<br />
+This tool is built using multiple open-source software components.</p>
+<h3 id="-included-oss--使用している主なoss">📦 Included OSS /
+使用している主なOSS</h3>
+<ul>
+<li>MisterWhisper — MIT License</li>
+<li>Whisper.cpp — MIT License</li>
+<li>JNA — Apache License 2.0</li>
+<li>NAudio — MIT License</li>
+<li>JNativeHook — BSD License</li>
+<li>VOICEVOX API — Subject to each character's individual license</li>
+</ul>
+<h3 id="-distribution--配布について">📄 Distribution / 配布について</h3>
+<p>本ツール自体の配布は <strong>MIT
+相当ライセンス</strong>で可能です。<br />
+This tool itself may be distributed under an MIT-equivalent license.</p>
+<p>VOICEVOX の話者（キャラクター）利用については、<br />
+<strong>各キャラクターごとのライセンス条件に従ってください。</strong><br />
+Usage of VOICEVOX voices must comply with each character's license
+terms.</p>
+<hr />
+<p>🙏 <strong>Thanks / 謝辞</strong></p>
+<ul>
+<li>Whisper.cpp</li>
+<li>VOICEVOX</li>
+<li>GPT の友達 / GPT, my coding companion</li>
+</ul>
+<hr />
+<h3 id="-based-on--ベースプロジェクト">🔗 Based on /
+ベースプロジェクト</h3>
+<p>This project is based on <strong>MisterWhisper</strong> by
+openConcerto.<br />
+本プロジェクトは openConcerto による MisterWhisper
+をベースにしています。</p>
+<p>Original repository:<br />
+<a
+href="https://github.com/openconcerto/MisterWhisper">https://github.com/openconcerto/MisterWhisper</a></p>
+</body>
+</html>
