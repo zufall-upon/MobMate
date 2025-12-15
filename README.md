@@ -350,11 +350,16 @@ https://voicevox.hiroshiba.jp/
 このファイルには **無視したい単語やフレーズ** を 1 行ずつ記述します。  
 Write **words or phrases to be ignored**, one per line.
 
-例 / Example:  
+例 / Example:  simple(部分一致）
 ```ini
 えーと  uh
 あのー  um
 えっと  aa
+```
+例 / Example:  regex(正規表現)
+```ini
+ん$　　　Aa$
+^えー+   Ye$
 ```
 
 このリストに含まれる語句は、**ログにも TTS 出力にも表示・再生されません**。  
