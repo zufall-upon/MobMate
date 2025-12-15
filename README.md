@@ -16,6 +16,11 @@ It converts your voice into **anonymous synthesized speech** in real time for vo
 短いリアクション・応答向けのVC利用を想定しています。  
 Designed mainly for **short reactions and quick responses**.
 
+ラジオチャット（聞き専・コメント主体）のコミュニケーションに慣れたユーザーが、
+無理なくボイスチャットに参加するためのツールです。
+Designed for users who are comfortable with radio-style, listener-based communication,
+and want a low-pressure way to participate in voice chat.
+
 ![MobMateWhispTalk](https://raw.githubusercontent.com/zufall-upon/MobMate/refs/heads/main/mov01.gif)
 
 ## 💡 Why MobMate / コンセプト
