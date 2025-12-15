@@ -333,14 +333,18 @@ The `_outtts.txt` file works as both **configuration** and **log**.
 
 | Setting | Description (EN) | 説明 (JP) |
 |--------|------------------|-----------|
-| `language=en` | Language hint for Whisper | Whisper への言語ヒント |
-| `silence` | Silence detection threshold (higher = more tolerant) | 無音判定（大きいほど判定が甘くなる） |
-| `silence_hard` | Hard silence detection to reduce noise misdetection | ハード無音判定（ノイズ誤認識を減らす） |
-| `voicevox.exe` | Path to VOICEVOX executable | VOICEVOX 本体のパス |
-| `voicevox.api` | VOICEVOX API URL | VOICEVOX API の URL |
-| `voicevox.speaker` | Speaker ID | 話者 ID |
-| `initial_prompt` | Initial prompt for Whisper (shorter is more stable) | 事前プロンプト（短いほど安定） |
-| `laughs` | Laugh patterns (text or WAV path relative to working dir) | 笑い声パターン（テキスト or WAV。カレントディレクトリ基準） |
+| `language` | Whisper language hint (`ja / en / ko / zh / auto`) | Whisper の言語ヒント（ja / en / ko / zh / auto） |
+| `initial_prompt` | Initial prompt for Whisper (shorter = more stable) | Whisper 用の事前プロンプト（短いほど安定） |
+| `silence` | Silence detection threshold (ms, higher = more tolerant) | 無音判定（ミリ秒。大きいほど判定が甘くなる） |
+| `silence_hard` | Hard silence detection to suppress noise | ハード無音判定（ノイズ誤認識を抑制） |
+| `voicevox.exe` | Path to VOICEVOX executable (optional) | VOICEVOX 実行ファイルのパス（任意） |
+| `voicevox.api` | VOICEVOX API endpoint | VOICEVOX API の URL |
+| `voicevox.speaker` | VOICEVOX speaker ID | VOICEVOX 話者 ID |
+| `laughs.enable` | Enable natural laugh detection | 笑い検知機能の有効 / 無効 |
+| `laughs.detect` | Laugh tokens for the selected language | 言語別の笑い検知トークン |
+| `laughs.detect.auto` | Laugh tokens for auto language mode | auto モード用の多言語笑い検知 |
+| `laughs.replace` | Replacement text or WAV paths for laughter | 笑いを置換する文字列または WAV |
+| `ignore.mode` | Ignore filter mode (`simple` or `regex`) | 無視フィルタ方式（simple / regex） |
 
 ---
 
