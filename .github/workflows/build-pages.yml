@@ -1,41 +1,47 @@
-name: build-pages
+name: Build GitHub Pages
 
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install pandoc
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pandoc
+        run: sudo apt-get install -y pandoc
 
-      - name: Convert README.md to docs/index.html
+      - name: Convert README.md to HTML body
         run: |
-          mkdir -p docs
           pandoc README.md \
-            -f gfm \
-            -t html \
-            -s \
-            --metadata title="MobMateWhispTalk" \
-            -o docs/index.html
+            --from markdown \
+            --to html \
+            --no-highlight \
+            --wrap=none \
+            -o /tmp/readme_body.html
 
-      - name: Commit generated HTML
+      - name: Inject into template
+        run: |
+          sed '/<!-- CONTENT -->/{
+            r /tmp/readme_body.html
+            d
+          }' docs/index.template.html > docs/index.html
+
+      - name: Commit generated index.html
         run: |
           if git diff --quiet; then
-            echo "No changes to commit"
-            exit 0
+            echo "No changes"
+          else
+            git config user.name "github-actions"
+            git config user.email "github-actions@github.com"
+            git add docs/index.html
+            git commit -m "Update docs/index.html from README.md"
+            git push
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/index.html
-          git commit -m "Update docs/index.html from README.md"
-          git push
