@@ -17,9 +17,9 @@ jobs:
 
       - name: Install pandoc
         run: sudo apt-get install -y pandoc
-
+        
       - name: Convert README.md to HTML body
-        run: pandoc README.md --from markdown --to html --no-highlight --wrap=none -o /tmp/readme_body.html
+        run: pandoc README.md --from markdown --to html --no-highlight --wrap=none --metadata title="" -o /tmp/readme_body.html
 
       - name: Inject into template
         run: |
