@@ -172,8 +172,8 @@ https://github.com/zufall-upon/MobMate/releases/tag/release
 
 1. zip を展開  
    Extract the zip file
-2. `_run.bat` をダブルクリック  
-   Double-click `_run.bat`
+2. `MobMateWhisp.exe` をダブルクリック  
+   Double-click `MobMateWhisp.exe`
 
 ### 🟢 First Launch ／ 初回起動について
 
@@ -301,10 +301,8 @@ Open the **Prefs** button and configure the following recommended settings.
   ホットキー（初期設定：F9）または「Start」ボタンで録音を開始します
 - Your voice is transcribed (STT) and converted into speech (TTS)  
   音声が認識され、テキスト化された後に音声として再生されます
-- Recognition results are appended to the end of `_outtts.txt`  
-  認識結果は `_outtts.txt` の末尾に追記されます
-- The program monitors the latest line and plays it via TTS  
-  ファイルの最新行を監視し、その内容を TTS で再生します
+- Recognition results are appended to the end of `_outtts.txt`  and speach it.
+  認識結果は `_outtts.txt` の末尾に追記され、そのまま発声されます
 
 ---
 
