@@ -329,6 +329,11 @@ Open the **Prefs** button and configure the following recommended settings.
 | `laughs.replace` | Replacement text or WAV paths for laughter | 笑いを置換する文字列または WAV |
 | `ignore.mode` | Ignore filter mode (`simple` or `regex`) | 無視フィルタ方式（simple ／ regex） |
 
+## 📝 Configuration Options ／ 各項目の説明
+
+The `_outtts.txt` file works as both **configuration** and **log**.  
+設定はファイル上部に記述してください。下部はログ領域になります。
+
 ---
 
 ## 🔊 匿名発声（TTS） ／ Anonymous TTS
@@ -354,12 +359,6 @@ voicevox.speaker=3
 initial_prompt=これはゲーム内の無線チャットです。短く簡潔に話す。字幕、BGM、効果音、顔文字は出力しないで。笑い声は出していい。話している内容だけに集中してください。使われる単語は「了解、敵、味方、助けて」
 --------------------------↑設定↓ログ--------------------------
 ```
-## 📝 Configuration Options ／ 各項目の説明
-
-The `_outtts.txt` file works as both **configuration** and **log**.  
-設定はファイル上部に記述してください。下部はログ領域になります。
-
----
 
 ### 🔊 VOICEVOX Notes ／ VOICEVOX に関する注意
 
