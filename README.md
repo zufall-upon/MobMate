@@ -312,6 +312,25 @@ Open the **Prefs** button and configure the following recommended settings.
 
 ---
 
+### 🔧 Available Settings ／ 設定項目一覧
+
+| Setting | Description (EN) | 説明 (JP) |
+|--------|------------------|-----------|
+| `language` | Whisper language hint (`ja ／ en ／ ko ／ zh ／ auto`) | Whisper の言語ヒント（ja ／ en ／ ko ／ zh ／ auto） |
+| `initial_prompt` | Initial prompt for Whisper (shorter = more stable) | Whisper 用の事前プロンプト（短いほど安定） |
+| `silence` | Silence detection threshold (ms, higher = more tolerant) | 無音判定（ミリ秒。大きいほど判定が甘くなる） |
+| `silence_hard` | Hard silence detection to suppress noise | ハード無音判定（ノイズ誤認識を抑制） |
+| `voicevox.exe` | Path to VOICEVOX executable (optional) | VOICEVOX 実行ファイルのパス（任意） |
+| `voicevox.api` | VOICEVOX API endpoint | VOICEVOX API の URL |
+| `voicevox.speaker` | VOICEVOX speaker ID | VOICEVOX 話者 ID |
+| `laughs.enable` | Enable natural laugh detection | 笑い検知機能の有効 ／ 無効 |
+| `laughs.detect` | Laugh tokens for the selected language | 言語別の笑い検知トークン |
+| `laughs.detect.auto` | Laugh tokens for auto language mode | auto モード用の多言語笑い検知 |
+| `laughs.replace` | Replacement text or WAV paths for laughter | 笑いを置換する文字列または WAV |
+| `ignore.mode` | Ignore filter mode (`simple` or `regex`) | 無視フィルタ方式（simple ／ regex） |
+
+---
+
 ## 🔊 匿名発声（TTS） ／ Anonymous TTS
 
 MobMate can optionally integrate with **VOICEVOX** for text-to-speech output.  
@@ -342,25 +361,6 @@ The `_outtts.txt` file works as both **configuration** and **log**.
 
 ---
 
-### 🔧 Available Settings ／ 設定項目一覧
-
-| Setting | Description (EN) | 説明 (JP) |
-|--------|------------------|-----------|
-| `language` | Whisper language hint (`ja ／ en ／ ko ／ zh ／ auto`) | Whisper の言語ヒント（ja ／ en ／ ko ／ zh ／ auto） |
-| `initial_prompt` | Initial prompt for Whisper (shorter = more stable) | Whisper 用の事前プロンプト（短いほど安定） |
-| `silence` | Silence detection threshold (ms, higher = more tolerant) | 無音判定（ミリ秒。大きいほど判定が甘くなる） |
-| `silence_hard` | Hard silence detection to suppress noise | ハード無音判定（ノイズ誤認識を抑制） |
-| `voicevox.exe` | Path to VOICEVOX executable (optional) | VOICEVOX 実行ファイルのパス（任意） |
-| `voicevox.api` | VOICEVOX API endpoint | VOICEVOX API の URL |
-| `voicevox.speaker` | VOICEVOX speaker ID | VOICEVOX 話者 ID |
-| `laughs.enable` | Enable natural laugh detection | 笑い検知機能の有効 ／ 無効 |
-| `laughs.detect` | Laugh tokens for the selected language | 言語別の笑い検知トークン |
-| `laughs.detect.auto` | Laugh tokens for auto language mode | auto モード用の多言語笑い検知 |
-| `laughs.replace` | Replacement text or WAV paths for laughter | 笑いを置換する文字列または WAV |
-| `ignore.mode` | Ignore filter mode (`simple` or `regex`) | 無視フィルタ方式（simple ／ regex） |
-
----
-
 ### 🔊 VOICEVOX Notes ／ VOICEVOX に関する注意
 
 - VOICEVOX is automatically detected if `voicevox.exe` path is valid  
@@ -376,8 +376,6 @@ The `_outtts.txt` file works as both **configuration** and **log**.
 ⚠ **VOICEVOX は第三者製ツールです**
 
 https://voicevox.hiroshiba.jp/
-
----
 
 ---
 
