@@ -33,7 +33,8 @@
 👉 If you like it, please consider supporting the project on Steam
 
 🔗 Steam Store
-<iframe src="https://store.steampowered.com/widget/4261090/" frameborder="0" width="646" height="190"></iframe>
+
+https://store.steampowered.com/app/4261090/MobMateWhispTalk/
 
 ### 🧪 GitHub リポジトリについて / About This Repository
 
