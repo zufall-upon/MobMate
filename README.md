@@ -216,23 +216,44 @@ MobMateWhispTalk の用途（短い発話・リアクション）に最適です
 Offers the best balance of accuracy, speed, and stability,  
 and is well suited for short voice chat interactions.
 
-#### 他モデルとの比較 ／ Model Comparison
+🆙 上位モデルについて ／ About Larger Models
 
-- **Tiny**  
-  精度不足で誤認識が多い  
-  Low accuracy, frequent misrecognition
+MobMateWhispTalk では VAD（発話検出）を導入したことで、
+従来よりも 長文認識時のスパミングや暴走が大幅に抑制されています。
 
-- **Medium**  
-  正常動作するが、サイズが大きく動作が重い  
-  Works correctly, but large and noticeably slower
+With the introduction of VAD (Voice Activity Detection),
+spam-like or runaway transcription during long speech has been significantly reduced.
 
-- **Large ／ Large-v3-turbo**  
-  出力が不安定でスパム的な認識が増えやすい  
-  Unstable output, prone to repetitive or spam-like transcription
+そのため、長めの発話を行うユーザーには
+以下のモデルを アップグレードパスとして選択する価値があります。
 
-👉 **結論 ／ Conclusion**  
-まずは `ggml-small.bin` の使用を強く推奨します ⭐
+As a result, users who frequently speak in longer sentences
+may benefit from upgrading to the following models.
 
+🔍 モデル比較 ／ Model Comparison
+
+Tiny
+精度不足で誤認識が多いため非推奨
+Low accuracy, frequent misrecognition (not recommended)
+
+Small（推奨）
+高速・安定・軽量。短文VC用途に最適
+Fast, stable, lightweight — best for short VC usage
+
+Medium
+長文での精度が向上。処理はやや重め
+Better accuracy for longer speech, slightly heavier processing
+
+Large / Large-v3-turbo
+最も高精度。長文・翻訳用途向け（高負荷）
+Highest accuracy, suited for long speech or translation (high load)
+
+👉 結論 ／ Conclusion
+まずは ggml-small.bin を強く推奨します ⭐
+より長く話す用途では、Medium や Large-v3-turbo へのアップグレードも有効です。
+
+We strongly recommend starting with ggml-small.bin ⭐
+For longer speech use cases, upgrading to Medium or Large-v3-turbo is also a valid option.
 
 ---
 
