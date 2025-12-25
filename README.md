@@ -18,6 +18,76 @@
   </div>
 </div>
 
+
+## 🚀 ビルドについて / About Builds
+
+- 最新・安定版は Steam で先行公開しています
+- GitHub のビルドは 体験版・開発者向け です
+- 今後のアップデートは Steam 版を中心に提供します
+
+- Latest and stable builds are released first on Steam
+- GitHub builds are provided as demo / developer builds
+- Future updates will focus on the Steam version
+
+👉 気に入ったら Steam 版で応援してもらえると嬉しいです
+👉 If you like it, please consider supporting the project on Steam
+
+🔗 Steam Store
+<iframe src="https://store.steampowered.com/widget/4261090/" frameborder="0" width="646" height="190"></iframe>
+
+### 🧪 GitHub リポジトリについて / About This Repository
+
+ソースコードの公開
+動作確認・カスタマイズ用途
+
+For source code access, testing, and customization.
+
+### 👍 Support
+
+Steam 版の購入が、今後の開発の大きな支えになります。
+Your support on Steam helps continued development.
+
+### ✅ Major Features Added since v0.8
+v0.8以降の主な機能追加
+
+- 自前VAD（Java実装）導入
+- Custom Java-based VAD implementation
+
+ 短文・相槌・即時リアクションに強化
+ Enhanced support for short utterances, acknowledgements, and quick reactions
+
+- partial / final 分離処理
+- Separated partial and final transcription
+
+反応速度と安定性を両立
+Improves both responsiveness and stability
+
+- 誤検知対策の大幅強化
+- Significant improvements to false-trigger prevention
+
+ignore / good / dictionary をリアルタイム反映
+Real-time ignore, good, and dictionary controls
+
+- Historyベースの操作UI
+- History-based control UI
+
+NG / Good / Dictionary をワンボタン管理
+One-click management for NG, Good, and Dictionary entries
+
+- ユーザー調整可能なUI・設定強化
+- User-adjustable UI and quality-of-life settings
+ 
+文字サイズ変更など、常用前提の改善
+Improvements for daily use, including adjustable text size
+
+- Steam配布・GPU対応基盤の整備
+- Steam distribution and GPU support infrastructure
+
+GPU Acceleration Pack（DLC）対応
+GPU Acceleration Pack available as DLC
+
+---
+
 ローカルで動作する **STT + TTS（匿名発声）ツール** です。  
 This is a **local-only speech-to-text + text-to-speech (anonymous voice)** tool.
 
