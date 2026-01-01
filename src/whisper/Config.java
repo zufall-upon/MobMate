@@ -1,16 +1,15 @@
 package whisper;
 
+import javax.swing.*;
+import java.awt.*;
 import java.io.*;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardOpenOption;
+import java.nio.file.*;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
+import java.util.*;
+import java.util.List;
+import java.util.prefs.Preferences;
 
 public final class Config {
 
@@ -27,7 +26,7 @@ public final class Config {
             LOG = new PrintWriter(new FileWriter(out, true));
             log("=== MobMateWhisp Started ===");
         } catch (Exception e) {
-            // ログ初期化失敗時は黙る（今の思想どおり）
+
         }
     }
 
@@ -78,6 +77,15 @@ public final class Config {
             return defaultValue;
         }
     }
+    public static float getFloat(String key, float defaultValue) {
+        String v = get(key);
+        if (v == null) return defaultValue;
+        try {
+            return Float.parseFloat(v.trim());
+        } catch (NumberFormatException e) {
+            return defaultValue;
+        }
+    }
     public static boolean getBool(String key, boolean def) {
         String v = get(key);
         if (v == null) return def;
@@ -101,13 +109,10 @@ public final class Config {
     }
 
     public static synchronized void appendOutTts(String line) {
-        if (line == null) return;
-        String s = line.trim();
-        if (s.isEmpty()) return;
         try {
             Files.write(
                     OUT_TTS,
-                    (s + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
+                    (line + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
                     StandardOpenOption.CREATE,
                     StandardOpenOption.APPEND
             );
@@ -133,7 +138,7 @@ public final class Config {
             while ((line = br.readLine()) != null) {
                 line = line.trim();
                 if (line.isEmpty() || line.startsWith("#")) continue;
-                if (line.startsWith("---")) break;
+
 
                 int eq = line.indexOf('=');
                 if (eq <= 0) continue;
@@ -148,7 +153,482 @@ public final class Config {
                 cache.put(k, v);
             }
         } catch (Exception e) {
-            // 落とさない思想
+
+        }
+    }
+
+    private static final File IGNORE_FILE = new File("_ignore.txt");
+    public static LinkedHashSet<String> loadIgnoreSet() {
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+        if (!IGNORE_FILE.exists()) return set;
+
+        try (BufferedReader br = new BufferedReader(new FileReader(IGNORE_FILE))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (!line.isEmpty()) {
+                    set.add(line);
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return set;
+    }
+    public static void saveIgnoreSet(LinkedHashSet<String> set) {
+        if (set == null || set.isEmpty()) {
+            Config.log("Skip saveIgnoreSet (empty)");
+            return;
+        }
+        try (PrintWriter pw = new PrintWriter(
+                new OutputStreamWriter(
+                        new FileOutputStream(IGNORE_FILE), StandardCharsets.UTF_8))) {
+            for (String s : set) {
+                pw.println(s);
+            }
+            Config.mirrorAllToCloud();
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static java.util.List<String> loadIgnoreWords() {
+        List<String> list = new ArrayList<>();
+        File f = new File("_ignore.txt");
+        if (!f.exists()) return list;
+
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (!line.isEmpty()) {
+                    list.add(line);
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return list;
+    }
+
+
+    private static final File GOOD_FILE = new File("_initprmpt_add.txt");
+    public static LinkedHashSet<String> loadGoodSet() {
+        LinkedHashSet<String> set = new LinkedHashSet<>();
+        if (!GOOD_FILE.exists()) return set;
+
+        try (BufferedReader br = new BufferedReader(new FileReader(GOOD_FILE))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (!line.isEmpty()) {
+                    set.add(line);
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return set;
+    }
+    public static void saveGoodSet(LinkedHashSet<String> set) {
+        if (set == null || set.isEmpty()) {
+            Config.log("Skip saveGoodSet (empty)");
+            return;
+        }
+        try (PrintWriter pw = new PrintWriter(
+                new OutputStreamWriter(
+                        new FileOutputStream(GOOD_FILE), StandardCharsets.UTF_8))) {
+            for (String s : set) {
+                pw.println(s);
+            }
+            Config.mirrorAllToCloud();
+
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+    public static java.util.List<String> loadGoodWords() {
+        List<String> list = new ArrayList<>();
+        File f = new File("_initprmpt_add.txt");
+        if (!f.exists()) return list;
+
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (!line.isEmpty()) {
+                    list.add(line);
+                }
+            }
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        return list;
+    }
+
+    // Steam Cloud
+    private static final String[] CLOUD_TARGET_FILES = {
+            "_dictionary.txt",
+            "_ignore.txt",
+            "_initprmpt_add.txt",
+            "_outtts.txt"
+    };
+    public static void syncAllFromCloud() {
+        for (String name : CLOUD_TARGET_FILES) {
+            syncFromCloud(name);
+        }
+    }
+    private static void syncFromCloud(String fileName) {
+        try {
+            Path local = getLocalDir().resolve(fileName);
+            Path cloud = getCloudDir().resolve(fileName);
+            if (!Files.exists(cloud)) return;
+            if (!Files.exists(local)) {
+                Files.copy(cloud, local, StandardCopyOption.REPLACE_EXISTING);
+                return;
+            }
+            if (Files.size(cloud) == 0) {
+                Config.log("Skip cloud sync (empty): " + fileName);
+                return;
+            }
+            long localTime = Files.getLastModifiedTime(local).toMillis();
+            long cloudTime = Files.getLastModifiedTime(cloud).toMillis();
+            long localSize = Files.size(local);
+            long cloudSize = Files.size(cloud);
+            if (cloudTime > localTime || cloudSize != localSize) {
+                Files.copy(cloud, local, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            Config.logError("Cloud sync failed: " + fileName, e);
+        }
+    }
+    public static void mirrorAllToCloud() {
+        for (String name : CLOUD_TARGET_FILES) {
+            mirrorToCloud(name);
+        }
+    }
+    private static void mirrorToCloud(String fileName) {
+        try {
+            Files.createDirectories(getCloudDir());
+            Path local = getLocalDir().resolve(fileName);
+            Path cloud = getCloudDir().resolve(fileName);
+            if (Files.exists(local)) {
+                // log compress
+                if ("_outtts.txt".equals(fileName)) {
+                    trimOutttsSafely(local, OUTTTS_MAX_LINES);
+                    trimFileBySize(getLocalDir().resolve("_log.txt"), LOG_MAX_BYTES);
+                }
+                Files.copy(local, cloud, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } catch (IOException e) {
+            Config.logError("Cloud mirror failed: " + fileName, e);
+        }
+    }
+    public static Path getLocalDir() {
+        try {
+            return Paths.get(
+                    Config.class
+                            .getProtectionDomain()
+                            .getCodeSource()
+                            .getLocation()
+                            .toURI()
+            ).getParent();
+        } catch (Exception e) {
+            return Paths.get("").toAbsolutePath();
+        }
+    }
+    public static Path getCloudDir() {
+        return Paths.get(
+                System.getProperty("user.home"),
+                "Documents",
+                "MobMateWhispTalk"
+        );
+    }
+
+    private static final int OUTTTS_MAX_LINES = 500;
+    private static final long LOG_MAX_BYTES = 2 * 1024 * 1024; // 2MB
+    private static final String OUTTTS_MARKER =
+            "↑Settings↓Logs below";
+    public static void trimOutttsSafely(Path file, int maxLines) throws IOException {
+        if (!Files.exists(file)) return;
+
+        List<String> lines = Files.readAllLines(file, StandardCharsets.UTF_8);
+        if (lines.isEmpty()) return;
+
+        int markerIndex = -1;
+        for (int i = 0; i < lines.size(); i++) {
+            if (lines.get(i).contains(OUTTTS_MARKER)) {
+                markerIndex = i;
+                break;
+            }
+        }
+        if (markerIndex >= 0 && markerIndex + 1 >= lines.size()) {
+            return;
+        }
+        List<String> result = new ArrayList<>();
+        if (markerIndex >= 0) {
+            // setting safe
+            result.addAll(lines.subList(0, markerIndex + 1));
+            List<String> logs = lines.subList(markerIndex + 1, lines.size());
+            if (logs.size() > maxLines) {
+                logs = logs.subList(logs.size() - maxLines, logs.size());
+            }
+            result.addAll(logs);
+
+        } else {
+            // tail delete
+            if (lines.size() <= maxLines) return;
+            result.addAll(lines.subList(lines.size() - maxLines, lines.size()));
+        }
+        Files.write(file, result, StandardCharsets.UTF_8);
+    }
+    public static void trimFileBySize(Path file, long maxBytes) throws IOException {
+        if (!Files.exists(file)) return;
+        if (Files.size(file) <= maxBytes) return;
+
+        byte[] all = Files.readAllBytes(file);
+        byte[] tail = Arrays.copyOfRange(
+                all, all.length - (int)maxBytes, all.length
+        );
+        Files.write(file, tail);
+    }
+
+    public static String loadSetting(String key, String defaultValue) {
+        File f = new File("_outtts.txt");
+        if (!f.exists()) return defaultValue;
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                if (line.startsWith(key + "=")) {
+                    return line.substring((key + "=").length()).trim();
+                }
+                if (line.startsWith("---")) break;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return defaultValue;
+    }
+    static private Map<String, List<String>> dictMap = new HashMap<>();
+    static private Random rnd = new Random();
+    public static void loadDictionary() {
+        File f = new File("_dictionary.txt");
+        if (!f.exists()) return;
+
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+
+                if (line.isEmpty()) continue;
+                if (line.startsWith("#")) continue; // comments
+
+                String[] parts = line.split("=", 2);
+                if (parts.length != 2) continue;
+
+                String key = parts[0].trim().toLowerCase();
+                String[] values = parts[1].split(",");
+
+                List<String> list = new ArrayList<>();
+                for (String v : values) {
+                    list.add(v.trim());
+                }
+
+                dictMap.put(key, list);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+    public static String applyDictionary(String text) {
+        if (text == null) return null;
+
+        for (Map.Entry<String, List<String>> e : dictMap.entrySet()) {
+            String key = e.getKey();
+            List<String> choices = e.getValue();
+
+            // ignore case
+            if (text.toLowerCase().contains(key)) {
+                String pick = choices.get(rnd.nextInt(choices.size()));
+                text = text.replaceAll("(?i)" + key, pick);
+            }
+        }
+        return text;
+    }
+    public static synchronized void addDictionaryEntry(String key, String value) {
+        try {
+            File dict = new File("_dictionary.txt");
+
+
+            if (!dict.exists()) {
+                dict.getParentFile().mkdirs();
+                dict.createNewFile();
+            }
+
+
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(new FileInputStream(dict), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) {
+                    if (line.startsWith(key + "=")) {
+                        return;
+                    }
+                }
+            }
+
+
+            try (BufferedWriter bw = new BufferedWriter(
+                    new OutputStreamWriter(new FileOutputStream(dict, true), StandardCharsets.UTF_8))) {
+                bw.write(key + "=" + value);
+                bw.newLine();
+            }
+
+            logDebug("Dictionary entry added: " + key + "=" + value);
+
+        } catch (IOException e) {
+            logError("Failed to add dictionary entry: " + key, e);
+        }
+    }
+}
+
+class DebugLogZipper {
+
+    public static File createZip() throws IOException {
+        String ts = java.time.LocalDateTime.now()
+                .format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"));
+
+        File zip = new File("MobMateWhispTalk_DebugLog_" + ts + ".zip");
+
+        List<String> targets = List.of(
+                "_log.txt",
+                "_outtts.txt",
+                "_dictionary.txt",
+                "_ignore.txt",
+                "_initprmpt_add.txt"
+        );
+
+        try (FileOutputStream fos = new FileOutputStream(zip);
+             java.util.zip.ZipOutputStream zos = new java.util.zip.ZipOutputStream(fos)) {
+
+            for (String name : targets) {
+                File f = new File(name);
+                if (!f.exists()) continue;
+
+                zos.putNextEntry(new java.util.zip.ZipEntry(name));
+                Files.copy(f.toPath(), zos);
+                zos.closeEntry();
+            }
+
+            // ENV
+            Runtime rt = Runtime.getRuntime();
+            zos.putNextEntry(new java.util.zip.ZipEntry("_env.txt"));
+            String env =
+                    "version=" + Version.APP_VERSION + "\n" +
+                            "log.debug=" + Config.getBool("log.debug", false) + "\n" +
+                            "\n" +
+                            "os=" + System.getProperty("os.name") + "\n" +
+                            "os.version=" + System.getProperty("os.version") + "\n" +
+                            "os.arch=" + System.getProperty("os.arch") + "\n" +
+                            "\n" +
+                            "java.version=" + System.getProperty("java.version") + "\n" +
+                            "java.vendor=" + System.getProperty("java.vendor") + "\n" +
+                            "java.vm=" + System.getProperty("java.vm.name") + "\n" +
+                            "java.arch=" + System.getProperty("os.arch") + "\n" +
+                            "\n" +
+                            "cpu.cores=" + rt.availableProcessors() + "\n" +
+                            "mem.maxMB=" + (rt.maxMemory() / 1024 / 1024) + "\n" +
+                            "mem.totalMB=" + (rt.totalMemory() / 1024 / 1024) + "\n" +
+                            "mem.freeMB=" + (rt.freeMemory() / 1024 / 1024) + "\n" +
+                            "\n" +
+                            "audio.input=" + MobMateWhisp.prefs.get("audio.device", "") + "\n" +
+                            "audio.output=" + MobMateWhisp.prefs.get("audio.output.device", "") + "\n" +
+                            "tts.voice=" + MobMateWhisp.prefs.get("tts.windows.voice", "auto") + "\n" +
+                            "vulkan.gpu.index=" + MobMateWhisp.prefs.get("vulkan.gpu.index", "") + "\n" +
+                             "\n" +
+                            "timezone=" + TimeZone.getDefault().getID() + "\n" +
+                            "locale=" + Locale.getDefault();
+            zos.write(env.getBytes(StandardCharsets.UTF_8));
+            zos.closeEntry();
+        }
+
+        return zip;
+    }
+}
+
+class VulkanGpuUtil {
+
+    private static List<String> cachedNames;
+
+
+    public static int getGpuCount() {
+        ensureLoaded();
+        return cachedNames.size();
+    }
+
+
+    public static String getGpuName(int index) {
+        ensureLoaded();
+        if (index < 0 || index >= cachedNames.size()) {
+            return "Unknown Vulkan GPU";
+        }
+        return cachedNames.get(index);
+    }
+
+    private static synchronized void ensureLoaded() {
+        if (cachedNames != null) return;
+
+        cachedNames = new ArrayList<>();
+
+        try {
+            Process p = new ProcessBuilder(
+                    "vulkaninfo",
+                    "--summary"
+            )
+                    .redirectErrorStream(true)
+                    .start();
+
+            String pendingName = null;
+
+            try (BufferedReader r = new BufferedReader(
+                    new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+
+                String line;
+                while ((line = r.readLine()) != null) {
+                    line = line.trim();
+
+
+
+                    if (line.startsWith("GPU id")) {
+                        int l = line.indexOf('(');
+                        int rIdx = line.lastIndexOf(')');
+                        if (l >= 0 && rIdx > l) {
+                            pendingName = line.substring(l + 1, rIdx).trim();
+                            cachedNames.add(pendingName);
+                            pendingName = null;
+                        }
+                    }
+
+
+
+                    if (line.startsWith("deviceName")) {
+                        int eq = line.indexOf('=');
+                        if (eq > 0) {
+                            String name = line.substring(eq + 1).trim();
+                            cachedNames.add(name);
+                        }
+                    }
+                }
+            }
+
+            p.waitFor();
+
+        } catch (Exception e) {
+            cachedNames.clear();
+        }
+
+        if (cachedNames.isEmpty()) {
+            cachedNames.add("Vulkan GPU (unknown)");
         }
     }
 }

@@ -4,7 +4,7 @@ if (-not $script:DllUnblocked) {
     try {
         $base = Split-Path -Parent $MyInvocation.MyCommand.Path
         Get-ChildItem -Path $base -Filter *.dll |
-            Unblock-File -ErrorAction SilentlyContinue
+                Unblock-File -ErrorAction SilentlyContinue
         $script:DllUnblocked = $true
     } catch {}
 }
@@ -15,20 +15,30 @@ Add-Type -Path ".\NAudio.Core.dll"
 Add-Type -Path ".\NAudio.Wasapi.dll"
 Add-Type -Path ".\NAudio.WinMM.dll"
 
+# === Audio player (singleton) ===
+$script:waveOut = $null
+$script:reader  = $null
+
 function Play-Wav($path, $dev) {
     try {
-        $reader = New-Object NAudio.Wave.WaveFileReader($path)
-        $output = New-Object NAudio.Wave.WaveOutEvent
-        $output.DeviceNumber = [int]$dev
-        $output.Init($reader)
-        $output.Play()
-
-        while ($output.PlaybackState -eq "Playing") {
-            Start-Sleep -Milliseconds 20
+        if ($script:waveOut) {
+            try { $script:waveOut.Stop() } catch {}
+            try { $script:waveOut.Dispose() } catch {}
+            $script:waveOut = $null
+        }
+        if ($script:reader) {
+            try { $script:reader.Dispose() } catch {}
+            $script:reader = $null
         }
 
-        $output.Dispose()
-        $reader.Dispose()
+        $script:reader = New-Object NAudio.Wave.WaveFileReader($path)
+        $script:waveOut = New-Object NAudio.Wave.WaveOutEvent
+        $script:waveOut.DeviceNumber = [int]$dev
+        $script:waveOut.Init($script:reader)
+
+        $script:waveOut.Play()
+
+        [Console]::Out.WriteLine("DONE")
     }
     catch {
         [Console]::Error.WriteLine("ERR $_")
@@ -46,10 +56,10 @@ while ($true) {
             $dev = [int]$match.Matches.Groups[2].Value
 
             Play-Wav $wav $dev
-            $stdout.WriteLine("DONE")
+            [Console]::Out.WriteLine("DONE")
         }
         else {
-            $stderr.WriteLine("BAD LINE: $line")
+            [Console]::Error.WriteLine("BAD LINE: $line")
         }
     }
 }
