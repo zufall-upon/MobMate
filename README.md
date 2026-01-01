@@ -223,6 +223,13 @@ laugh.replace=ワハハハ,ふふふっ,laughsounds/laughter01.wav
 Natural laughter → Whisper generates a laugh marker
 → MobMate detects it → replaces it with another voice or sound
 
+⚠ Bluetoothヘッドセットをご利用の場合
+一部の機種ではマイクのノイズキャンセリングにより、
+笑い声や息音などの非言語音が検出されにくくなることがあります。
+
+可能であれば、マイクのノイズキャンセリング機能をオフにするか、
+デスクトップマイクの使用を推奨します。
+
 ## 🟢 動作環境 ／ System Requirements
 
 - Windows 10 ／ 11 (64bit)
