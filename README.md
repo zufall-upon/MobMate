@@ -34,6 +34,7 @@
 
 🔗 Steam Store
 
+25/1/16 released!
 https://store.steampowered.com/app/4261090/MobMateWhispTalk/
 
 ### 🧪 GitHub リポジトリについて / About This Repository
