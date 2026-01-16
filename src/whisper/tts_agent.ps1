@@ -37,7 +37,6 @@ function Play-Wav($path, $dev) {
         $script:waveOut.Init($script:reader)
 
         $script:waveOut.Play()
-
         [Console]::Out.WriteLine("DONE")
     }
     catch {
@@ -50,13 +49,12 @@ while ($true) {
     if ($line -eq $null) { break }
 
     if ($line.StartsWith("PLAY")) {
-        $match = $line | Select-String 'PLAY\s+"(.+)"\s+(\d+)'
+        $match = $line | Select-String '^PLAY\s+\"(.+?)\"\s+(-?\d+)$'
         if ($match) {
             $wav = $match.Matches.Groups[1].Value
             $dev = [int]$match.Matches.Groups[2].Value
 
             Play-Wav $wav $dev
-            [Console]::Out.WriteLine("DONE")
         }
         else {
             [Console]::Error.WriteLine("BAD LINE: $line")

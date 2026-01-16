@@ -632,3 +632,77 @@ class VulkanGpuUtil {
         }
     }
 }
+
+final class UiLang {
+    public static String normalize(String lang) {
+        if (lang == null) return "en";
+        lang = lang.toLowerCase(Locale.ROOT);
+        if (lang.startsWith("ja")) return "ja";
+        if (lang.startsWith("ko")) return "ko";
+        if (lang.startsWith("zh")) {
+            if (lang.contains("tw") || lang.contains("hk")) return "zh_tw";
+            return "zh_cn";
+        }
+        return "en";
+    }
+    public static Path resolveUiFile(String lang) {
+        String code = normalize(lang);
+        return Paths.get("libs/preset/_ui_" + code + ".txt");
+    }
+}
+class UiText {
+    private static final Map<String, String> map = new HashMap<>();
+    public static void load(Path dictFile) {
+        map.clear();
+        try {
+            for (String line : Files.readAllLines(dictFile, StandardCharsets.UTF_8)) {
+                if (line.isBlank() || line.startsWith("#")) continue;
+                int idx = line.indexOf('=');
+                if (idx <= 0) continue;
+                map.put(
+                        line.substring(0, idx).trim(),
+                        unescape(line.substring(idx + 1).trim())
+                );
+            }
+        } catch (IOException e) {
+            JOptionPane.showMessageDialog(null, "Error :\n" + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+    private static String unescape(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' && i + 1 < s.length()) {
+                char n = s.charAt(i + 1);
+                if (n == 'u' && i + 5 < s.length()) {
+                    String hex = s.substring(i + 2, i + 6);
+                    try {
+                        sb.append((char) Integer.parseInt(hex, 16));
+                        i += 5; // 'u' + 4桁ぶん消費
+                        continue;
+                    } catch (NumberFormatException ignored) {
+                        // fallthrough
+                    }
+                }
+                switch (n) {
+                    case 'n': sb.append('\n'); i++; continue;
+                    case 'r': sb.append('\r'); i++; continue;
+                    case 't': sb.append('\t'); i++; continue;
+                    case '\\': sb.append('\\'); i++; continue;
+                    default:
+                        // 未知の \x はそのまま（\ と次文字を保持）
+                        sb.append(c);
+                        continue;
+                }
+            }
+            sb.append(c);
+        }
+        return sb.toString();
+    }
+    // UiText.load(Paths.get("libs/preset/_ui_ja.txt"));
+    // UiText.t("ui.history");
+    public static String t(String key) {
+        return map.getOrDefault(key, key);
+    }
+}

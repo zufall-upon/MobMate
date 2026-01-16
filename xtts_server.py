@@ -1,33 +1,34 @@
-from fastapi import FastAPI
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Response
 from pydantic import BaseModel
 from TTS.api import TTS
+import io
+import soundfile as sf
 
 app = FastAPI()
 
-tts = TTS(
-    model_name="tts_models/multilingual/multi-dataset/xtts_v2",
-    progress_bar=False,
-    gpu=False
-)
+# CPU固定
+tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to("cpu")
 
-class TTSReq(BaseModel):
+class TtsReq(BaseModel):
     text: str
     language: str = "en"
-
-@app.post("/tts")
-def tts_api(req: TTSReq):
-    speaker_wav = "vv_4146689104366679984.wav"  # ★ 3〜10s .wav
-
-    tts.tts_to_file(
-        text=req.text,
-        language=req.language,
-        speaker_wav=speaker_wav,
-        file_path="out.wav",
-    )
-
-    return FileResponse("out.wav", media_type="audio/wav")
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+@app.post("/tts")
+def tts_api(req: TtsReq):
+    wav = tts.tts(
+        text=req.text,
+        language=req.language,
+        speaker_wav="samples/female.wav"
+    )
+
+    buf = io.BytesIO()
+    sf.write(buf, wav, 24000, format="WAV")
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="audio/wav"
+    )

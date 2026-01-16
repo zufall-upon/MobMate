@@ -10,6 +10,8 @@ import io.github.ggerganov.whispercpp.params.CBool;
 import io.github.ggerganov.whispercpp.params.WhisperFullParams;
 import io.github.ggerganov.whispercpp.params.WhisperSamplingStrategy;
 
+import static whisper.MobMateWhisp.prefs;
+
 public class LocalWhisperCPP {
 
     // NOTE: LocalWhisperCPP is singleton in current design.
@@ -51,7 +53,10 @@ public class LocalWhisperCPP {
         baseParamsGreedy.single_segment = CBool.TRUE;
         baseParamsGreedy.max_len = 0;
         baseParamsGreedy.n_threads =
-                Math.max(2, Runtime.getRuntime().availableProcessors() / 3);
+                (!MobMateWhisp.lowGpuMode) ? Math.min(
+                        12, // 上限
+                        Math.max(4, Runtime.getRuntime().availableProcessors() / 3) // 下限4
+                ) : 1;
         baseParamsGreedy.language = this.language;
         baseParamsGreedy.initial_prompt = this.initialPrompt;
         baseParamsGreedy.write();
@@ -63,7 +68,10 @@ public class LocalWhisperCPP {
         baseParamsBeam.print_progress = CBool.FALSE;
         baseParamsBeam.detect_language = CBool.FALSE;
         baseParamsBeam.n_threads =
-                Math.max(2, Runtime.getRuntime().availableProcessors() / 3);
+                (!MobMateWhisp.lowGpuMode) ? Math.min(
+                        12, // 上限
+                        Math.max(4, Runtime.getRuntime().availableProcessors() / 3) // 下限4
+                ) : 1;
         baseParamsBeam.language = this.language;
         baseParamsBeam.initial_prompt = this.initialPrompt;
         baseParamsBeam.write();
@@ -72,6 +80,7 @@ public class LocalWhisperCPP {
         Config.log("initial_prompt: " + this.initialPrompt);
         Config.loadDictionary();
     }
+
     private WhisperFullParams createBeamParams() {
         WhisperFullParams p =
                 whisper.getFullDefaultParams(
@@ -82,31 +91,43 @@ public class LocalWhisperCPP {
         p.print_progress = CBool.FALSE;
         p.language = this.language;
         p.detect_language = CBool.FALSE;
-        p.n_threads = Runtime.getRuntime().availableProcessors();;
+        p.n_threads =
+                (!MobMateWhisp.lowGpuMode) ? Math.min(
+                        12,
+                        Math.max(4, Runtime.getRuntime().availableProcessors() / 3)
+                ) : 1;
         p.initial_prompt = buildInitialPrompt();
         p.write();
         return p;
     }
-    private WhisperFullParams createGreedyParams() {
+
+    private static final int SAMPLE_RATE_HZ = 16000; // whisper.cppのPCM想定(16k)
+    private WhisperFullParams createGreedyParams(boolean longMode) {
         WhisperFullParams p =
                 whisper.getFullDefaultParams(
                         WhisperSamplingStrategy.WHISPER_SAMPLING_GREEDY
                 );
         p.print_progress = CBool.FALSE;
         p.detect_language = CBool.FALSE;
-        p.single_segment = CBool.TRUE;
+        p.single_segment = longMode ? CBool.FALSE : CBool.TRUE;
+        p.no_context     = longMode ? CBool.FALSE : CBool.TRUE;
         p.max_len = 0;
         p.temperature = 0.0f;
         if (lowGainMic) {
             p.temperature = 0.2f;
         }
-        p.no_context = CBool.TRUE;
-        p.n_threads = Runtime.getRuntime().availableProcessors();
+        p.n_threads =
+                (!MobMateWhisp.lowGpuMode) ? Math.min(
+                        12,
+                        Math.max(4, Runtime.getRuntime().availableProcessors() / 3)
+                ) : 1;
         p.language = this.language;
         p.initial_prompt = buildInitialPrompt();
         p.write();
         return p;
     }
+
+
     private String buildInitialPrompt() {
         if (!initialPromptDirty && cachedInitialPrompt != null) {
             return cachedInitialPrompt;
@@ -127,12 +148,15 @@ public class LocalWhisperCPP {
         initialPromptDirty = false;
         return cachedInitialPrompt;
     }
+
     public static void markInitialPromptDirty() {
         initialPromptDirty = true;
     }
+
     public static void markDictionaryDirty() {
         dictionaryDirty = true;
     }
+
     private void reloadIgnoreIfNeeded() {
         if (!ignoreDirty) return;
         cachedIgnoreMode = Config.get("ignore.mode", "simple");
@@ -149,7 +173,8 @@ public class LocalWhisperCPP {
         }
         ignoreDirty = false;
     }
-    private boolean isIgnored(String text) {
+
+    public boolean isIgnored(String text) {
         if (text == null || text.isEmpty()) return false;
         reloadIgnoreIfNeeded();
         if ("regex".equalsIgnoreCase(cachedIgnoreMode)) {
@@ -167,6 +192,7 @@ public class LocalWhisperCPP {
         }
         return false;
     }
+
     public static boolean isIgnoredStatic(String text) {
         if (text == null || text.isEmpty()) return true;
         String mode = Config.get("ignore.mode", "simple");
@@ -182,11 +208,12 @@ public class LocalWhisperCPP {
         }
         return false;
     }
+
     public static void markIgnoreDirty() {
         ignoreDirty = true;
     }
 
-    private static void applySoftwareGain(short[] samples, float gain) {
+    public static void applySoftwareGain(short[] samples, float gain) {
         if (gain <= 1.01f) return;
 
         for (int i = 0; i < samples.length; i++) {
@@ -223,45 +250,57 @@ public class LocalWhisperCPP {
 //        return raw;
 //    }
 
-    private static final int INSTANT_FINAL_MAX_CHARS =
-            Config.getBool("silence.alternate", false) ? 12 : 20;
-    public String transcribeRaw(byte[] pcmData) throws IOException {
+    private int INSTANT_FINAL_MAX_CHARS = 12;
+
+    public String transcribeRaw(byte[] pcmData, final MobMateWhisp.Action action, MobMateWhisp mobMateWhisp) throws IOException {
         int numSamples = pcmData.length / 2;
         short[] shorts = new short[numSamples];
         float[] floats = new float[numSamples];
         for (int i = 0, j = 0; i < pcmData.length; i += 2, j++) {
             shorts[j] = (short) (((pcmData[i + 1] & 0xFF) << 8) | (pcmData[i] & 0xFF));
         }
-
-        // ★ LowGainMic
-        float gain = 1.0f;
-        if (lowGainMic) {
-            gain = Config.getFloat("audio.lowgain.boost", 3.2f);
-        }
-        applySoftwareGain(shorts, gain);
-        applySoftwareGain(shorts, gain);
         for (int i = 0; i < numSamples; i++) {
             floats[i] = shorts[i] / 32768.0f;
         }
 
-        WhisperFullParams params = createGreedyParams();
+        int longSec = Config.getInt("whisper.long_mode_sec", 3); // 例:秒以上は長文扱い
+        boolean longMode = numSamples >= (SAMPLE_RATE_HZ * longSec);
+        WhisperFullParams params = createGreedyParams(longMode);
         String raw = whisper.fullTranscribe(params, floats);
 
+        // ★BGM判定を最優先
+//        String lowerRaw = raw.toLowerCase();
+//        if ((lowerRaw.startsWith("bgm") || lowerRaw.equals("bgm、") || lowerRaw.equals("bgm,"))) {
+//            Config.logDebug("★BGM detected in transcribeRaw, returning empty");
+//            MobMateWhisp.setLastPartial("");
+//            return "";
+//        }
+
+        // ★Ignore判定
+        if (isIgnored(raw)) {
+            Config.logDebug("★Ignored text: " + raw);
+            MobMateWhisp.setLastPartial("");
+            return "";
+        }
+
         if (raw != null && !raw.trim().isEmpty()) {
+            if (isIgnored(raw)) {
+                MobMateWhisp.setLastPartial("");
+            }
             MobMateWhisp.setLastPartial(raw.trim());
             Config.logDebug("★Partial: " + MobMateWhisp.getLastPartial());
         } else {
             return "";
         }
+        INSTANT_FINAL_MAX_CHARS = (MobMateWhisp.isSilenceAlternate() && !lowGainMic) ? 12 : 10;
         int len = raw.codePointCount(0, raw.length());
         if (len <= INSTANT_FINAL_MAX_CHARS) {
             String fin = raw.trim();
-            MobMateWhisp.setLastPartial("");
-            return fin;
-        }
-        if (isIgnored(raw)) {
+            Config.logDebug("★Instant FINAL (short utterance): " + fin);
+            mobMateWhisp.instantFinalFromWhisper(fin, action);
             return "";
         }
+
         return raw.trim();
     }
     public static void main(String[] args) throws Exception {
@@ -469,26 +508,32 @@ class AdaptiveNoiseProfile {
         boolean useAuto = AUTO_CALIBRATE && !noiseSamples.isEmpty();
         int basePeakThreshold;
 
+        // ★通常マイクの方が環境ノイズ拾いやすいので、std倍数と最低閾値を上げる
+        int stdMulNormal = Config.getInt("vad.stdMul.normal", 6);     // 既定: 6
+        int stdMulLow    = Config.getInt("vad.stdMul.lowGain", 3);    // 既定: 3
+        int stdMul = isLowGainMic ? stdMulLow : stdMulNormal;
+
         if (useAuto) {
-            basePeakThreshold = noiseFloor + (noiseStdDev * 3);
+            basePeakThreshold = noiseFloor + (noiseStdDev * stdMul);
             currentPeakThreshold = (int) (basePeakThreshold * sensitivityFactor);
         } else {
             currentPeakThreshold = (int) (manualPeak * sensitivityFactor);
         }
         currentAvgThreshold = currentPeakThreshold / 4;
 
-        // ★修正: 低ゲインの場合、さらに閾値を下げる
-        if (isLowGainMic) {
-            currentPeakThreshold = (int) (currentPeakThreshold * 0.40);  // 0.50 → 0.40
-            currentAvgThreshold  = (int) (currentAvgThreshold  * 0.40);  // 0.50 → 0.40
-        }
+        // ★最低閾値：通常マイクは高め、低ゲインは低め
+        int minPeakNormal = Config.getInt("vad.minPeak.normal", 1800);
+        int minAvgNormal  = Config.getInt("vad.minAvg.normal",  450);
+        int minPeakLow    = Config.getInt("vad.minPeak.lowGain", 600);
+        int minAvgLow     = Config.getInt("vad.minAvg.lowGain",  120);
 
-        // ★修正: 最低閾値も引き下げ
-        int minPeak = isLowGainMic ? 80 : 600;   // 150 → 80
-        int minAvg  = isLowGainMic ? 16 : 120;   // 30  → 16
+        int minPeak = isLowGainMic ? minPeakLow : minPeakNormal;
+        int minAvg  = isLowGainMic ? minAvgLow  : minAvgNormal;
+
         currentPeakThreshold = Math.max(minPeak, currentPeakThreshold);
         currentAvgThreshold  = Math.max(minAvg,  currentAvgThreshold);
     }
+
 
     private int calculateMean(List<Integer> samples) {
         return samples.stream().mapToInt(Integer::intValue).sum() / samples.size();
@@ -579,21 +624,18 @@ class ImprovedVAD extends SimpleVAD {
         }
 
         int peakThreshold = noiseProfile.getPeakThreshold();
-        int avgThreshold = noiseProfile.getAvgThreshold();
+        int avgThreshold  = noiseProfile.getAvgThreshold();
         boolean isPeakSpeech = peak >= peakThreshold;
         boolean isAvgSpeech  = avg  >= avgThreshold;
+        // ★通常マイクは「avgだけ」で拾うと環境音を拾いがちなので、peak寄りにする
+        double peakFactor = noiseProfile.isLowGainMic ? 0.60 : 0.85;
         boolean currentIsSpeech =
                 isPeakSpeech ||
-                        (isAvgSpeech && peak >= peakThreshold * 0.6);
-        if (!noiseProfile.isLowGainMic) {
-            if (!isPeakSpeech && isAvgSpeech) {
-                currentIsSpeech = false;
-            }
-        }
+                        (isAvgSpeech && peak >= peakThreshold * peakFactor);
 
         if (!currentIsSpeech && noiseProfile.isLowGainMic) {
-            int ULTRA_PEAK = Config.getInt("vad.ultra.peak", 170);
-            int ULTRA_AVG  = Config.getInt("vad.ultra.avg",  45);
+            int ULTRA_PEAK = Config.getInt("vad.ultra.peak", 140);
+            int ULTRA_AVG  = Config.getInt("vad.ultra.avg",  32);
 
             if (peak >= ULTRA_PEAK && avg >= ULTRA_AVG) {
                 ultraRescueCount++;
@@ -612,18 +654,18 @@ class ImprovedVAD extends SimpleVAD {
             ultraRescueCount = 0;
         }
 
-        if (!currentIsSpeech) {
-            // 閾値の40%を超え、かつ絶対値が小さくても拾えるようにする
-            if (noiseProfile.isLowGainMic && peak > (int)(peakThreshold * 0.40) && avg > (int)(avgThreshold * 0.40)
-                    && peak > 80 && avg > 20) {   // 200/50 → 80/20
-                noiseProfile.setLowGainMic(true);
-                currentIsSpeech = true;
-                if (Config.getBool("log.vad.detailed", false)) {
-                    Config.logDebug("VAD low-gain rescue(soft): peak=" + peak + " avg=" + avg
-                            + " thPeak=" + peakThreshold + " thAvg=" + avgThreshold);
-                }
-            }
-        }
+//        if (!currentIsSpeech) {
+//            // 閾値の40%を超え、かつ絶対値が小さくても拾えるようにする
+//            if (noiseProfile.isLowGainMic && peak > (int)(peakThreshold * 0.40) && avg > (int)(avgThreshold * 0.40)
+//                    && peak > 80 && avg > 20) {   // 200/50 → 80/20
+//                noiseProfile.setLowGainMic(true);
+//                currentIsSpeech = true;
+//                if (Config.getBool("log.vad.detailed", false)) {
+//                    Config.logDebug("VAD low-gain rescue(soft): peak=" + peak + " avg=" + avg
+//                            + " thPeak=" + peakThreshold + " thAvg=" + avgThreshold);
+//                }
+//            }
+//        }
 
         if (Config.getBool("log.vad.detailed", false)) {
             Config.logDebug(String.format("VAD: peak=%d(>%d?%s) avg=%d(>%d?%s) → %s",
@@ -631,12 +673,12 @@ class ImprovedVAD extends SimpleVAD {
                     avg, avgThreshold, isAvgSpeech,
                     currentIsSpeech));
         }
-        if (!currentIsSpeech && noiseProfile.isLowGainMic) {
-            if (peak >= 100 && avg < avgThreshold * 0.5) {
-                currentIsSpeech = true;
-                Config.logDebug("★LowGain peak-only speech accepted");
-            }
-        }
+//        if (!currentIsSpeech && noiseProfile.isLowGainMic) {
+//            if (peak >= 100 && avg < avgThreshold * 0.5) {
+//                currentIsSpeech = true;
+//                Config.logDebug("★LowGain peak-only speech accepted");
+//            }
+//        }
 
         if (currentIsSpeech) {
             maxPeak = Math.max(maxPeak, peak);
@@ -674,18 +716,18 @@ class ImprovedVAD extends SimpleVAD {
                 return true;
             }
         }
-        if (noiseProfile.isLowGainMic) {
-            int minBytes = Config.getInt("vad.lowgain.min_final_bytes", 8000); // 約0.5秒
-            int minPeak  = Config.getInt("vad.lowgain.min_peak", 90);
-            int minAvg   = Config.getInt("vad.lowgain.min_avg", 18);
-
-            if (currentBufferSize >= minBytes
-                    && maxPeak >= minPeak
-                    && silenceFrames >= 1) {
-                Config.logDebug("★LowGain FINAL rescue (short utterance)");
-                return true;
-            }
-        }
+//        if (noiseProfile.isLowGainMic) {
+//            int minBytes = Config.getInt("vad.lowgain.min_final_bytes", 8000); // 約0.5秒
+//            int minPeak  = Config.getInt("vad.lowgain.min_peak", 90);
+//            int minAvg   = Config.getInt("vad.lowgain.min_avg", 18);
+//
+//            if (currentBufferSize >= minBytes
+//                    && maxPeak >= minPeak
+//                    && silenceFrames >= 1) {
+//                Config.logDebug("★LowGain FINAL rescue (short utterance)");
+//                return true;
+//            }
+//        }
         return false;
     }
 
@@ -728,6 +770,12 @@ class ImprovedVAD extends SimpleVAD {
 
 
 class LaughDetector {
+    private int minPeakForBurst = 1200;
+    private long burstWindowMs = 1000;
+    private static final int ALT_MIN_PEAK_FOR_BURST = 2200; // 1200 → 2200
+    private static final int ALT_BURST_MIN = 3;             // 2 → 3
+    private static final long ALT_BURST_WINDOW_MS = 800;    // 1000 → 800
+
     private static final long MIN_BURST_INTERVAL_MS = 90;
     private static final long MAX_BURST_INTERVAL_MS = 350;
 
@@ -748,10 +796,8 @@ class LaughDetector {
 
     private final ArrayDeque<Long> burstTimes = new ArrayDeque<>();
 
-    private int minPeakForBurst = 1200;
     private boolean lowGain = false;
 
-    private long burstWindowMs = 1000;
     private long cooldownMs = 1200;
 
     private double midRatioMin = 0.12;
@@ -768,9 +814,15 @@ class LaughDetector {
 
     public boolean updateAndDetectLaugh(byte[] pcm, int len, int peak, long nowMs, boolean speech) {
         boolean debugLog = Config.getBool("log.laugh.debug", false);
+        boolean altMode = prefs.getBoolean("silence.alternate", false);
+        if (altMode) {
+            this.minPeakForBurst = ALT_MIN_PEAK_FOR_BURST;
+            this.burstWindowMs   = ALT_BURST_WINDOW_MS;
+        }
 
-        long guardStart = 150;
-        long guardEnd   = 180;
+        // ★ガード時間を延長（発話開始・終了付近での誤検知防止）
+        long guardStart = 250; // 150 → 250ms
+        long guardEnd   = 300; // 180 → 300ms
 
         if (lastSpeechStartMs > 0 && nowMs - lastSpeechStartMs < guardStart) {
             if (debugLog && nowMs - lastSpeechStartMs > 100) {
@@ -792,10 +844,9 @@ class LaughDetector {
             return false;
         }
 
-        // ★咳/破裂音の除外（大幅に緩和）
-        // minPeakForBurst の3.5倍、または絶対値10000のいずれか大きい方を上限とする
-        int coughAbsoluteMax = Config.getInt("laugh.cough_abs_peak", 10000); // 7000 → 10000
-        int coughThreshold = Math.max(coughAbsoluteMax, (int)(minPeakForBurst * COUGH_PEAK_RATIO));
+        // ★咳判定を厳格化（倍率アップ）
+        int coughAbsoluteMax = Config.getInt("laugh.cough_abs_peak", 12000); // 10000 → 12000
+        int coughThreshold = Math.max(coughAbsoluteMax, (int)(minPeakForBurst * 4.0f)); // 3.5 → 4.0
 
         if (peak > coughThreshold) {
             if (debugLog && burstTimes.size() > 0) {
@@ -805,7 +856,6 @@ class LaughDetector {
             return false;
         }
 
-        // 閾値未満
         if (peak < minPeakForBurst) {
             cleanupOld(nowMs);
             if (burstTimes.size() > 0 && debugLog) {
@@ -824,7 +874,8 @@ class LaughDetector {
                     zcr, zcrStableMin, zcrStableMax, zcrOk ? "OK" : "NG", zcrStableCount, peak, coughThreshold));
         }
 
-        int requiredZcrStable = 2;
+        // ★ZCR安定要求を厳格化
+        int requiredZcrStable = altMode ? 3 : 2; // alt時は3フレーム必要
         if (zcrOk) {
             zcrStableCount++;
         } else {
@@ -836,11 +887,20 @@ class LaughDetector {
             return false;
         }
 
-        // 低周波チェック
+        // ★低周波チェックを厳格化
         float lowRatio = calcLowFreqRatio(pcm, len);
-        if (lowRatio > 0.45f) {
+        if (lowRatio > 0.40f) { // 0.45 → 0.40
             if (debugLog) {
-                Config.logDebug("[Laugh] Blocked by lowRatio=" + lowRatio + " > 0.45");
+                Config.logDebug("[Laugh] Blocked by lowRatio=" + lowRatio + " > 0.40");
+            }
+            reset();
+            return false;
+        }
+
+        // ★ゲップ判定を厳格化
+        if (lowRatio > 0.45f && burstTimes.size() <= 1) { // 0.50 → 0.45
+            if (altMode && debugLog) {
+                Config.logDebug(String.format("[LAUGH-ALT] ★BURP suspected (lowRatio=%.2f, single burst)", lowRatio));
             }
             reset();
             return false;
@@ -862,14 +922,15 @@ class LaughDetector {
             long prev = getPrev(burstTimes);
             long d = last - prev;
 
-            if (d < MIN_BURST_INTERVAL_MS) {
+            // ★間隔要求を厳格化
+            if (d < 100) { // 90 → 100ms
                 burstTimes.removeLast();
                 if (debugLog) {
                     Config.logDebug("[Laugh] Interval too short: " + d + "ms");
                 }
                 return false;
             }
-            if (d > MAX_BURST_INTERVAL_MS) {
+            if (d > 320) { // 350 → 320ms
                 while (burstTimes.size() > 1) burstTimes.removeFirst();
                 burstEnergySum = 0;
                 if (debugLog) {
@@ -881,11 +942,11 @@ class LaughDetector {
         // energy加算
         burstEnergySum += (double) peak * (double) peak;
 
-        // "短い笑い"救済
+        // "短い笑い"救済（より厳格に）
         boolean denseShortLaugh = false;
-        if (burstTimes.size() >= 2) {
+        if (!altMode && burstTimes.size() >= 2) {
             long span = burstTimes.peekLast() - burstTimes.peekFirst();
-            if (span <= 300) {
+            if (span <= 250) { // 300 → 250ms
                 denseShortLaugh = true;
                 if (debugLog) {
                     Config.logDebug("[Laugh] Dense short laugh detected (span=" + span + "ms)");
@@ -893,7 +954,7 @@ class LaughDetector {
             }
         }
 
-        int burstMin = 2;
+        int burstMin = altMode ? ALT_BURST_MIN : 2;
         if (burstTimes.size() < burstMin && !denseShortLaugh) {
             if (debugLog) {
                 Config.logDebug("[Laugh] Not enough bursts: " + burstTimes.size() + " < " + burstMin);
@@ -901,24 +962,25 @@ class LaughDetector {
             return false;
         }
 
-        // midRatio計算
+        // ★midRatio要求を厳格化
         double midRatio = calcMidRatio(pcm, len);
+        double midRatioRequired = altMode ? 0.15 : 0.14; // 0.12 → 0.14
         if (debugLog) {
             Config.logDebug(String.format("[Laugh] midRatio=%.4f (min=%.2f) %s",
-                    midRatio, midRatioMin, midRatio >= midRatioMin ? "OK" : "NG"));
+                    midRatio, midRatioRequired, midRatio >= midRatioRequired ? "OK" : "NG"));
         }
 
-        if (midRatio < midRatioMin) {
+        if (midRatio < midRatioRequired) {
             if (debugLog) {
                 Config.logDebug("[Laugh] Blocked by midRatio");
             }
             return false;
         }
 
-        // エネルギーチェック
-        double energyFactor = 0.55;
-        if (denseShortLaugh) energyFactor *= 0.65;
-        if (lowGain) energyFactor *= 0.65;
+        // ★エネルギーチェックを厳格化
+        double energyFactor = 0.60; // 0.55 → 0.60
+        if (denseShortLaugh) energyFactor *= 0.70; // 0.65 → 0.70
+        if (lowGain) energyFactor *= 0.70; // 0.65 → 0.70
 
         double minEnergy = (double) minPeakForBurst * (double) minPeakForBurst * (double) burstMin * energyFactor;
         if (debugLog) {
