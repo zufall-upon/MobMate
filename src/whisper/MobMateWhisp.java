@@ -5,9 +5,7 @@ import com.sun.jna.platform.win32.Shell32;
 import whisper.Version;
 
 import java.awt.event.*;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.awt.*;
 import java.awt.Window.Type;
 import java.awt.datatransfer.Clipboard;
@@ -19,8 +17,6 @@ import java.net.URISyntaxException;
 import java.nio.file.*;
 import java.util.*;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -37,6 +33,7 @@ import javax.swing.*;
 import javax.swing.Timer;
 import javax.swing.event.ChangeEvent;
 import javax.swing.event.ChangeListener;
+import javax.swing.plaf.FontUIResource;
 
 import com.github.kwhat.jnativehook.GlobalScreen;
 import com.github.kwhat.jnativehook.NativeHookException;
@@ -351,6 +348,7 @@ public class MobMateWhisp implements NativeKeyListener {
         final Frame frame = new Frame("");
         frame.setUndecorated(true);
         frame.setType(Type.UTILITY);
+        SwingUtilities.updateComponentTreeUI(frame);
         // Create a pop-up menu components
         final PopupMenu popup = createPopupMenu();
         this.trayIcon.setPopupMenu(popup);
@@ -431,15 +429,64 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
 
+    // ===== Tray menu: force English text (to avoid tofu/garble on some OS) =====
+    private static final Object TRAY_TEXT_LOCK = new Object();
+    private static final Map<String, String> TRAY_TEXT_CACHE = new HashMap<>();
+    private static String trayText(String key) {
+        synchronized (TRAY_TEXT_LOCK) {
+            String cached = TRAY_TEXT_CACHE.get(key);
+            if (cached != null) return cached;
+
+            // current UI language (restore after fetch)
+            String curSuffix = "en";
+            try {
+                if (MobMateWhisp.prefs != null) curSuffix = prefs.get("ui.language", "en");
+            } catch (Exception ignore) {}
+
+            Path enFile  = UiLang.resolveUiFile("en");
+            Path curFile = UiLang.resolveUiFile(curSuffix);
+
+            try {
+                // temporarily load EN
+                UiText.load(enFile);
+
+                String v = UiText.t(key);
+                if (v == null || v.isBlank()) v = key; // safety
+                TRAY_TEXT_CACHE.put(key, v);
+                return v;
+            } catch (Exception e) {
+                // fallback: current language
+                try { return UiText.t(key); } catch (Exception ignore) { return key; }
+            } finally {
+                // restore current UI immediately
+                try { UiText.load(curFile); } catch (Exception ignore) {}
+            }
+        }
+    }
+    private static void applyAwtFontRecursive(java.awt.MenuComponent mc, java.awt.Font f) {
+        try { mc.setFont(f); } catch (Exception ignore) {}
+
+        if (mc instanceof java.awt.Menu m) {
+            for (int i = 0; i < m.getItemCount(); i++) {
+                java.awt.MenuItem it = m.getItem(i);
+                if (it != null) applyAwtFontRecursive(it, f);
+            }
+        } else if (mc instanceof java.awt.PopupMenu pm) {
+            for (int i = 0; i < pm.getItemCount(); i++) {
+                java.awt.MenuItem it = pm.getItem(i);
+                if (it != null) applyAwtFontRecursive(it, f);
+            }
+        }
+    }
     protected PopupMenu createPopupMenu() {
         final String strAction = this.prefs.get("action", "noting");
 
-        Menu requiredMenu = new Menu(UiText.t("menu.required"));
+        Menu requiredMenu = new Menu(trayText("menu.required"));
         final PopupMenu popup = new PopupMenu();
-        CheckboxMenuItem autoPaste = new CheckboxMenuItem(UiText.t("menu.autoPaste"));
+        CheckboxMenuItem autoPaste = new CheckboxMenuItem(trayText("menu.autoPaste"));
         autoPaste.setState(strAction.equals("paste"));
         requiredMenu.add(autoPaste);
-        CheckboxMenuItem autoType = new CheckboxMenuItem(UiText.t("menu.autoType"));
+        CheckboxMenuItem autoType = new CheckboxMenuItem(trayText("menu.autoType"));
         autoType.setState(strAction.equals("type"));
         requiredMenu.add(autoType);
         final ItemListener typeListener = new ItemListener() {
@@ -466,7 +513,7 @@ public class MobMateWhisp implements NativeKeyListener {
         };
         autoPaste.addItemListener(typeListener);
         autoType.addItemListener(typeListener);
-        CheckboxMenuItem detectSilece = new CheckboxMenuItem(UiText.t("menu.silenceDetection"));
+        CheckboxMenuItem detectSilece = new CheckboxMenuItem(trayText("menu.silenceDetection"));
         detectSilece.setState(this.prefs.getBoolean("silence-detection", true));
         detectSilece.addItemListener(new ItemListener() {
             @Override
@@ -481,8 +528,25 @@ public class MobMateWhisp implements NativeKeyListener {
             }
         });
         requiredMenu.add(detectSilece);
+        // ===== Whisper translate (auto -> EN) =====
+        final CheckboxMenuItem translateToEnItem =
+                new CheckboxMenuItem("Translate to English (Whisper)");
+        translateToEnItem.setState(MobMateWhisp.this.prefs.getBoolean("whisper.translate_to_en", false));
+        translateToEnItem.addItemListener(new ItemListener() {
+            @Override
+            public void itemStateChanged(ItemEvent e) {
+                MobMateWhisp.this.prefs.putBoolean("whisper.translate_to_en", translateToEnItem.getState());
+                try {
+                    MobMateWhisp.this.prefs.sync();
+                } catch (BackingStoreException ex) {
+                    ex.printStackTrace();
+                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + ex.getMessage());
+                }
+            }
+        });
+        requiredMenu.add(translateToEnItem);
         // Shift hotkey modifier
-        Menu hotkeysMenu = new Menu(UiText.t("menu.keyboardShortcut"));
+        Menu hotkeysMenu = new Menu(trayText("menu.keyboardShortcut"));
         final CheckboxMenuItem shiftHotkeyMenuItem = new CheckboxMenuItem("SHIFT");
         shiftHotkeyMenuItem.setState(this.prefs.getBoolean("shift-hotkey", false));
         hotkeysMenu.add(shiftHotkeyMenuItem);
@@ -544,7 +608,7 @@ public class MobMateWhisp implements NativeKeyListener {
             });
         }
         if (this.remoteUrl == null) {
-            Menu modelMenu = new Menu(UiText.t("menu.models"));
+            Menu modelMenu = new Menu(trayText("menu.models"));
             final File dir = new File("models");
             List<CheckboxMenuItem> allModels = new ArrayList<>();
             if (new File(dir, this.model).exists()) {
@@ -592,10 +656,10 @@ public class MobMateWhisp implements NativeKeyListener {
             requiredMenu.add(modelMenu);
         }
         requiredMenu.add(hotkeysMenu);
-        final Menu modeMenu = new Menu(UiText.t("menu.keyTriggerMode"));
-        final CheckboxMenuItem pushToTalkItem = new CheckboxMenuItem(UiText.t("menu.pushToTalk"));
-        final CheckboxMenuItem pushToTalkDoubleTapItem = new CheckboxMenuItem(UiText.t("menu.pushToTalkDoubleTap"));
-        final CheckboxMenuItem startStopItem = new CheckboxMenuItem(UiText.t("menu.startStop"));
+        final Menu modeMenu = new Menu(trayText("menu.keyTriggerMode"));
+        final CheckboxMenuItem pushToTalkItem = new CheckboxMenuItem(trayText("menu.pushToTalk"));
+        final CheckboxMenuItem pushToTalkDoubleTapItem = new CheckboxMenuItem(trayText("menu.pushToTalkDoubleTap"));
+        final CheckboxMenuItem startStopItem = new CheckboxMenuItem(trayText("menu.startStop"));
         String currentMode = this.prefs.get("trigger-mode", START_STOP);
         pushToTalkItem.setState(PUSH_TO_TALK.equals(currentMode));
         pushToTalkDoubleTapItem.setState(PUSH_TO_TALK_DOUBLE_TAP.equals(currentMode));
@@ -654,7 +718,7 @@ public class MobMateWhisp implements NativeKeyListener {
         popup.add(requiredMenu);
 
         // Get available audio input devices
-        final Menu audioInputsItem = new Menu(UiText.t("menu.audioInputs"));
+        final Menu audioInputsItem = new Menu(trayText("menu.audioInputs"));
         String audioDevice = this.prefs.get("audio.device", "");
         String previsouAudipDevice = this.prefs.get("audio.device.previous", "");
         List<String> mixers = getInputsMixerNames();
@@ -719,7 +783,7 @@ public class MobMateWhisp implements NativeKeyListener {
         }
         popup.add(audioInputsItem);
 
-        Menu audioOutputsItem = new Menu(UiText.t("menu.audioOutputs"));
+        Menu audioOutputsItem = new Menu(trayText("menu.audioOutputs"));
         String outputDevice = this.prefs.get("audio.output.device", "");
         String prevOutputDevice = this.prefs.get("audio.output.device.previous", "");
 
@@ -755,10 +819,10 @@ public class MobMateWhisp implements NativeKeyListener {
         popup.add(audioOutputsItem);
 
         // ===== GPU selection (CPU / Vulkan only) =====
-        Menu gpuMenu = new Menu(UiText.t("menu.gpuSelect"));
+        Menu gpuMenu = new Menu(trayText("menu.gpuSelect"));
         int gpuIndex = prefs.getInt("vulkan.gpu.index", -1); // -1 = auto
         List<CheckboxMenuItem> items = new ArrayList<>();
-        CheckboxMenuItem autoItem = new CheckboxMenuItem(UiText.t("menu.gpu.auto"));
+        CheckboxMenuItem autoItem = new CheckboxMenuItem(trayText("menu.gpu.auto"));
         autoItem.setState(gpuIndex < 0);
         gpuMenu.add(autoItem);
         items.add(autoItem);
@@ -804,12 +868,12 @@ public class MobMateWhisp implements NativeKeyListener {
         popup.add(gpuMenu);
         popup.addSeparator();
 
-        Menu ttsVoicesItem = new Menu(UiText.t("menu.voices"));
+        Menu ttsVoicesItem = new Menu(trayText("menu.voices"));
         String voicePref = prefs.get("tts.windows.voice", "auto");
         List<CheckboxMenuItem> all = new ArrayList<>();
         // --- auto ---
         CheckboxMenuItem autoItem2 =
-                new CheckboxMenuItem(UiText.t("menu.voice.auto"));
+                new CheckboxMenuItem(trayText("menu.voice.auto"));
         autoItem2.setState("auto".equals(voicePref));
         ttsVoicesItem.add(autoItem2);
         all.add(autoItem2);
@@ -862,20 +926,20 @@ public class MobMateWhisp implements NativeKeyListener {
         popup.add(ttsVoicesItem);
 
 
-        Menu settingsMenu = new Menu(UiText.t("menu.settings"));
+        Menu settingsMenu = new Menu(trayText("menu.settings"));
 
-        Menu RecommendMenu = new Menu(UiText.t("menu.recommend"));
+        Menu RecommendMenu = new Menu(trayText("menu.recommend"));
         CheckboxMenuItem rmDesktopMic =
-                new CheckboxMenuItem(UiText.t("menu.recommend.desktopMic"));
+                new CheckboxMenuItem(trayText("menu.recommend.desktopMic"));
         CheckboxMenuItem rmHeadsetMic =
-                new CheckboxMenuItem(UiText.t("menu.recommend.headsetMic"));
+                new CheckboxMenuItem(trayText("menu.recommend.headsetMic"));
         RecommendMenu.add(rmDesktopMic);
         RecommendMenu.add(rmHeadsetMic);
         settingsMenu.add(RecommendMenu);
 
-        Menu performanceMenu = new Menu(UiText.t("menu.performance"));
+        Menu performanceMenu = new Menu(trayText("menu.performance"));
         CheckboxMenuItem lowGpuItem =
-                new CheckboxMenuItem(UiText.t("menu.lowGpuMode"));
+                new CheckboxMenuItem(trayText("menu.lowGpuMode"));
         lowGpuItem.setState(MobMateWhisp.lowGpuMode);
         lowGpuItem.addItemListener(e -> {
             boolean enabled = lowGpuItem.getState();
@@ -900,7 +964,7 @@ public class MobMateWhisp implements NativeKeyListener {
         performanceMenu.add(lowGpuItem);
 
         CheckboxMenuItem vadLaughItem =
-                new CheckboxMenuItem(UiText.t("menu.vadLaugh"));
+                new CheckboxMenuItem(trayText("menu.vadLaugh"));
         vadLaughItem.setState(useAlternateLaugh);
         vadLaughItem.addItemListener(e -> {
             boolean enabled = vadLaughItem.getState();
@@ -954,11 +1018,11 @@ public class MobMateWhisp implements NativeKeyListener {
             }
         });
 
-        Menu inputGainMenu = new Menu(UiText.t("menu.inputGain"));
+        Menu inputGainMenu = new Menu(trayText("menu.inputGain"));
         boolean autogaintuner = prefs.getBoolean("audio.autoGain", true); // -1 = auto
         float currentGain = prefs.getFloat("audio.inputGainMultiplier", 1.0f);
         CheckboxMenuItem autoItem3 =
-                new CheckboxMenuItem(UiText.t("menu.autoGainTuner"));
+                new CheckboxMenuItem(trayText("menu.autoGainTuner"));
         autoItem3.setState(autogaintuner);
         autoItem3.addItemListener(e -> {
             prefs.putBoolean("audio.autoGain", autoItem3.getState());
@@ -1028,7 +1092,7 @@ public class MobMateWhisp implements NativeKeyListener {
 //        final MenuItem historyItem = new MenuItem("History");
 //        popup.add(historyItem);
 
-        Menu fontSizeMenu = new Menu(UiText.t("menu.fontSize"));
+        Menu fontSizeMenu = new Menu(trayText("menu.fontSize"));
         int currentSize = prefs.getInt("ui.font.size", 12);
         List<CheckboxMenuItem> fontItems = new ArrayList<>();
         for (int size = 12; size <= 24; size += 2) {
@@ -1064,7 +1128,7 @@ public class MobMateWhisp implements NativeKeyListener {
         settingsMenu.add(fontSizeMenu);
 
         // ===== VOICEVOX感情自動寄せ =====
-        CheckboxMenuItem autoEmotionItem = new CheckboxMenuItem(UiText.t("menu.voicevox.autoEmotion"));
+        CheckboxMenuItem autoEmotionItem = new CheckboxMenuItem(trayText("menu.voicevox.autoEmotion"));
         boolean currentAutoEmotion = prefs.getBoolean("voicevox.auto_emotion", true); // デフォルトtrue
         autoEmotionItem.setState(currentAutoEmotion);
         autoEmotionItem.addItemListener(e -> {
@@ -1080,7 +1144,7 @@ public class MobMateWhisp implements NativeKeyListener {
         boolean readyToZip = Config.getBool("log.debug", false);
         Menu debugMenu = new Menu("MobMateWhispTalk v" + Version.APP_VERSION);
         if (!readyToZip) {
-            MenuItem enableDebugItem = new MenuItem(UiText.t("menu.debug.enableLog"));
+            MenuItem enableDebugItem = new MenuItem(trayText("menu.debug.enableLog"));
             enableDebugItem.addActionListener(e -> {
                 try {
                     Config.appendOutTts("log.debug=true");
@@ -1100,7 +1164,7 @@ public class MobMateWhisp implements NativeKeyListener {
             });
             debugMenu.add(enableDebugItem);
         } else {
-            MenuItem zipLogsItem = new MenuItem(UiText.t("menu.debug.createZip"));
+            MenuItem zipLogsItem = new MenuItem(trayText("menu.debug.createZip"));
             zipLogsItem.addActionListener(e -> {
                 try {
                     File zip = DebugLogZipper.createZip();
@@ -1121,7 +1185,7 @@ public class MobMateWhisp implements NativeKeyListener {
         popup.add(debugMenu);
 
         popup.addSeparator();
-        MenuItem exitItem = new MenuItem(UiText.t("menu.exit"));
+        MenuItem exitItem = new MenuItem(trayText("menu.exit"));
         popup.add(exitItem);
         exitItem.addActionListener(new ActionListener() {
             @Override
@@ -1138,6 +1202,9 @@ public class MobMateWhisp implements NativeKeyListener {
 //
 //            }
 //        });
+        Font awtFont = new Font(UIManager.getFont("Menu.font").getFamily(), Font.PLAIN,
+                prefs.getInt("ui.font.size", 12));
+        applyAwtFontRecursive(popup, awtFont);
         return popup;
     }
 
@@ -1356,7 +1423,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 if (line == null) {
                     Config.log("No audio input device available for calibration");
                     SwingUtilities.invokeLater(() -> {
-                        window.setTitle(UiText.t("ui.calibrating.skipped"));
+                        window.setTitle(trayText("ui.calibrating.skipped"));
                         button.setEnabled(true);
                         button.setText(UiText.t("ui.main.start"));
                         isCalibrationComplete = true;
@@ -2738,13 +2805,33 @@ public class MobMateWhisp implements NativeKeyListener {
     public static void main(String[] args) {
         System.setProperty("jna.encoding", "UTF-8");
         ensureInitialConfig();
-
-        SwingUtilities.invokeLater(() -> {
+        Thread keepAlive = new Thread(() -> {
             try {
-                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-            } catch (ClassNotFoundException | InstantiationException | IllegalAccessException | UnsupportedLookAndFeelException e) {
+                Thread.sleep(Long.MAX_VALUE);
+            } catch (InterruptedException e) {
                 e.printStackTrace();
             }
+        });
+        keepAlive.setDaemon(false); // ★non-daemonにする
+        keepAlive.start();
+        try {
+            java.nio.file.Files.writeString(
+                    java.nio.file.Path.of("started_from_steam.txt"),
+                    java.time.LocalDateTime.now() + " pid=" + ProcessHandle.current().pid() + System.lineSeparator(),
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND
+            );
+        } catch (Exception ignore) {}
+        SwingUtilities.invokeLater(() -> {
+            // 以下は元のコードと同じ
+            try {
+                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            FontBootstrap.registerBundledFonts();
+            Preferences p = Preferences.userRoot().node("MobMateWhispTalk");
+            String suffix = p.get("ui.language", "en");
+            UiFontApplier.applyDefaultUIFontBySuffix(suffix);
             try {
                 Boolean debug = false;
                 String url = null;
@@ -2765,7 +2852,6 @@ public class MobMateWhisp implements NativeKeyListener {
                 r.debug = debug;
                 r.autoStartVoiceVox();
                 r.startPsServer();
-
                 boolean openWindow = r.prefs.getBoolean("open-window", true);
                 if (forceOpenWindow) {
                     openWindow = true;
@@ -2804,6 +2890,7 @@ public class MobMateWhisp implements NativeKeyListener {
         this.window.setIconImage(this.imageInactive);
         this.window.setFocusable(true);
         this.window.setFocusableWindowState(true);
+        SwingUtilities.updateComponentTreeUI(this.window);
 
         JPanel p = new JPanel();
         p.setLayout(new BoxLayout(p, BoxLayout.X_AXIS));
@@ -3061,6 +3148,11 @@ public class MobMateWhisp implements NativeKeyListener {
         float gain = userGain * autoGainMultiplier;
         boolean applyGain = gain > 1.01f;
 
+        // ★波形（min/max）をGainMeterへ流す：UIは増やさず「ここ」に出す
+        if (gainMeter != null) {
+            gainMeter.pushWaveformPcm16le(pcm, len, gain, applyGain);
+        }
+
         int peak = 0;
         long sum = 0;
 
@@ -3201,6 +3293,7 @@ public class MobMateWhisp implements NativeKeyListener {
         historyFrame = new HistoryFrame(this);
         historyFrame.setMinimumSize(new Dimension(510, 200));
         historyFrame.setSize(510, 400);
+        SwingUtilities.updateComponentTreeUI(historyFrame);
 
         Rectangle fb = null;
         if (window != null) {
@@ -4127,6 +4220,10 @@ public class MobMateWhisp implements NativeKeyListener {
     private static void ensureInitialConfig() {
         File outtts = new File("_outtts.txt");
         if (outtts.exists()) return;
+        // まず暫定でフォント適用（言語選択ダイアログが豆腐になるのを防ぐ）
+        FontBootstrap.registerBundledFonts();
+        UiFontApplier.applyDefaultUIFontFromSystemLocale();
+
         int choice = showLanguageSelectDialog();
         if (choice < 0) {
             System.exit(0);
@@ -4140,8 +4237,11 @@ public class MobMateWhisp implements NativeKeyListener {
             case 0:
             default: suffix = "en"; break;
         }
+        UiFontApplier.applyDefaultUIFontBySuffix(suffix);
         prefs = Preferences.userRoot().node("MobMateWhispTalk");
         prefs.put("ui.language", suffix);
+        FontBootstrap.registerBundledFonts();
+        UiFontApplier.applyDefaultUIFontBySuffix(suffix);
         UiText.load(UiLang.resolveUiFile(suffix));
         copyPreset("libs/preset/_outtts_" + suffix + ".txt", "_outtts.txt");
         copyPreset("libs/preset/_dictionary_" + suffix + ".txt", "_dictionary.txt");
@@ -4236,6 +4336,16 @@ class GainMeter extends JComponent {
 
     private final Timer animTimer;
 
+    // ===== Waveform overlay (pixel-column ring) =====
+    private final Object waveLock = new Object();
+    private static final int WAVE_COLS = 640;
+    private static final int WAVE_WINDOW_SAMPLES = 1024;
+    private final short[] waveMinCol = new short[WAVE_COLS];
+    private final short[] waveMaxCol = new short[WAVE_COLS];
+    private int waveColWrite = 0;
+    private int winCount = 0;
+    private int winMin = 32767;
+    private int winMax = -32768;
     public GainMeter() {
         setPreferredSize(new Dimension(260, 22));
         setMinimumSize(new Dimension(160, 18));
@@ -4246,6 +4356,51 @@ class GainMeter extends JComponent {
         animTimer.setCoalesce(true);
         animTimer.start();
     }
+
+    /**
+     * 16bit little-endian PCM を受け取り、波形表示用に min/max をリングへ溜める
+     * ※音量メーターと同じ “適用後ゲイン” で描画したいので gain/applyGain を受け取る
+     * ※オーディオスレッドから呼ばれる想定なので同期してる
+     */
+    public void pushWaveformPcm16le(byte[] pcm, int len, float gain, boolean applyGain) {
+        if (pcm == null || len <= 0) return;
+
+        synchronized (waveLock) {
+            for (int i = 0; i + 1 < len; i += 2) {
+                int s = (short) (((pcm[i + 1] & 0xFF) << 8) | (pcm[i] & 0xFF));
+
+                if (applyGain) {
+                    int amplified = Math.round(s * gain);
+                    if (amplified > 32767) amplified = 32767;
+                    else if (amplified < -32768) amplified = -32768;
+                    s = amplified;
+                }
+
+                if (s < winMin) winMin = s;
+                if (s > winMax) winMax = s;
+                winCount++;
+
+                if (winCount >= WAVE_WINDOW_SAMPLES) {
+                    waveMinCol[waveColWrite] = (short) winMin;
+                    waveMaxCol[waveColWrite] = (short) winMax;
+
+                    waveColWrite++;
+                    if (waveColWrite >= WAVE_COLS) waveColWrite = 0;
+
+                    winCount = 0;
+                    winMin = 32767;
+                    winMax = -32768;
+                }
+            }
+        }
+        long now = System.nanoTime();
+        if (now - lastRepaintNs > REPAINT_INTERVAL_NS) {
+            lastRepaintNs = now;
+            // EDTで描画（スレッド安全）
+            SwingUtilities.invokeLater(this::repaint);
+        }
+    }
+
 
     /**
      * recentSpeech=false のときは強制的に0へ落とす（中途半端停止を潰す）
@@ -4296,6 +4451,8 @@ class GainMeter extends JComponent {
         repaint();
     }
 
+    private volatile long lastRepaintNs = 0;
+    private static final long REPAINT_INTERVAL_NS = 33_000_000L; // 約30fps
     @Override protected void paintComponent(Graphics g) {
         Graphics2D g2 = (Graphics2D) g.create();
         try {
@@ -4314,10 +4471,58 @@ class GainMeter extends JComponent {
             int barW = w - pad * 2;
             int barH = h - pad * 2;
 
+            // ★波形オーバーレイ（min/max縦線）
+            // 先に描いて、後段のバー・文字の上に “うっすら残る” 感じにする
+            // ★波形オーバーレイ（列固定リング：形が泳がない）
+            // ★波形オーバーレイ（列固定リング：最新側を表示。泳がない）
+            {
+                int midY = barY + barH / 2;
+                float scale = (barH * 0.48f) / 32768f;
+
+                g2.setColor(new Color(80, 220, 255, 170)); // 波形色
+
+                int step = 2; // 1=高精細, 2=軽量
+                int colsToDraw = Math.min(WAVE_COLS, Math.max(1, barW / step));
+
+                synchronized (waveLock) {
+                    // ★「最新側」を表示する：write位置の直前から colsToDraw 分を描く
+                    int start = waveColWrite - colsToDraw;
+                    if (start < 0) start += WAVE_COLS;
+
+                    // ★右端に最新が来るように寄せる（見た目が自然）
+                    int startX = barX + Math.max(0, barW - colsToDraw * step);
+
+                    for (int i = 0; i < colsToDraw; i++) {
+                        int x = startX + i * step;
+                        if (x >= barX + barW) break;
+
+                        int idx = start + i;
+                        if (idx >= WAVE_COLS) idx -= WAVE_COLS;
+
+                        int mn = waveMinCol[idx];
+                        int mx = waveMaxCol[idx];
+
+                        int y1 = midY - Math.round(mx * scale);
+                        int y2 = midY - Math.round(mn * scale);
+
+                        if (y1 < barY) y1 = barY;
+                        if (y1 > barY + barH) y1 = barY + barH;
+                        if (y2 < barY) y2 = barY;
+                        if (y2 > barY + barH) y2 = barY + barH;
+
+                        g2.drawLine(x, y1, x, y2);
+                    }
+                }
+            }
+
+
             int lvl = Math.max(0, Math.min(100, Math.round(dispLevel)));
             int fillW = (int) (barW * (lvl / 100.0));
-            g2.setColor(colorFor(lvl));
+            Color c = colorFor(lvl);
+            // ★透明度を上げて、波形が見えるように
+            g2.setColor(new Color(c.getRed(), c.getGreen(), c.getBlue(), 90)); // 0-255（小さいほど透明）
             g2.fillRoundRect(barX, barY, Math.max(0, fillW), barH, 8, 8);
+
 
             // 目盛り
             g2.setColor(new Color(255, 255, 255, 35));
@@ -4349,14 +4554,24 @@ class GainMeter extends JComponent {
             String text = gainStr.isEmpty() ? dbStr : (dbStr + "  " + gainStr);
 
             g2.setFont(getFont().deriveFont(Font.BOLD, Math.max(11f, h * 0.55f)));
-            FontMetrics fm = g2.getFontMetrics();
-            int tx = 8;
-            int ty = (h - fm.getHeight()) / 2 + fm.getAscent();
 
-            g2.setColor(new Color(0,0,0,160));
+            // ★dBテキスト：左下寄せ＆一回り小さく
+            Font base = getFont();
+            Font small = base.deriveFont(Math.max(10f, base.getSize2D() * 0.85f)); // 小さめ
+            g2.setFont(small);
+
+            FontMetrics fm = g2.getFontMetrics();
+            int tx = barX + 6;
+            int ty = barY + barH - 6; // 左下
+
+            // 文字が読みやすいように、うっすら影
+            g2.setColor(new Color(0, 0, 0, 140));
             g2.drawString(text, tx + 1, ty + 1);
-            g2.setColor(Color.WHITE);
+
+            g2.setColor(new Color(235, 235, 235, 220));
             g2.drawString(text, tx, ty);
+
+            g2.setComposite(AlphaComposite.SrcOver);
 
         } finally {
             g2.dispose();
@@ -4368,5 +4583,125 @@ class GainMeter extends JComponent {
         if (level >= 60) return new Color(255, 150, 40);
         if (level >= 30) return new Color(60, 180, 90);
         return new Color(120, 120, 120);
+    }
+}
+
+final class FontBootstrap {
+    private FontBootstrap() {}
+
+    public static void registerBundledFonts() {
+        register("/fonts/NotoSansCJKsc-Regular.otf");
+        register("/fonts/NotoSansCJKkr-Regular.otf");
+        register("/fonts/NotoSansCJKtc-Regular.otf");
+        register("/fonts/NotoSansCJKjp-Regular.otf");
+    }
+
+    private static void register(String resourcePath) {
+        try (InputStream is = FontBootstrap.class.getResourceAsStream(resourcePath)) {
+            if (is == null) throw new IllegalStateException("Font not found: " + resourcePath);
+            Font font = Font.createFont(Font.TRUETYPE_FONT, is);
+            GraphicsEnvironment.getLocalGraphicsEnvironment().registerFont(font);
+        } catch (Exception e) {
+            // フォント登録失敗してもアプリは動かす
+            System.err.println("[FontBootstrap] Failed to register: " + resourcePath + " : " + e);
+        }
+    }
+}
+final class UiFontApplier {
+    private UiFontApplier() {}
+
+    /** Preferences の ui.language (en/ja/zh_cn/zh_tw/ko) で適用 */
+    public static void applyDefaultUIFontBySuffix(String suffix) {
+        String prefix = switch (suffix) {
+            case "zh_cn" -> "Noto Sans CJK SC";
+            case "zh_tw" -> "Noto Sans CJK TC";
+            case "ko"    -> "Noto Sans CJK KR";
+            case "ja"    -> "Noto Sans CJK JP";
+            default      -> null;
+        };
+
+        int size = 12;
+        Font base = pickByPrefixOrFallback(prefix, size);
+        setAllUIDefaultFonts(base);
+
+        // デバッグ（任意）
+        System.out.println("[UiFontApplier] suffix=" + suffix + " base=" + base.getFamily());
+        System.out.println("[UiFontApplier] Menu.font=" + UIManager.getFont("Menu.font"));
+    }
+
+    /** ui.language がまだ無い初回用：OS Locale から推定して適用 */
+    public static void applyDefaultUIFontFromSystemLocale() {
+        Locale loc = Locale.getDefault();
+        String lang = loc.getLanguage();   // "zh","ja","ko","en"...
+        String country = loc.getCountry(); // "CN","TW","HK"...
+
+        String suffix;
+        if ("zh".equalsIgnoreCase(lang)) {
+            // 中国語は国/地域で雑に判定（TW/HKなら繁体、それ以外は簡体）
+            suffix = ("TW".equalsIgnoreCase(country) || "HK".equalsIgnoreCase(country))
+                    ? "zh_tw"
+                    : "zh_cn";
+        } else if ("ko".equalsIgnoreCase(lang)) {
+            suffix = "ko";
+        } else if ("ja".equalsIgnoreCase(lang)) {
+            suffix = "ja";
+        } else {
+            suffix = "en";
+        }
+
+        applyDefaultUIFontBySuffix(suffix);
+    }
+
+    /** 既に作ったUIへ反映（Frame作成後に呼ぶ） */
+    public static void refreshAllUI(Window root) {
+        SwingUtilities.updateComponentTreeUI(root);
+        root.invalidate();
+        root.validate();
+        root.repaint();
+    }
+
+    // ---- internal helpers ----
+
+    private static Font pickByPrefixOrFallback(String familyPrefix, int size) {
+        if (familyPrefix != null) {
+            String found = findFamilyStartsWith(familyPrefix);
+            if (found != null) return new Font(found, Font.PLAIN, size);
+        }
+
+        // OSフォントfallback
+        List<String> fallbacks = List.of(
+                "Microsoft YaHei UI", "Microsoft YaHei", "SimHei",
+                "Malgun Gothic",
+                "Arial Unicode MS"
+        );
+        for (String fam : fallbacks) {
+            Font f = new Font(fam, Font.PLAIN, size);
+            if (!f.getFamily().equalsIgnoreCase("Dialog")) return f;
+        }
+        return new Font(Font.DIALOG, Font.PLAIN, size);
+    }
+
+    private static String findFamilyStartsWith(String prefix) {
+        String[] fams = GraphicsEnvironment.getLocalGraphicsEnvironment()
+                .getAvailableFontFamilyNames(Locale.ENGLISH);
+        for (String f : fams) {
+            if (f.startsWith(prefix)) return f;
+        }
+        return null;
+    }
+
+    private static void setAllUIDefaultFonts(Font base) {
+        FontUIResource fuir = new FontUIResource(base);
+
+        // LAF defaults と app defaults の両方へ
+        UIDefaults[] targets = { UIManager.getLookAndFeelDefaults(), UIManager.getDefaults() };
+        for (UIDefaults d : targets) {
+            for (Object key : Collections.list(d.keys())) {
+                Object val = d.get(key);
+                if (val instanceof FontUIResource) {
+                    UIManager.put(key, fuir);
+                }
+            }
+        }
     }
 }

@@ -78,11 +78,11 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         final JPanel buttonPanel = new JPanel();
         buttonPanel.setLayout(new FlowLayout(FlowLayout.LEFT));
 
-        final JButton clearButton = new JButton("\uD83D\uDDD1Clr");
-        final JButton openOutTts = new JButton("\uD83D\uDDE3_out");
-        final JButton openIgnore = new JButton("\uD83D\uDE48_ignr");
-        final JButton openDict   = new JButton("\uD83D\uDCD6_dict");
-        final JButton openGood   = new JButton("★_good");
+        final JButton clearButton = new JButton("×Clr");
+        final JButton openOutTts = new JButton("■_out");
+        final JButton openIgnore = new JButton("■_ignr");
+        final JButton openDict   = new JButton("■_dict");
+        final JButton openGood   = new JButton("■_good");
 
         buttonPanel.add(clearButton);
         buttonPanel.add(openOutTts);

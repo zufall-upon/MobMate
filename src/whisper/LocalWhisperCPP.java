@@ -123,9 +123,40 @@ public class LocalWhisperCPP {
                 ) : 1;
         p.language = this.language;
         p.initial_prompt = buildInitialPrompt();
+        applyTranslatePref(p);
         p.write();
         return p;
     }
+    private static void applyTranslatePref(WhisperFullParams p) {
+        boolean on = false;
+        try {
+            on = (MobMateWhisp.prefs != null) &&
+                    MobMateWhisp.prefs.getBoolean("whisper.translate_to_en", false);
+        } catch (Exception ignore) {}
+
+        // ★重要：ON/OFFどっちでも必ず反映する（OFF時に false を書く）
+        try {
+            java.lang.reflect.Field f = p.getClass().getField("translate");
+            Class<?> t = f.getType();
+
+            if (t == boolean.class) {
+                f.setBoolean(p, on);
+            } else if (t == Boolean.class) {
+                f.set(p, Boolean.valueOf(on));
+            } else if (t == int.class) {
+                f.setInt(p, on ? 1 : 0);
+            } else if (t.getSimpleName().equals("CBool")) {
+                f.set(p, on ? CBool.TRUE : CBool.FALSE);
+            } else {
+                // last resort
+                f.set(p, Boolean.valueOf(on));
+            }
+        } catch (Exception ignore) {
+            // bindingsにフィールドが無い場合は何もしない
+        }
+    }
+
+
 
 
     private String buildInitialPrompt() {
