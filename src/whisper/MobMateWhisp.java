@@ -4,7 +4,13 @@ import com.sun.jna.WString;
 import com.sun.jna.platform.win32.Shell32;
 import whisper.Version;
 
+import javax.sound.sampled.*;
+import java.io.ByteArrayInputStream;
 import java.awt.event.*;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.concurrent.*;
 import java.awt.*;
 import java.awt.Window.Type;
@@ -43,6 +49,7 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import static whisper.LocalWhisperCPP.dictionaryDirty;
+import static whisper.VoicegerManager.httpOk;
 
 public class MobMateWhisp implements NativeKeyListener {
     private static final String PREF_WIN_X = "ui.window.x";
@@ -868,6 +875,90 @@ public class MobMateWhisp implements NativeKeyListener {
         popup.add(gpuMenu);
         popup.addSeparator();
 
+        // ===== TTS Engine select (Auto / VOICEVOX / XTTS / Windows / Voiceger) =====
+        Menu ttsEngineMenu = new Menu("TTS Engine");
+        String enginePref = prefs.get("tts.engine", "auto");
+        List<CheckboxMenuItem> engItems = new ArrayList<>();
+        CheckboxMenuItem engAuto = new CheckboxMenuItem("Auto");
+        CheckboxMenuItem engXtts = new CheckboxMenuItem("XTTS");
+        CheckboxMenuItem engWin  = new CheckboxMenuItem("Windows");
+        CheckboxMenuItem engVg   = new CheckboxMenuItem("Voiceger");
+        // ★VOICEVOXは子メニューにする（トップにチェックは付かないので、内部に「Use VOICEVOX」チェックを置く）
+        Menu engVvMenu = new Menu("VOICEVOX");
+        CheckboxMenuItem engVv = new CheckboxMenuItem("Use VOICEVOX");
+        engAuto.setState("auto".equalsIgnoreCase(enginePref));
+        engVv.setState("voicevox".equalsIgnoreCase(enginePref));
+        engXtts.setState("xtts".equalsIgnoreCase(enginePref));
+        engWin.setState("windows".equalsIgnoreCase(enginePref));
+        engVg.setState("voiceger".equalsIgnoreCase(enginePref));
+        engItems.add(engAuto);
+        engItems.add(engVv);
+        engItems.add(engXtts);
+        engItems.add(engWin);
+        engItems.add(engVg);
+        ItemListener engListener = e -> {
+            CheckboxMenuItem src = (CheckboxMenuItem) e.getSource();
+            if (!src.getState()) return;
+
+            for (CheckboxMenuItem m : engItems) m.setState(m == src);
+
+            String v = "auto";
+            if (src == engVv) v = "voicevox";
+            else if (src == engXtts) v = "xtts";
+            else if (src == engWin) v = "windows";
+            else if (src == engVg) v = "voiceger";
+
+            prefs.put("tts.engine", v);
+            try { prefs.sync(); } catch (Exception ignore) {}
+        };
+        engAuto.addItemListener(engListener);
+        engVv.addItemListener(engListener);
+        engXtts.addItemListener(engListener);
+        engWin.addItemListener(engListener);
+        engVg.addItemListener(engListener);
+        // --- VOICEVOX submenu contents ---
+        engVvMenu.add(engVv);
+        engVvMenu.addSeparator();
+        if (isVoiceVoxAvailable()) {
+            String vvVoicePref = prefs.get("tts.voice", "auto");
+            List<CheckboxMenuItem> vvAll = new ArrayList<>();
+
+            List<VoiceVoxSpeaker> speakers = getVoiceVoxSpeakers(); // id + name
+            for (VoiceVoxSpeaker sp : speakers) {
+                String key = "" + sp.id();
+                String label = key + ":" + sp.name();
+                CheckboxMenuItem item = new CheckboxMenuItem(label);
+                item.setState(key.equals(vvVoicePref));
+                engVvMenu.add(item);
+                vvAll.add(item);
+
+                item.addItemListener(ev -> {
+                    if (item.getState()) {
+                        // 話者を選んだら VOICEVOXエンジンも有効化（迷いを減らす）
+                        engVv.setState(true);
+                        engListener.itemStateChanged(new ItemEvent(engVv, 0, engVv, ItemEvent.SELECTED));
+
+                        for (CheckboxMenuItem m : vvAll) m.setState(m == item);
+                        prefs.put("tts.voice", key);
+                        try { prefs.sync(); } catch (Exception ignore) {}
+                    }
+                });
+            }
+        } else {
+            MenuItem na = new MenuItem("VOICEVOX not available");
+            na.setEnabled(false);
+            engVvMenu.add(na);
+        }
+        ttsEngineMenu.add(engAuto);
+        ttsEngineMenu.addSeparator();
+        ttsEngineMenu.add(engVvMenu);
+        ttsEngineMenu.add(engXtts);
+        ttsEngineMenu.add(engWin);
+        ttsEngineMenu.addSeparator();
+        ttsEngineMenu.add(engVg);
+        popup.add(ttsEngineMenu);
+
+
         Menu ttsVoicesItem = new Menu(trayText("menu.voices"));
         String voicePref = prefs.get("tts.windows.voice", "auto");
         List<CheckboxMenuItem> all = new ArrayList<>();
@@ -904,25 +995,6 @@ public class MobMateWhisp implements NativeKeyListener {
             });
         }
         ttsVoicesItem.addSeparator();
-        if (isVoiceVoxAvailable()) {
-            ttsVoicesItem.addSeparator();
-            List<VoiceVoxSpeaker> speakers = getVoiceVoxSpeakers(); // id + name
-            for (VoiceVoxSpeaker sp : speakers) {
-                String key = "" + sp.id();
-                String label = key + ":" + sp.name();
-                CheckboxMenuItem item = new CheckboxMenuItem(label);
-                item.setState(key.equals(voicePref));
-                ttsVoicesItem.add(item);
-                all.add(item);
-                item.addItemListener(e -> {
-                    if (item.getState()) {
-                        for (CheckboxMenuItem m : all) m.setState(m == item);
-                        prefs.put("tts.voice", key);
-                        try { prefs.sync(); } catch (Exception ignore) {}
-                    }
-                });
-            }
-        }
         popup.add(ttsVoicesItem);
 
 
@@ -1182,6 +1254,30 @@ public class MobMateWhisp implements NativeKeyListener {
             });
             debugMenu.add(zipLogsItem);
         }
+        debugMenu.addSeparator(); // 必要なら区切り
+
+        MenuItem openWizardItem = new MenuItem(trayText("menu.wizard.open"));
+        openWizardItem.addActionListener(e -> {
+            SwingUtilities.invokeLater(() -> {
+                FirstLaunchWizard wizard = null;
+                try {
+                    try {
+                        wizard = new FirstLaunchWizard(window, MobMateWhisp.this);
+                    } catch (FileNotFoundException ex) {
+                        throw new RuntimeException(ex);
+                    } catch (NativeHookException ex) {
+                        throw new RuntimeException(ex);
+                    }
+                    wizard.setLocationRelativeTo(window);
+                    wizard.setVisible(true); // modal想定
+                } finally {
+                    try {
+                        if (wizard != null) wizard.stopAllWizardTests();
+                    } catch (Throwable ignore) {}
+                }
+            });
+        });
+        debugMenu.add(openWizardItem);
         popup.add(debugMenu);
 
         popup.addSeparator();
@@ -1190,6 +1286,7 @@ public class MobMateWhisp implements NativeKeyListener {
         exitItem.addActionListener(new ActionListener() {
             @Override
             public void actionPerformed(ActionEvent e) {
+                try { VoicegerManager.stopIfRunning(MobMateWhisp.prefs); } catch (Throwable ignore) {}
                 Config.mirrorAllToCloud();
                 System.exit(0);
 
@@ -2852,6 +2949,12 @@ public class MobMateWhisp implements NativeKeyListener {
                 r.debug = debug;
                 r.autoStartVoiceVox();
                 r.startPsServer();
+                VoicegerManager.ensureRunningIfEnabledAsync(MobMateWhisp.prefs);
+                // Exit時にVoiceger APIを止める（System.exit / ウィンドウ終了どっちでも効く）
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                    try { VoicegerManager.stopIfRunning(MobMateWhisp.prefs); } catch (Throwable ignore) {}
+                }, "voiceger-shutdown"));
+
                 boolean openWindow = r.prefs.getBoolean("open-window", true);
                 if (forceOpenWindow) {
                     openWindow = true;
@@ -2995,6 +3098,7 @@ public class MobMateWhisp implements NativeKeyListener {
         });
 
         // === First launch wizard ===
+//        prefs.putBoolean("wizard.never", false);
 //        prefs.putBoolean("wizard.completed", false);
         SwingUtilities.invokeLater(() -> {
             try {
@@ -3042,6 +3146,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     } catch (Throwable ignore) {}
                 }
 
+//                prefs.putBoolean("wizard.completed", true);
                 try { prefs.sync(); } catch (Exception ignore) {}
 
                 final String afterIn = prefs.get("audio.device", "");
@@ -3318,25 +3423,185 @@ public class MobMateWhisp implements NativeKeyListener {
     public void speak(String text) {
         if (text == null || text.trim().isEmpty()) return;
         text = normalizeLaugh(text);
-        text = Config.applyDictionary(text); // Dictorary apply
-        if (isVoiceVoxAvailable()) {
-            String api = Config.getString("voicevox.api", "");int base = Integer.parseInt(this.prefs.get("tts.voice", "3"));
-            String uiLang = this.prefs.get("ui.language", "en"); // "ja","en","ko","zh_cn","zh_tw" 想定
-            // ★感情自動寄せの有効/無効判定
-            boolean autoEmotion = prefs.getBoolean("voicevox.auto_emotion", true);
-            int styleId;
-            if (autoEmotion) {
-                styleId = VoiceVoxStyles.pickStyleId(text, base, api, uiLang);
-            } else {
-                styleId = base; // 感情寄せOFFなら設定IDをそのまま使用
+        text = Config.applyDictionary(text);
+
+        String engine = prefs.get("tts.engine", "auto").toLowerCase(Locale.ROOT);
+
+        // --- forced route ---
+        if ("voiceger".equals(engine)) {
+            speakVoiceger(text);
+            return;
+        }
+        if ("voicevox".equals(engine)) {
+            if (isVoiceVoxAvailable()) {
+                String api = Config.getString("voicevox.api", "");
+                int base = Integer.parseInt(this.prefs.get("tts.voice", "3"));
+                String uiLang = this.prefs.get("ui.language", "en");
+                boolean autoEmotion = prefs.getBoolean("voicevox.auto_emotion", true);
+
+                int styleId = autoEmotion
+                        ? VoiceVoxStyles.pickStyleId(text, base, api, uiLang)
+                        : base;
+
+                speakVoiceVox(text, String.valueOf(styleId), api);
+                return;
             }
+            // fallthrough to auto
+        }
+        if ("xtts".equals(engine)) {
+            if (isXttsAvailable()) {
+                try { speakXtts(text); } catch (Exception ignore) {}
+                return;
+            }
+            // fallthrough
+        }
+        if ("windows".equals(engine)) {
+            speakWindows(text);
+            return;
+        }
+
+        // --- auto (existing behavior) ---
+        if (isVoiceVoxAvailable()) {
+            String api = Config.getString("voicevox.api", "");
+            int base = Integer.parseInt(this.prefs.get("tts.voice", "3"));
+            String uiLang = this.prefs.get("ui.language", "en");
+            boolean autoEmotion = prefs.getBoolean("voicevox.auto_emotion", true);
+
+            int styleId = autoEmotion
+                    ? VoiceVoxStyles.pickStyleId(text, base, api, uiLang)
+                    : base;
+
             speakVoiceVox(text, String.valueOf(styleId), api);
         } else if (isXttsAvailable()) {
-            try { speakXtts(text); } catch (Exception e) {}
+            try { speakXtts(text); } catch (Exception ignore) {}
         } else {
             speakWindows(text);
         }
     }
+
+    // ===== Voiceger route =====
+    private static String cut200(String s) {
+        if (s == null) return "null";
+        s = s.replace("\r", "\\r").replace("\n", "\\n");
+        return (s.length() <= 200) ? s : s.substring(0, 200) + "...";
+    }
+    // WindowsTTS(wav) -> bytes -> Voiceger VC -> bytes -> Java再生（outファイル書き出し無し）
+    private void speakVoiceger(String text) {
+        long t0 = System.nanoTime();
+        try {
+            byte[] inBytes = synthWindowsToWavBytesViaAgent(text);
+            long t1 = System.nanoTime();
+            Config.logDebug("[VG] tts_ms=" + ((t1 - t0) / 1_000_000));
+
+            byte[] outBytes = applyVoicegerVcBytesIfEnabled(inBytes, prefs);
+            long t2 = System.nanoTime();
+            Config.logDebug("[VG] vc_ms=" + ((t2 - t1) / 1_000_000));
+
+            boolean usingVc = (outBytes != null && outBytes.length >= 256);
+            byte[] play = usingVc ? outBytes : inBytes;
+            playViaPowerShellBytesAsync(play);
+            long t3 = System.nanoTime();
+            Config.logDebug("[VG] play_send_ms=" + ((t3 - t2) / 1_000_000));
+
+        } catch (Exception e) {
+            Config.logDebug("[VG] speakVoiceger(bytes) exception: " + e);
+            e.printStackTrace();
+        }
+    }
+    private byte[] synthWindowsToWavBytesViaAgent(String text) throws Exception {
+        if (text == null || text.isBlank()) return null;
+
+        synchronized (psLock) {
+            ensurePsServerLocked();
+
+            String voice = prefs.get("tts.windows.voice", "auto");
+
+            String id = Long.toHexString(System.nanoTime());
+            byte[] txtBytes = text.getBytes(StandardCharsets.UTF_8);
+            String b64Text = Base64.getEncoder().encodeToString(txtBytes);
+
+            // SYNTHB64 <voiceOrAuto> <id>
+            psWriter.write("SYNTHB64 " + voice + " " + id + "\n");
+
+            final int CHUNK = 12000;
+            for (int i = 0; i < b64Text.length(); i += CHUNK) {
+                int end = Math.min(b64Text.length(), i + CHUNK);
+                psWriter.write("TDATA " + id + " " + b64Text.substring(i, end) + "\n");
+            }
+            psWriter.write("TEND " + id + "\n");
+            psWriter.flush();
+
+            // 返り：ODATA... が複数行 → OEND → DONE
+            StringBuilder b64 = new StringBuilder(256000);
+            while (true) {
+                String line = psReader.readLine();
+                if (line == null) throw new IOException("tts_agent pipe closed");
+                if ("DONE".equals(line)) break;
+
+                if (line.startsWith("ODATA ")) {
+                    b64.append(line.substring("ODATA ".length()));
+                } else if ("OEND".equals(line)) {
+                    // nop
+                } else if (line.startsWith("ERR")) {
+                    throw new IOException("tts_agent synth error: " + line);
+                } else {
+                    throw new IOException("tts_agent bad response: " + line);
+                }
+            }
+
+            if (b64.length() < 64) return null;
+            return Base64.getDecoder().decode(b64.toString());
+        }
+    }
+    private byte[] applyVoicegerVcBytesIfEnabled(byte[] inWavBytes, Preferences prefs) {
+        try {
+            boolean enabled = prefs.getBoolean("voiceger.enabled", false);
+            String baseUrl = prefs.get("voiceger.api_base", "http://127.0.0.1:8501");
+            if (!baseUrl.endsWith("/")) baseUrl += "/";
+
+            Config.logDebug("[VG] enabled=" + enabled + " api_base=" + baseUrl);
+            if (!enabled) return null;
+
+            if (!httpOk(baseUrl + "health")) {
+                Config.logDebug("[VG] healthOk=false");
+                return null;
+            }
+            Config.logDebug("[VG] healthOk=true");
+
+            HttpClient client = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofSeconds(3))
+                    .build();
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "vc/bytes"))
+                    .timeout(Duration.ofSeconds(300))
+                    .header("Content-Type", "audio/wav")
+                    .POST(HttpRequest.BodyPublishers.ofByteArray(inWavBytes))
+                    .build();
+
+            HttpResponse<byte[]> res = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
+            Config.logDebug("[VG] /vc/bytes status=" + res.statusCode());
+
+            if (res.statusCode() != 200) {
+                // 失敗時はテキストボディの先頭だけログ（過多防止）
+                String err = new String(res.body(), java.nio.charset.StandardCharsets.UTF_8);
+                Config.logDebug("[VG] /vc/bytes body=" + cut200(err));
+                return null;
+            }
+
+            byte[] out = res.body();
+            Config.logDebug("[VG] /vc/bytes out_size=" + (out == null ? -1 : out.length));
+            if (out == null || out.length < 256) return null;
+
+            return out;
+
+        } catch (Exception e) {
+            Config.logDebug("[VG] applyVc(bytes) exception: " + e);
+            e.printStackTrace();
+            return null;
+        }
+    }
+
     private boolean isVoiceVoxAvailable() {
         long now = System.currentTimeMillis();
         if (now - lastVoiceVoxCheckMs < VOICEVOX_CHECK_INTERVAL_MS) {
@@ -3419,25 +3684,20 @@ public class MobMateWhisp implements NativeKeyListener {
             s.setDoOutput(true);
             s.setRequestProperty("Content-Type", "application/json");
             s.getOutputStream().write(queryJson.getBytes(StandardCharsets.UTF_8));
-            Path tmp = Files.createTempFile("vv_", ".wav");
-            try (InputStream in = s.getInputStream();
-                 OutputStream out = Files.newOutputStream(tmp, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING)) {
-                byte[] buf = new byte[4096];
-                int len;
-                while ((len = in.read(buf)) != -1) {
-                    out.write(buf, 0, len);
-                }
+            byte[] wavBytes;
+            try (InputStream in = s.getInputStream()) {
+                wavBytes = in.readAllBytes();
             }
-            if (!waitForValidWav(tmp.toFile(), 3000)) {
-                Config.logDebug("[VV] WAV invalid timeout");
+
+            if (!looksLikeWav(wavBytes)) {
+                Config.logDebug("[VV] synth bytes not wav");
                 return;
             }
-            Config.logDebug("[VV] saved: " + tmp);
-            playViaPowerShellAsync(tmp.toFile());
+            Config.logDebug("[VV] bytes size=" + wavBytes.length);
+            playViaPowerShellBytesAsync(wavBytes);
             new Thread(() -> {
                 try {
                     Thread.sleep(3000);
-                    Files.deleteIfExists(tmp);
                 } catch (Exception ignore) {}
             }).start();
         } catch (Exception ex) {
@@ -3765,39 +4025,12 @@ public class MobMateWhisp implements NativeKeyListener {
     public void speakWindows(String text) {
         if (text == null || text.isBlank()) return;
         try {
-            Path tmp = Files.createTempFile("win_", ".wav");
-            String wavPath = tmp.toAbsolutePath().toString().replace("\\", "\\\\");
-            String escapedText = text.replace("'", "''");
-            String voice = prefs.get("tts.windows.voice", "auto");
-            StringBuilder ps = new StringBuilder();
-            ps.append("Add-Type -AssemblyName System.Speech;");
-            ps.append("$s = New-Object System.Speech.Synthesis.SpeechSynthesizer;");
-            if (!"auto".equalsIgnoreCase(voice)) {
-                ps.append("$s.SelectVoice('").append(voice.replace("'", "''")).append("');");
-            }
-            ps.append("$s.SetOutputToWaveFile('").append(wavPath).append("');");
-            ps.append("$s.Speak('").append(escapedText).append("');");
-            ps.append("$s.Dispose();");
-            new ProcessBuilder(
-                    "powershell",
-                    "-NoLogo",
-                    "-NoProfile",
-                    "-Command",
-                    ps.toString()
-            ).redirectErrorStream(true)
-                    .start()
-                    .waitFor();
-            if (!waitForValidWav(tmp.toFile(), 3000)) {
-                Config.logDebug("[WIN] WAV invalid timeout");
+            byte[] wavBytes = synthWindowsToWavBytesViaAgent(text);
+            if (!looksLikeWav(wavBytes)) {
+                Config.logDebug("[WIN] synth bytes not wav");
                 return;
             }
-            playViaPowerShellAsync(tmp.toFile());
-            new Thread(() -> {
-                try {
-                    Thread.sleep(3000);
-                    Files.deleteIfExists(tmp);
-                } catch (Exception ignore) {}
-            }).start();
+            playViaPowerShellBytesAsync(wavBytes);
         } catch (Exception ex) {
             ex.printStackTrace();
             Config.logDebug("[WIN ERROR] " + ex.getMessage());
@@ -3832,6 +4065,8 @@ public class MobMateWhisp implements NativeKeyListener {
                 t.setDaemon(true);
                 return t;
             });
+
+
     private int psHealthCounter = 0;
     private static final int PS_HEALTH_CHECK_INTERVAL = 3;
     public void playViaPowerShellAsync(File wavFile) {
@@ -3868,6 +4103,55 @@ public class MobMateWhisp implements NativeKeyListener {
                 }
             }
         });
+    }
+    public void playViaPowerShellBytesAsync(byte[] wavBytes) {
+        if (wavBytes == null || wavBytes.length < 256) return;
+
+        playExecutor.submit(() -> {
+            synchronized (psLock) {
+                try {
+                    ensurePsServerLocked();
+
+                    int devIndex = findOutputDeviceIndex(
+                            prefs.get("audio.output.device", "")
+                    );
+
+                    String id = Long.toHexString(System.nanoTime());
+                    String b64 = Base64.getEncoder().encodeToString(wavBytes);
+
+                    psWriter.write("PLAYB64 " + devIndex + " " + id + "\n");
+
+                    final int CHUNK = 12000; // 1行長すぎ対策
+                    for (int i = 0; i < b64.length(); i += CHUNK) {
+                        int end = Math.min(b64.length(), i + CHUNK);
+                        psWriter.write("DATA " + id + " " + b64.substring(i, end) + "\n");
+                    }
+                    psWriter.write("END " + id + "\n");
+                    psWriter.flush();
+
+                    String resp = psReader.readLine();
+                    if (!"DONE".equals(resp)) {
+                        psHealthCounter = 0;
+                        throw new IOException("tts_agent bad response: " + resp);
+                    }
+                    psHealthCounter++;
+                    if (psHealthCounter >= PS_HEALTH_CHECK_INTERVAL) psHealthCounter = 0;
+
+                } catch (Exception e) {
+                    Config.log("TTS agent error: " + e.getMessage());
+                    if (e instanceof IOException) {
+                        Config.log("TTS pipe dead → restarting agent");
+                        stopPsServerLocked();
+                    }
+                }
+            }
+        });
+    }
+
+    private static boolean looksLikeWav(byte[] b) {
+        if (b == null || b.length < 12) return false;
+        return (b[0]=='R' && b[1]=='I' && b[2]=='F' && b[3]=='F'
+                && b[8]=='W' && b[9]=='A' && b[10]=='V' && b[11]=='E');
     }
     private void ensurePsServerLocked() throws Exception {
         if (psProcess != null && psProcess.isAlive()
@@ -4703,5 +4987,435 @@ final class UiFontApplier {
                 }
             }
         }
+    }
+}
+
+final class VoicegerManager {
+    private static volatile Process proc;
+    private static final Object LOCK = new Object();
+
+    private VoicegerManager() {}
+
+    // ===== Stop API on exit =====
+    public static void stopIfRunning(Preferences prefs) {
+//        if (prefs != null && !prefs.getBoolean("voiceger.enabled", false)) return;
+
+        synchronized (LOCK) {
+            int port = (prefs != null) ? prefs.getInt("voiceger.port", 8501) : 8501;
+
+            // MobMateが掴んでるプロセスがあればまず止める
+            if (proc != null) {
+                try {
+                    if (proc.isAlive()) {
+                        proc.destroy();
+                        try { proc.waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS); } catch (Exception ignore) {}
+                    }
+                } catch (Exception ignore) {
+                } finally {
+                    proc = null;
+                }
+            }
+
+            // 念のため LISTENING を潰す（孤児対策）
+            killListeningPortWindows(port);
+        }
+    }
+
+    private static void killListeningPortWindows(int port) {
+        try {
+            String os = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+            if (!os.contains("win")) return;
+
+            Process p = new ProcessBuilder("cmd", "/c", "netstat -ano -p tcp")
+                    .redirectErrorStream(true)
+                    .start();
+
+            String out;
+            try (java.io.InputStream is = p.getInputStream()) {
+                out = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            }
+            try { p.waitFor(1200, java.util.concurrent.TimeUnit.MILLISECONDS); } catch (Exception ignore) {}
+
+            String needle = ":" + port;
+            java.util.HashSet<Integer> pids = new java.util.HashSet<>();
+
+            for (String line : out.split("\\r?\\n")) {
+                if (!line.contains(needle)) continue;
+                if (!line.toUpperCase(java.util.Locale.ROOT).contains("LISTENING")) continue;
+
+                String[] parts = line.trim().split("\\s+");
+                if (parts.length < 5) continue;
+
+                // 最後のトークンがPID
+                try {
+                    int pid = Integer.parseInt(parts[parts.length - 1]);
+                    if (pid > 0) pids.add(pid);
+                } catch (Exception ignore) {}
+            }
+
+            for (int pid : pids) {
+                try {
+                    Config.logDebug("[VG] stop: taskkill pid=" + pid + " port=" + port);
+                    new ProcessBuilder("taskkill", "/T", "/F", "/PID", String.valueOf(pid))
+                            .redirectErrorStream(true)
+                            .start()
+                            .waitFor(1500, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (Exception ignore) {}
+            }
+        } catch (Exception ignore) {}
+    }
+
+    /** MobMate起動時：enabledなら裏で起動→Ready待ち */
+    public static void ensureRunningIfEnabledAsync(Preferences prefs) {
+        if (!prefs.getBoolean("voiceger.enabled", false)) return;
+
+        Thread t = new Thread(() -> {
+            try {
+                ensureRunning(prefs, Duration.ofSeconds(20));
+            } catch (Throwable e) {
+                e.printStackTrace();
+            }
+        }, "voiceger-autostart");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** Wizardの起動テスト用：起動→Readyまで待って結果文字列を返す */
+    public static String startTest(Preferences prefs, Duration timeout) {
+        try {
+            ensureRunning(prefs, timeout);
+            return "OK: Voiceger ready";
+        } catch (Throwable e) {
+            return "NG: " + e.getMessage();
+        }
+    }
+
+    /** 起動済みならそのまま、未起動なら起動してReady待ち */
+    public static void ensureRunning(Preferences prefs, Duration timeout) throws Exception {
+        synchronized (LOCK) {
+            int port = prefs.getInt("voiceger.port", 8501);
+            String baseUrl = "http://127.0.0.1:" + port;
+
+            // 既に生きてるならOK
+            if (isUp(baseUrl)) return;
+
+            // 残骸があれば掃除
+            if (proc != null && proc.isAlive()) {
+                try { proc.destroy(); } catch (Exception ignore) {}
+            }
+
+            Path dir = Paths.get(prefs.get("voiceger.dir", "")).toAbsolutePath();
+            if (dir.toString().isBlank() || !Files.isDirectory(dir)) {
+                throw new FileNotFoundException("voiceger.dir not found: " + dir);
+            }
+
+            // Wizardと同じ：embedded pythonで _internal/voiceger_api.py を直接起動する
+            Path apiPy = resolveVoicegerApiPy(dir);
+            if (!Files.exists(apiPy)) {
+                throw new FileNotFoundException("voiceger_api.py not found: " + apiPy);
+            }
+
+            Path py = detectEmbeddedPython(dir);
+            if (py == null || !Files.exists(py)) {
+                throw new FileNotFoundException("embedded python not found under: " + dir);
+            }
+
+            Path log = dir.resolve("voiceger_api.log");
+            ProcessBuilder pb = new ProcessBuilder(
+                    py.toAbsolutePath().toString(),
+                    apiPy.toAbsolutePath().toString()
+            );
+            pb.directory(dir.toFile());
+            pb.redirectErrorStream(true);
+            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()));
+
+// env（Wizard同様）
+            Map<String, String> env = pb.environment();
+            env.putIfAbsent("NUMBA_DISABLE_CACHING", "1");
+            env.putIfAbsent("NUMBA_DISABLE_JIT", "1");
+
+            proc = pb.start();
+
+
+            long end = System.nanoTime() + timeout.toNanos();
+            while (System.nanoTime() < end) {
+                if (isUp(baseUrl)) return;
+                try { Thread.sleep(300); } catch (InterruptedException ignore) {}
+            }
+            throw new TimeoutException("Voiceger not ready. See: " + log);
+        }
+    }
+    private static Path resolveVoicegerApiPy(Path voicegerDir) {
+        return voicegerDir.resolve("_internal").resolve("voiceger_api.py");
+    }
+    private static Path detectEmbeddedPython(Path voicegerDir) {
+        // まずは定番
+        // voicegerDir = VOICEGER_DIR を想定
+        Path p1 = voicegerDir.resolve("_internal").resolve("py").resolve("python.exe");
+        if (Files.exists(p1)) return p1;
+
+        // 旧/別配置の保険（あれば）
+        Path p2 = voicegerDir.resolve("voiceger_v2").resolve("_internal").resolve("py").resolve("python.exe");
+        if (Files.exists(p2)) return p2;
+
+        return null;
+    }
+
+
+
+    private static Path detectLauncher(Path dir) {
+        // まずは “それっぽい” のみ（後で厳密化OK）
+        String[] names = {
+                "start_voiceger.bat", "start.bat", "run.bat", "voiceger.bat",
+                "start.ps1", "run.ps1"
+        };
+        for (String n : names) {
+            Path p = dir.resolve(n);
+            if (Files.exists(p)) return p;
+        }
+        return null;
+    }
+
+    private static List<String> buildWindowsCommand(Path launcher) {
+        String name = launcher.getFileName().toString().toLowerCase(Locale.ROOT);
+        if (name.endsWith(".bat") || name.endsWith(".cmd")) {
+            return Arrays.asList("cmd", "/c", launcher.toAbsolutePath().toString());
+        }
+        if (name.endsWith(".ps1")) {
+            return Arrays.asList("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    launcher.toAbsolutePath().toString());
+        }
+        return Arrays.asList(launcher.toAbsolutePath().toString());
+    }
+
+    private static boolean isUp(String baseUrl) {
+        // Streamlit想定： / や /health が200ならOK扱い（緩く）
+        return httpOk(baseUrl + "/") || httpOk(baseUrl + "/health") || httpOk(baseUrl + "/docs");
+    }
+
+    static boolean httpOk(String urlStr) {
+        HttpURLConnection con = null;
+        try {
+            con = (HttpURLConnection) new URL(urlStr).openConnection();
+            con.setConnectTimeout(300);
+            con.setReadTimeout(300);
+            con.setRequestMethod("GET");
+            int code = con.getResponseCode();
+            return code >= 200 && code < 300;
+        } catch (Exception ignore) {
+            return false;
+        } finally {
+            if (con != null) try { con.disconnect(); } catch (Exception ignore) {}
+        }
+    }
+
+    // ===== Conversion bridge (file-based) =====
+
+    /**
+     * MobMateが生成したwav(bytes)を Voiceger変換して返す。
+     * 変換失敗時は inWav をそのまま返す（壊さない）
+     */
+    public static byte[] maybeConvertWavByBridge(byte[] inWav, java.util.prefs.Preferences prefs) {
+        if (inWav == null || inWav.length < 64) return inWav;
+        if (!prefs.getBoolean("voiceger.enabled", false)) return inWav;
+        if (!prefs.getBoolean("voiceger.use_on_output", true)) return inWav;
+
+        Path dir = Paths.get(prefs.get("voiceger.dir", "")).toAbsolutePath();
+        if (dir.toString().isBlank() || !Files.isDirectory(dir)) return inWav;
+
+        try {
+            ensureConvertBridge(prefs);
+
+            Path inFile  = dir.resolve("mobmate_in.wav");
+            Path outFile = dir.resolve("mobmate_out.wav");
+            Files.write(inFile, inWav);
+
+            Path bat = dir.resolve("mobmate_voiceger_convert.bat");
+            if (!Files.exists(bat)) return inWav;
+
+            ProcessBuilder pb = new ProcessBuilder("cmd", "/c",
+                    bat.toAbsolutePath().toString(),
+                    inFile.toAbsolutePath().toString(),
+                    outFile.toAbsolutePath().toString());
+            pb.directory(dir.toFile());
+            pb.redirectErrorStream(true);
+            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(dir.resolve("voiceger_convert.log").toFile()));
+
+            Process p = pb.start();
+
+            // タイムアウト（長すぎるとUX死ぬので短め）
+            boolean ok = p.waitFor(25, java.util.concurrent.TimeUnit.SECONDS);
+            if (!ok) {
+                try { p.destroy(); } catch (Exception ignore) {}
+                return inWav;
+            }
+            if (p.exitValue() != 0) return inWav;
+
+            if (!Files.exists(outFile)) return inWav;
+
+            byte[] out = Files.readAllBytes(outFile);
+            return (out.length > 64) ? out : inWav;
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return inWav;
+        }
+    }
+
+    public static void ensureConvertBridge(Preferences prefs) {
+        Path dir = getDir(prefs);
+        if (dir == null) return;
+
+        try {
+            Files.createDirectories(dir);
+            Path bat = dir.resolve("mobmate_voiceger_convert.bat");
+            if (!Files.exists(bat)) {
+                // ★最小のダミー：in.wav を out.wav にコピー（経路確認用）
+                // 実運用ではこの中身を「voiceger変換コマンド」に置き換える
+                String s =
+                        "@echo off\r\n" +
+                                "set IN=%1\r\n" +
+                                "set OUT=%2\r\n" +
+                                "if \"%IN%\"==\"\" exit /b 2\r\n" +
+                                "if \"%OUT%\"==\"\" exit /b 2\r\n" +
+                                "copy /y \"%IN%\" \"%OUT%\" >nul\r\n" +
+                                "exit /b %ERRORLEVEL%\r\n";
+                Files.writeString(bat, s, StandardCharsets.UTF_8);
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    /** wavファイルを voiceger ブリッジで変換して、出力wav(File)を返す。失敗時は入力を返す。 */
+    public static File convertWavFile(File inWav, Preferences prefs) {
+        if (inWav == null || !inWav.exists()) return inWav;
+
+        // routeがVoicegerでも、enabled falseなら変換はしない（壊さない）
+        if (!prefs.getBoolean("voiceger.enabled", false)) return inWav;
+
+        Path dir = getDir(prefs);
+        if (dir == null) return inWav;
+
+        ensureConvertBridge(prefs);
+
+        Path bat = dir.resolve("mobmate_voiceger_convert.bat");
+        if (!Files.exists(bat)) return inWav;
+
+        Path out = null;
+        try {
+            out = Files.createTempFile("voiceger_out_", ".wav");
+
+            ProcessBuilder pb = new ProcessBuilder(
+                    "cmd", "/c",
+                    bat.toAbsolutePath().toString(),
+                    inWav.getAbsolutePath(),
+                    out.toAbsolutePath().toString()
+            );
+            pb.directory(dir.toFile());
+            pb.redirectErrorStream(true);
+            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(dir.resolve("voiceger_convert.log").toFile()));
+
+            Process p = pb.start();
+            boolean ok = p.waitFor(25, TimeUnit.SECONDS);
+            if (!ok) {
+                try { p.destroy(); } catch (Exception ignore) {}
+                safeDelete(out);
+                return inWav;
+            }
+            if (p.exitValue() != 0) {
+                safeDelete(out);
+                return inWav;
+            }
+            if (!isProbablyWav(out)) {
+                safeDelete(out);
+                return inWav;
+            }
+            return out.toFile();
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            safeDelete(out);
+            return inWav;
+        }
+    }
+
+    private static Path getDir(Preferences prefs) {
+        String s = prefs.get("voiceger.dir", "").trim();
+        if (s.isEmpty()) return null;
+        Path dir = Paths.get(s).toAbsolutePath();
+        if (!Files.isDirectory(dir)) return null;
+        return dir;
+    }
+
+    private static boolean isProbablyWav(Path p) {
+        try {
+            if (p == null || !Files.exists(p) || Files.size(p) < 64) return false;
+            byte[] h = Files.readAllBytes(p);
+            if (h.length < 12) return false;
+            String riff = new String(h, 0, 4, StandardCharsets.US_ASCII);
+            String wave = new String(h, 8, 4, StandardCharsets.US_ASCII);
+            return "RIFF".equals(riff) && "WAVE".equals(wave);
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private static void safeDelete(Path p) {
+        try { if (p != null) Files.deleteIfExists(p); } catch (Exception ignore) {}
+    }
+
+    static java.util.List<String> checkVoicegerFiles(java.nio.file.Path voicegerDir) {
+        java.util.List<String> miss = new java.util.ArrayList<>();
+
+        java.nio.file.Path internal = voicegerDir.resolve("_internal");
+        java.nio.file.Path apiPy = internal.resolve("voiceger_api.py");
+        if (!java.nio.file.Files.exists(apiPy)) miss.add("_internal/voiceger_api.py");
+
+        // voiceger_api.py の仕様に合わせた必須構成
+        java.nio.file.Path gptSoVits = voicegerDir.resolve("GPT-SoVITS");
+        if (!java.nio.file.Files.isDirectory(gptSoVits)) miss.add("GPT-SoVITS/");
+
+        // ffmpeg.exe (GPT-SoVITS直下)
+        if (!java.nio.file.Files.exists(gptSoVits.resolve("ffmpeg.exe"))) miss.add("GPT-SoVITS/ffmpeg.exe");
+
+        // pretrained_models
+        java.nio.file.Path pretrained = gptSoVits.resolve("GPT_SoVITS").resolve("pretrained_models");
+        if (!java.nio.file.Files.isDirectory(pretrained)) miss.add("GPT-SoVITS/GPT_SoVITS/pretrained_models/");
+        if (!java.nio.file.Files.isDirectory(pretrained.resolve("chinese-roberta-wwm-ext-large")))
+            miss.add(".../pretrained_models/chinese-roberta-wwm-ext-large/");
+        if (!java.nio.file.Files.isDirectory(pretrained.resolve("chinese-hubert-base")))
+            miss.add(".../pretrained_models/chinese-hubert-base/");
+
+        // G2PWModel
+        java.nio.file.Path g2pw = gptSoVits.resolve("GPT_SoVITS").resolve("text").resolve("G2PWModel");
+        if (!java.nio.file.Files.isDirectory(g2pw)) miss.add("GPT-SoVITS/GPT_SoVITS/text/G2PWModel/");
+
+        // RVC assets
+        java.nio.file.Path rvc = gptSoVits.resolve("Retrieval-based-Voice-Conversion-WebUI");
+        java.nio.file.Path hubert = rvc.resolve("assets").resolve("hubert").resolve("hubert_base.pt");
+        if (!java.nio.file.Files.exists(hubert)) miss.add(".../assets/hubert/hubert_base.pt");
+
+        java.nio.file.Path rmvpe = rvc.resolve("assets").resolve("rmvpe");
+        if (!java.nio.file.Files.isDirectory(rmvpe)) miss.add(".../assets/rmvpe/");
+
+        java.nio.file.Path weights = rvc.resolve("assets").resolve("weights");
+        if (!java.nio.file.Files.isDirectory(weights)) {
+            miss.add(".../assets/weights/");
+        } else {
+            try (var s = java.nio.file.Files.list(weights)) {
+                boolean hasPth = s.anyMatch(p -> p.getFileName().toString().toLowerCase().endsWith(".pth"));
+                if (!hasPth) miss.add(".../assets/weights/*.pth");
+            } catch (Exception ignore) {
+                miss.add(".../assets/weights/*.pth");
+            }
+        }
+
+        // reference（TTS用：無くてもVCだけなら動くが、API側はデフォルトで参照を読むので置いとくのが安全）
+        java.nio.file.Path refDir = voicegerDir.resolve("reference");
+        if (!java.nio.file.Files.exists(refDir.resolve("reference.wav"))) miss.add("reference/reference.wav");
+        if (!java.nio.file.Files.exists(refDir.resolve("ref_text.txt"))) miss.add("reference/ref_text.txt");
+
+        return miss;
     }
 }
