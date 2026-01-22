@@ -1239,6 +1239,10 @@ public class FirstLaunchWizard extends JDialog {
                     Map<String, String> env = pb.environment();
                     env.putIfAbsent("NUMBA_DISABLE_CACHING", "1");
                     env.putIfAbsent("NUMBA_DISABLE_JIT", "1");
+                    // ★追加：Voiceger API ログ抑制（デフォルトOFF）
+                    boolean vgDebug = prefs.getBoolean("voiceger.debug", false);
+                    env.put("VOICEGER_DEBUG", vgDebug ? "1" : "0");
+
                     pb.directory(voicegerDir.toFile());
                     pb.redirectErrorStream(true);
                     pb.redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()));

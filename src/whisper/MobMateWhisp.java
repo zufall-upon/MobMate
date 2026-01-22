@@ -177,6 +177,16 @@ public class MobMateWhisp implements NativeKeyListener {
     private final java.util.concurrent.atomic.AtomicBoolean isStartingRecording = new java.util.concurrent.atomic.AtomicBoolean(false);
     private volatile boolean primeAgain = false;
 
+    // ===== Voiceger HTTP (reuse) =====
+    private static final HttpClient VG_HTTP = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(2))
+            .version(HttpClient.Version.HTTP_1_1) // ローカルAPIならこれで十分
+            .build();
+
+    // health の結果キャッシュ（毎回叩かない）
+    private static volatile long vgHealthOkUntilMs = 0L;
+    private static final long VG_HEALTH_CACHE_MS = 3000; // 3秒だけ信じる
+
     private boolean debug;
 
     private static final String[] ALLOWED_HOTKEYS = { "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14", "F15", "F16", "F17", "F18" };
@@ -253,7 +263,7 @@ public class MobMateWhisp implements NativeKeyListener {
         this.hotkey = this.prefs.get("hotkey", "F9");
         this.shiftHotkey = this.prefs.getBoolean("shift-hotkey", false);
         this.ctrltHotkey = this.prefs.getBoolean("ctrl-hotkey", false);
-        this.model = this.prefs.get("model", "ggml-small.bin");
+        this.model = this.prefs.get("model", "ggml-small-q8_0.bin");
         this.model_dir = this.prefs.get("model_dir", "");
 
         GlobalScreen.registerNativeHook();
@@ -346,36 +356,52 @@ public class MobMateWhisp implements NativeKeyListener {
         return prefs;
     }
     void createTrayIcon() {
-        this.imageRecording = new ImageIcon(this.getClass().getResource("recording.png")).getImage();
-        this.imageInactive = new ImageIcon(this.getClass().getResource("inactive.png")).getImage();
-        this.imageTranscribing = new ImageIcon(this.getClass().getResource("transcribing.png")).getImage();
-        this.trayIcon = new TrayIcon(this.imageInactive, "Press " + this.hotkey + " to record");
-        this.trayIcon.setImageAutoSize(true);
-        final SystemTray tray = SystemTray.getSystemTray();
-        final Frame frame = new Frame("");
-        frame.setUndecorated(true);
-        frame.setType(Type.UTILITY);
-        SwingUtilities.updateComponentTreeUI(frame);
-        // Create a pop-up menu components
-        final PopupMenu popup = createPopupMenu();
-        this.trayIcon.setPopupMenu(popup);
-        this.trayIcon.addMouseListener(new MouseAdapter() {
-            @Override
-            public void mouseReleased(MouseEvent e) {
-                if (!e.isPopupTrigger()) {
-                    stopRecording();
-                }
-            }
-
-        });
-        try {
-            frame.setResizable(false);
-            frame.setVisible(true);
-            tray.add(this.trayIcon);
-        } catch (AWTException ex) {
-            Config.log("TrayIcon could not be added.\n" + ex.getMessage());
+        Config.log("[TRAY] begin");
+        // ★そもそもトレイ非対応環境なら即戻る（RDP/制限PCで多い）
+        if (!SystemTray.isSupported()) {
+            Config.log("[TRAY] SystemTray is NOT supported. skip tray.");
+            return;
         }
-        trayIcon.addActionListener(e -> bringToFront(window));
+        try {
+            this.imageRecording = new ImageIcon(this.getClass().getResource("recording.png")).getImage();
+            this.imageInactive = new ImageIcon(this.getClass().getResource("inactive.png")).getImage();
+            this.imageTranscribing = new ImageIcon(this.getClass().getResource("transcribing.png")).getImage();
+            this.trayIcon = new TrayIcon(this.imageInactive, "Press " + this.hotkey + " to record");
+            this.trayIcon.setImageAutoSize(true);
+            Config.log("[TRAY] getSystemTray...");
+            final SystemTray tray = SystemTray.getSystemTray();
+            final Frame frame = new Frame("");
+            frame.setUndecorated(true);
+            frame.setType(Type.UTILITY);
+            Config.log("[TRAY] updateComponentTreeUI...");
+            SwingUtilities.updateComponentTreeUI(frame);
+            // Create a pop-up menu components
+            final PopupMenu popup = createPopupMenu();
+            this.trayIcon.setPopupMenu(popup);
+            Config.log("[TRAY] add mouse listener...");
+            this.trayIcon.addMouseListener(new MouseAdapter() {
+                @Override
+                public void mouseReleased(MouseEvent e) {
+                    if (!e.isPopupTrigger()) {
+                        stopRecording();
+                    }
+                }
+
+            });
+            try {
+                Config.log("[TRAY] frame visible...");
+                frame.setResizable(false);
+                frame.setVisible(true);
+                tray.add(this.trayIcon);
+                Config.log("[TRAY] tray.add OK");
+            } catch (AWTException ex) {
+                Config.log("TrayIcon could not be added.\n" + ex.getMessage());
+            }
+            trayIcon.addActionListener(e -> bringToFront(window));
+            Config.log("[TRAY] end OK");
+        } catch (Throwable t) {
+            Config.logError("[TRAY] FAILED: " + t, t);
+        }
     }
     private void ensureVADCalibrationForDevice(TargetDataLine line, String deviceName) {
         String key = (deviceName == null || deviceName.isBlank()) ? "DEFAULT" : deviceName;
@@ -486,8 +512,10 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
     protected PopupMenu createPopupMenu() {
+        Config.log("[TRAY] popup: begin");
         final String strAction = this.prefs.get("action", "noting");
 
+        Config.log("[TRAY] popup: add Required...");
         Menu requiredMenu = new Menu(trayText("menu.required"));
         final PopupMenu popup = new PopupMenu();
         CheckboxMenuItem autoPaste = new CheckboxMenuItem(trayText("menu.autoPaste"));
@@ -724,6 +752,7 @@ public class MobMateWhisp implements NativeKeyListener {
         requiredMenu.add(modeMenu);
         popup.add(requiredMenu);
 
+        Config.log("[TRAY] popup: add Input...");
         // Get available audio input devices
         final Menu audioInputsItem = new Menu(trayText("menu.audioInputs"));
         String audioDevice = this.prefs.get("audio.device", "");
@@ -790,6 +819,7 @@ public class MobMateWhisp implements NativeKeyListener {
         }
         popup.add(audioInputsItem);
 
+        Config.log("[TRAY] popup: add Output...");
         Menu audioOutputsItem = new Menu(trayText("menu.audioOutputs"));
         String outputDevice = this.prefs.get("audio.output.device", "");
         String prevOutputDevice = this.prefs.get("audio.output.device.previous", "");
@@ -825,14 +855,17 @@ public class MobMateWhisp implements NativeKeyListener {
         }
         popup.add(audioOutputsItem);
 
+        Config.log("[TRAY] popup: add GPU Selection...");
         // ===== GPU selection (CPU / Vulkan only) =====
         Menu gpuMenu = new Menu(trayText("menu.gpuSelect"));
         int gpuIndex = prefs.getInt("vulkan.gpu.index", -1); // -1 = auto
         List<CheckboxMenuItem> items = new ArrayList<>();
+
         CheckboxMenuItem autoItem = new CheckboxMenuItem(trayText("menu.gpu.auto"));
         autoItem.setState(gpuIndex < 0);
         gpuMenu.add(autoItem);
         items.add(autoItem);
+
         autoItem.addItemListener(e -> {
             if (autoItem.getState()) {
                 for (CheckboxMenuItem m : items) m.setState(m == autoItem);
@@ -847,34 +880,84 @@ public class MobMateWhisp implements NativeKeyListener {
                 restartSelf(true);
             }
         });
+
         gpuMenu.addSeparator();
-        // --- Vulkan GPUs ---
-        int count = VulkanGpuUtil.getGpuCount();
-        for (int i = 0; i < count; i++) {
-            final int idx = i;
-            String name = "Vulkan " + i + ": " + VulkanGpuUtil.getGpuName(i);
-            CheckboxMenuItem item = new CheckboxMenuItem(name);
-            item.setState(gpuIndex == idx);
-            gpuMenu.add(item);
-            items.add(item);
-            item.addItemListener(e -> {
-                if (item.getState()) {
-                    for (CheckboxMenuItem m : items) m.setState(m == item);
-                    prefs.putInt("vulkan.gpu.index", idx);
-                    try { prefs.sync(); } catch (Exception ignore) {}
-                    JOptionPane.showMessageDialog(
-                            null,
-                            "GPU selection changed.\nPlease restart MobMate.",
-                            "MobMate",
-                            JOptionPane.INFORMATION_MESSAGE
-                    );
-                    restartSelf(true);
+
+        // ★Vulkanが“存在する時だけ”GPU列挙する（ここ重要）
+        //   起動ログで Vulkan dir not exists だったPCは、このチェックで列挙をスキップできる
+        File vulkanDir = new File("libs/vulkan");
+        boolean vulkanBackendPresent =
+                vulkanDir.exists() &&
+                        new File(vulkanDir, "whisper.dll").exists(); // 目安ファイル（必要に応じて調整）
+
+        Config.log("[TRAY] gpuMenu: vulkanBackendPresent=" + vulkanBackendPresent);
+
+        if (!vulkanBackendPresent) {
+            MenuItem na = new MenuItem("Vulkan not available");
+            na.setEnabled(false);
+            gpuMenu.add(na);
+        } else {
+            // ★列挙が固まる環境があるので、タイムアウト付きで呼ぶ
+            int count = 0;
+            try {
+                ExecutorService ex = Executors.newSingleThreadExecutor(r -> {
+                    Thread t = new Thread(r, "vulkan-enum");
+                    t.setDaemon(true);
+                    return t;
+                });
+                try {
+                    Future<Integer> f = ex.submit(() -> VulkanGpuUtil.getGpuCount());
+                    count = f.get(1200, TimeUnit.MILLISECONDS); // 1.2秒で諦める
+                } finally {
+                    ex.shutdownNow();
                 }
-            });
+                Config.log("[TRAY] gpuMenu: VulkanGpuUtil.getGpuCount=" + count);
+            } catch (TimeoutException te) {
+                Config.log("[TRAY] gpuMenu: Vulkan GPU enumeration TIMEOUT -> skip");
+                count = 0;
+            } catch (Throwable t) {
+                Config.logError("[TRAY] gpuMenu: Vulkan GPU enumeration FAILED: " + t, t);
+                count = 0;
+            }
+            if (count <= 0) {
+                MenuItem na = new MenuItem("Vulkan GPUs: (not detected)");
+                na.setEnabled(false);
+                gpuMenu.add(na);
+            } else {
+                for (int i = 0; i < count; i++) {
+                    final int idx = i;
+                    String name;
+                    try {
+                        name = "Vulkan " + i + ": " + VulkanGpuUtil.getGpuName(i);
+                    } catch (Throwable t) {
+                        name = "Vulkan " + i;
+                    }
+                    CheckboxMenuItem item = new CheckboxMenuItem(name);
+                    item.setState(gpuIndex == idx);
+                    gpuMenu.add(item);
+                    items.add(item);
+
+                    item.addItemListener(e -> {
+                        if (item.getState()) {
+                            for (CheckboxMenuItem m : items) m.setState(m == item);
+                            prefs.putInt("vulkan.gpu.index", idx);
+                            try { prefs.sync(); } catch (Exception ignore) {}
+                            JOptionPane.showMessageDialog(
+                                    null,
+                                    "GPU selection changed.\nPlease restart MobMate.",
+                                    "MobMate",
+                                    JOptionPane.INFORMATION_MESSAGE
+                            );
+                            restartSelf(true);
+                        }
+                    });
+                }
+            }
         }
         popup.add(gpuMenu);
         popup.addSeparator();
 
+        Config.log("[TRAY] popup: add TTS Engine...");
         // ===== TTS Engine select (Auto / VOICEVOX / XTTS / Windows / Voiceger) =====
         Menu ttsEngineMenu = new Menu("TTS Engine");
         String enginePref = prefs.get("tts.engine", "auto");
@@ -882,7 +965,9 @@ public class MobMateWhisp implements NativeKeyListener {
         CheckboxMenuItem engAuto = new CheckboxMenuItem("Auto");
         CheckboxMenuItem engXtts = new CheckboxMenuItem("XTTS");
         CheckboxMenuItem engWin  = new CheckboxMenuItem("Windows");
-        CheckboxMenuItem engVg   = new CheckboxMenuItem("Voiceger");
+        CheckboxMenuItem engVgWav = new CheckboxMenuItem("Voiceger(WavToWav)");
+        Menu engVgTtsMenu = new Menu("Voiceger(TTS)");
+        CheckboxMenuItem engVgTts = new CheckboxMenuItem("Use Voiceger(TTS)");
         // ★VOICEVOXは子メニューにする（トップにチェックは付かないので、内部に「Use VOICEVOX」チェックを置く）
         Menu engVvMenu = new Menu("VOICEVOX");
         CheckboxMenuItem engVv = new CheckboxMenuItem("Use VOICEVOX");
@@ -890,35 +975,100 @@ public class MobMateWhisp implements NativeKeyListener {
         engVv.setState("voicevox".equalsIgnoreCase(enginePref));
         engXtts.setState("xtts".equalsIgnoreCase(enginePref));
         engWin.setState("windows".equalsIgnoreCase(enginePref));
-        engVg.setState("voiceger".equalsIgnoreCase(enginePref));
+        String eng = enginePref == null ? "auto" : enginePref.toLowerCase(Locale.ROOT);
+        engVgWav.setState("voiceger".equals(eng) || "voiceger_w2w".equals(eng) || "voiceger_vc".equals(eng));
+        engVgTts.setState("voiceger_tts".equals(eng));
         engItems.add(engAuto);
         engItems.add(engVv);
         engItems.add(engXtts);
         engItems.add(engWin);
-        engItems.add(engVg);
+        engItems.add(engVgWav);
+        engItems.add(engVgTts);
         ItemListener engListener = e -> {
             CheckboxMenuItem src = (CheckboxMenuItem) e.getSource();
             if (!src.getState()) return;
 
+            // ラジオ制御（エンジンは必ず1つだけ）
             for (CheckboxMenuItem m : engItems) m.setState(m == src);
 
+            String prev = prefs.get("tts.engine", "auto");
             String v = "auto";
             if (src == engVv) v = "voicevox";
             else if (src == engXtts) v = "xtts";
             else if (src == engWin) v = "windows";
-            else if (src == engVg) v = "voiceger";
+            else if (src == engVgWav) v = "voiceger_vc";   // or voiceger_w2w
+            else if (src == engVgTts) v = "voiceger_tts";
 
             prefs.put("tts.engine", v);
             try { prefs.sync(); } catch (Exception ignore) {}
+            // ★非Voiceger→Voiceger の時だけ API再起動
+            String pv = (prev == null) ? "" : prev.toLowerCase(Locale.ROOT);
+            String nv = (v == null) ? "" : v.toLowerCase(Locale.ROOT);
+            if (!nv.equals(pv) && nv.startsWith("voiceger")) {
+                restartVoicegerApiAsync();
+            }
         };
+        // 既存のエンジン選択チェック群
         engAuto.addItemListener(engListener);
         engVv.addItemListener(engListener);
         engXtts.addItemListener(engListener);
         engWin.addItemListener(engListener);
-        engVg.addItemListener(engListener);
+        engVgWav.addItemListener(engListener);
+        engVgTts.addItemListener(engListener);
         // --- VOICEVOX submenu contents ---
         engVvMenu.add(engVv);
         engVvMenu.addSeparator();
+        // --- Voiceger(TTS) submenu contents ---
+        engVgTtsMenu.add(engVgTts);
+        engVgTtsMenu.addSeparator();
+        // 言語サブメニュー（内部コード保存：all_ja/en/all_zh/all_ko/all_yue/auto）
+        String curLang = prefs.get("voiceger.tts.lang", "all_ja");
+        List<CheckboxMenuItem> vgLangItems = new ArrayList<>();
+        boolean anySelected = false;
+        String[][] langs = {
+                {"Japanese", "all_ja"},
+                {"English", "en"},
+                {"Chinese", "all_zh"},
+                {"Korean", "all_ko"},
+                {"Cantonese", "all_yue"},
+//                {"Auto (later)", "auto"},
+        };
+        for (String[] it : langs) {
+            String label = it[0];
+            String code  = it[1];
+            CheckboxMenuItem mi = new CheckboxMenuItem(label);
+            boolean selected = code.equalsIgnoreCase(curLang);
+            mi.setState(selected);
+            if (selected) anySelected = true;
+            vgLangItems.add(mi);
+            engVgTtsMenu.add(mi);
+            mi.addItemListener(ev -> {
+                if (!mi.getState()) return;
+
+                // ラジオ制御（言語は必ず1つだけ）
+                for (CheckboxMenuItem m : vgLangItems) m.setState(m == mi);
+
+                // 言語保存（内部コード）
+                prefs.put("voiceger.tts.lang", code);
+                try { prefs.sync(); } catch (Exception ignore) {}
+
+                // ここが肝：言語選択＝Voiceger(TTS)を有効化
+                // 直接 setState(true) だけだと、他エンジンがOFFにならない場合があるので
+                // engListener を「正しいItemEvent」で叩いて確実にラジオ更新する
+                if (!engVgTts.getState()) {
+                    engVgTts.setState(true);
+                }
+                engListener.itemStateChanged(
+                        new ItemEvent(engVgTts, ItemEvent.ITEM_STATE_CHANGED, engVgTts, ItemEvent.SELECTED)
+                );
+            });
+        }
+        // どれも選ばれてない（設定値が変な時）なら、日本語に倒して保存しておく
+        if (!anySelected) {
+            prefs.put("voiceger.tts.lang", "all_ja");
+            try { prefs.sync(); } catch (Exception ignore) {}
+        }
+
         if (isVoiceVoxAvailable()) {
             String vvVoicePref = prefs.get("tts.voice", "auto");
             List<CheckboxMenuItem> vvAll = new ArrayList<>();
@@ -955,10 +1105,12 @@ public class MobMateWhisp implements NativeKeyListener {
         ttsEngineMenu.add(engXtts);
         ttsEngineMenu.add(engWin);
         ttsEngineMenu.addSeparator();
-        ttsEngineMenu.add(engVg);
+        ttsEngineMenu.add(engVgWav);
+        ttsEngineMenu.add(engVgTtsMenu);
         popup.add(ttsEngineMenu);
 
 
+        Config.log("[TRAY] popup: add Voice...");
         Menu ttsVoicesItem = new Menu(trayText("menu.voices"));
         String voicePref = prefs.get("tts.windows.voice", "auto");
         List<CheckboxMenuItem> all = new ArrayList<>();
@@ -998,6 +1150,7 @@ public class MobMateWhisp implements NativeKeyListener {
         popup.add(ttsVoicesItem);
 
 
+        Config.log("[TRAY] menu.settings:");
         Menu settingsMenu = new Menu(trayText("menu.settings"));
 
         Menu RecommendMenu = new Menu(trayText("menu.recommend"));
@@ -1256,6 +1409,8 @@ public class MobMateWhisp implements NativeKeyListener {
         }
         debugMenu.addSeparator(); // 必要なら区切り
 
+
+        Config.log("[TRAY] wizard:");
         MenuItem openWizardItem = new MenuItem(trayText("menu.wizard.open"));
         openWizardItem.addActionListener(e -> {
             SwingUtilities.invokeLater(() -> {
@@ -1302,6 +1457,8 @@ public class MobMateWhisp implements NativeKeyListener {
         Font awtFont = new Font(UIManager.getFont("Menu.font").getFamily(), Font.PLAIN,
                 prefs.getInt("ui.font.size", 12));
         applyAwtFontRecursive(popup, awtFont);
+
+        Config.log("[TRAY] popup: end");
         return popup;
     }
 
@@ -1738,6 +1895,11 @@ public class MobMateWhisp implements NativeKeyListener {
                             boolean firstPartialSent = false;
                             boolean forceFinalizePending = false;
                             final LaughDetector laughDet = new LaughDetector();
+                            int strongNoSpeechFrames = 0;
+                            // ===== [ADD] VAD stuck / startup guard =====
+                            final long recordLoopStartMs = System.currentTimeMillis();
+                            long primingSinceMs = 0L;
+
 
                             while (isRecording()) {
                                 int n = targetDataLine.read(data, 0, data.length);
@@ -1809,26 +1971,37 @@ public class MobMateWhisp implements NativeKeyListener {
 
                                 // ★修正：isPriming中のフレームカウント処理
                                 if (isPriming) {
-                                    int manualPeak = (vad instanceof ImprovedVAD) ?
-                                            ((ImprovedVAD) vad).getNoiseProfile().getManualPeakThreshold() : 2000;
-                                    boolean silentLike = peak < (manualPeak / 2) && avg < (manualPeak / 8);
-                                    if (vad instanceof ImprovedVAD) {
-                                        if (silentLike) {
-                                            ((ImprovedVAD) vad).getNoiseProfile().update(peak, avg, true);
+
+                                    if (primingSinceMs == 0L) primingSinceMs = System.currentTimeMillis();
+
+                                    // ===== [ADD] primingが長引いたら解除して通常録音へ =====
+                                    if (System.currentTimeMillis() - primingSinceMs > 4500) {
+                                        Config.logDebug("★Priming timeout -> force disable priming and continue recording");
+                                        isPriming = false;
+                                        primingSinceMs = 0L;
+                                        // ここで continue しない（通常ルートへ落とす）
+                                    } else {
+                                        int manualPeak = (vad instanceof ImprovedVAD) ?
+                                                ((ImprovedVAD) vad).getNoiseProfile().getManualPeakThreshold() : 2000;
+                                        boolean silentLike = peak < (manualPeak / 2) && avg < (manualPeak / 8);
+                                        if (vad instanceof ImprovedVAD) {
+                                            if (silentLike) {
+                                                ((ImprovedVAD) vad).getNoiseProfile().update(peak, avg, true);
+                                            }
+                                            AdaptiveNoiseProfile profile = ((ImprovedVAD) vad).getNoiseProfile();
+                                            int currentSamples = profile.noiseSamples.size();
+                                            int totalSamples = profile.CALIBRATION_FRAMES;
+                                            if (frameCount % 5 == 0) {
+                                                SwingUtilities.invokeLater(() ->
+                                                        window.setTitle(String.format(UiText.t("ui.calibrating.stayQuiet"),
+                                                                currentSamples, totalSamples))
+                                                );
+                                            }
                                         }
-                                        AdaptiveNoiseProfile profile = ((ImprovedVAD) vad).getNoiseProfile();
-                                        int currentSamples = profile.noiseSamples.size();
-                                        int totalSamples = profile.CALIBRATION_FRAMES;
-                                        if (frameCount % 5 == 0) {
-                                            SwingUtilities.invokeLater(() ->
-                                                    window.setTitle(String.format(UiText.t("ui.calibrating.stayQuiet"),
-                                                            currentSamples, totalSamples))
-                                            );
-                                        }
+                                        Thread.sleep(10);
+                                        frameCount++;
+                                        continue;
                                     }
-                                    Thread.sleep(10);
-                                    frameCount++;
-                                    continue;
                                 }
 
                                 if (frameCount == 0) {
@@ -1840,6 +2013,30 @@ public class MobMateWhisp implements NativeKeyListener {
                                 boolean speech = (vad instanceof ImprovedVAD) ?
                                         ((ImprovedVAD) vad).isSpeech(data, n, buffer.size()) :
                                         vad.isSpeech(data, n);
+
+                                // ===== [ADD] strong signal but speech=false guard =====
+                                if (vad instanceof ImprovedVAD) {
+                                    AdaptiveNoiseProfile np = ((ImprovedVAD) vad).getNoiseProfile();
+                                    int peakTh = np.getPeakThreshold();
+
+                                    // 「閾値近い強い音が来てるのに speech がずっと false」なら救済
+                                    boolean strongInput = peak >= (int)(peakTh * 0.90);
+                                    if (!speech && strongInput) strongNoSpeechFrames++;
+                                    else strongNoSpeechFrames = 0;
+
+                                    if (strongNoSpeechFrames == 45) { // 約45フレーム続いた時点でログ
+                                        Config.logDebug(String.format(
+                                                "★VAD maybe stuck: peak=%d avg=%d peakTh=%d avgTh=%d lowGain=%s bgm=%s",
+                                                peak, avg, np.getPeakThreshold(), np.getAvgThreshold(),
+                                                np.isLowGainMic, ((ImprovedVAD) vad).looksLikeBGM(peak, avg)
+                                        ));
+                                    }
+                                    if (strongNoSpeechFrames >= 60) { // さらに続いたら強制で speech 扱いにして発話開始へ
+                                        speech = true;
+                                        Config.logDebug("★VAD override: strongNoSpeechFrames>=60 -> speech=true");
+                                        strongNoSpeechFrames = 0;
+                                    }
+                                }
 
                                 // VAD結果を保持（メーターの「無音で0へ戻る」に使う）
                                 lastVadSpeech = speech;
@@ -2949,23 +3146,48 @@ public class MobMateWhisp implements NativeKeyListener {
                 r.debug = debug;
                 r.autoStartVoiceVox();
                 r.startPsServer();
-                VoicegerManager.ensureRunningIfEnabledAsync(MobMateWhisp.prefs);
+
+                String engine = prefs.get("tts.engine", "auto").toLowerCase(Locale.ROOT);
+                if ("voiceger_tts".equals(engine)) {
+                    VoicegerManager.ensureRunningIfEnabledAsync(MobMateWhisp.prefs);
+                }
+                if ("voiceger_vc".equals(engine) || "voiceger".equals(engine)) {
+                    VoicegerManager.ensureRunningIfEnabledAsync(MobMateWhisp.prefs);
+                }
                 // Exit時にVoiceger APIを止める（System.exit / ウィンドウ終了どっちでも効く）
                 Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                     try { VoicegerManager.stopIfRunning(MobMateWhisp.prefs); } catch (Throwable ignore) {}
                 }, "voiceger-shutdown"));
 
+
                 boolean openWindow = r.prefs.getBoolean("open-window", true);
                 if (forceOpenWindow) {
                     openWindow = true;
                 }
+                Config.log("[BOOT] openWindow(pref)=" + openWindow + " force=" + forceOpenWindow);
+
+                boolean trayOk = false;
                 try {
+                    Config.log("[BOOT] createTrayIcon...");
                     r.createTrayIcon();
-                } catch (Exception e) {
-                    e.printStackTrace();
+                    trayOk = true;
+                    Config.log("[BOOT] createTrayIcon OK");
+                } catch (Throwable t) {
+                    // ★printStackTraceだと_log.txtに出ないので、必ずログへ
+                    Config.logError("[BOOT] createTrayIcon FAILED: " + t, t);
                 }
+                if (!trayOk) openWindow = true;
                 if (openWindow) {
-                    r.openWindow();
+                    try {
+                        Config.log("[BOOT] openWindow...");
+                        r.openWindow();
+                        Config.log("[BOOT] openWindow OK");
+                    } catch (Throwable t) {
+                        Config.logError("[BOOT] openWindow FAILED: " + t, t);
+                        JOptionPane.showMessageDialog(null, "Error :\n" + t.getMessage());
+                    }
+                } else {
+                    Config.log("[BOOT] window skipped (tray only)");
                 }
             } catch (Throwable e) {
                 JOptionPane.showMessageDialog(null, "Error :\n" + e.getMessage());
@@ -3428,8 +3650,12 @@ public class MobMateWhisp implements NativeKeyListener {
         String engine = prefs.get("tts.engine", "auto").toLowerCase(Locale.ROOT);
 
         // --- forced route ---
-        if ("voiceger".equals(engine)) {
-            speakVoiceger(text);
+        if ("voiceger_tts".equals(engine)) {
+            speakVoiceger(text);      // 今の実装をそのまま：/tts優先→VCフォールバック
+            return;
+        }
+        if ("voiceger_vc".equals(engine) || "voiceger".equals(engine)) {
+            speakVoicegerVcOnly(text); // 新規：VCのみ
             return;
         }
         if ("voicevox".equals(engine)) {
@@ -3479,6 +3705,75 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
 
+    // ===== Voiceger TTS pipelining =====
+    private final ExecutorService vgTtsExec = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "vg-tts-prefetch");
+        t.setDaemon(true);
+        return t;
+    });
+
+    // ===== Voiceger restart (tray selection) =====
+    private static final AtomicLong vgRestartDebounceUntilMs = new AtomicLong(0);
+    private static final long VG_RESTART_DEBOUNCE_MS = 1500;
+
+    private void restartVoicegerApiAsync() {
+        // 連打・多重イベント対策（1.5秒以内は無視）
+        long now = System.currentTimeMillis();
+        long until = vgRestartDebounceUntilMs.get();
+        if (now < until) return;
+        vgRestartDebounceUntilMs.set(now + VG_RESTART_DEBOUNCE_MS);
+
+        new Thread(() -> {
+            try {
+                String dir = prefs.get("voiceger.dir", "").trim();
+                if (dir.isEmpty()) {
+                    Config.logDebug("[VG] restart skipped: voiceger.dir empty");
+                    return;
+                }
+
+                Config.logDebug("[VG] restart requested (tray)");
+                try { VoicegerManager.stopIfRunning(prefs); } catch (Throwable ignore) {}
+                try { Thread.sleep(250); } catch (Exception ignore) {}
+
+                // enabledがfalseでも「選んだ＝使う」なので起動を試みる（dirがある場合）
+                try {
+                    VoicegerManager.ensureRunning(prefs, Duration.ofSeconds(20));
+                    Config.logDebug("[VG] restart done (ready)");
+                } catch (Throwable e) {
+                    Config.logDebug("[VG] restart failed: " + e);
+                }
+            } catch (Throwable e) {
+                Config.logDebug("[VG] restart thread error: " + e);
+            }
+        }, "voiceger-restart").start();
+    }
+    private final ExecutorService vgPlayExec = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "vg-tts-player");
+        t.setDaemon(true);
+        return t;
+    });
+    private static List<String> splitSentences(String s) {
+        if (s == null) return Collections.emptyList();
+        String t = s.trim();
+        if (t.isEmpty()) return Collections.emptyList();
+
+        // ざっくり：日本語・英語の句点/終端で分ける
+        String[] arr = t.split("(?<=[。！？!?])\\s*");
+        List<String> out = new ArrayList<>();
+        for (String a : arr) {
+            String x = a.trim();
+            if (!x.isEmpty()) out.add(x);
+        }
+        return out.isEmpty() ? Collections.singletonList(t) : out;
+    }
+    private static boolean voicegerHealthOkCached(String baseUrl) {
+        long now = System.currentTimeMillis();
+        if (now < vgHealthOkUntilMs) return true;
+
+        boolean ok = httpOk(baseUrl + "health");
+        if (ok) vgHealthOkUntilMs = now + VG_HEALTH_CACHE_MS;
+        return ok;
+    }
     // ===== Voiceger route =====
     private static String cut200(String s) {
         if (s == null) return "null";
@@ -3489,6 +3784,62 @@ public class MobMateWhisp implements NativeKeyListener {
     private void speakVoiceger(String text) {
         long t0 = System.nanoTime();
         try {
+            // ① まず /tts を試す：文分割して「再生中に次文を先読み」する
+            List<String> parts = splitSentences(text);
+            if (!parts.isEmpty()) {
+                // 最初の文は同期で取りに行く（ここだけは待つ）
+                byte[] first = applyVoicegerTtsBytesIfEnabled(parts.get(0), prefs);
+                if (first != null && first.length >= 256) {
+                    // 2文目以降は先読みして、再生キューに流す
+                    List<Future<byte[]>> futures = new ArrayList<>();
+                    for (int i = 1; i < parts.size(); i++) {
+                        final String p = parts.get(i);
+                        futures.add(vgTtsExec.submit(() -> applyVoicegerTtsBytesIfEnabled(p, prefs)));
+                    }
+
+                    // 再生は直列（事故防止）。再生中に次が生成されるのが狙い
+                    vgPlayExec.submit(() -> {
+                        try {
+                            playViaPowerShellBytesAsync(first);
+                            for (Future<byte[]> f : futures) {
+                                byte[] b = null;
+                                try { b = f.get(350, TimeUnit.SECONDS); } catch (Exception ignore) {}
+                                if (b != null && b.length >= 256) {
+                                    playViaPowerShellBytesAsync(b);
+                                } else {
+                                    // 先読みが失敗したら、残りはまとめてフォールバックでも良い（最小は何もしない）
+                                }
+                            }
+                        } catch (Exception ignore) {}
+                    });
+                    return;
+                }
+            }
+
+            // ② 失敗したら従来の WindowsTTS→VC にフォールバック
+            byte[] inBytes = synthWindowsToWavBytesViaAgent(text);
+            long t1 = System.nanoTime();
+            Config.logDebug("[VG] tts_ms=" + ((t1 - t0) / 1_000_000));
+
+            byte[] outBytes = applyVoicegerVcBytesIfEnabled(inBytes, prefs);
+            long t2 = System.nanoTime();
+            Config.logDebug("[VG] vc_ms=" + ((t2 - t1) / 1_000_000));
+
+            boolean usingVc = (outBytes != null && outBytes.length >= 256);
+            byte[] play = usingVc ? outBytes : inBytes;
+            playViaPowerShellBytesAsync(play);
+            long t3 = System.nanoTime();
+            Config.logDebug("[VG] play_send_ms=" + ((t3 - t2) / 1_000_000));
+
+        } catch (Exception e) {
+            Config.logDebug("[VG] speakVoiceger(bytes) exception: " + e);
+            e.printStackTrace();
+        }
+    }
+    private void speakVoicegerVcOnly(String text) {
+        long t0 = System.nanoTime();
+        try {
+            // ② 失敗したら従来の WindowsTTS→VC にフォールバック
             byte[] inBytes = synthWindowsToWavBytesViaAgent(text);
             long t1 = System.nanoTime();
             Config.logDebug("[VG] tts_ms=" + ((t1 - t0) / 1_000_000));
@@ -3553,24 +3904,63 @@ public class MobMateWhisp implements NativeKeyListener {
             return Base64.getDecoder().decode(b64.toString());
         }
     }
+    private static String normalizeVoicegerLang(String raw) {
+        if (raw == null || raw.isBlank()) return "ja";
+        String l = raw.trim().toLowerCase(java.util.Locale.ROOT);
+        if (l.startsWith("all_")) l = l.substring(4);
+
+        // よくある表記ゆれ吸収（必要なら追加）
+        if (l.equals("jp") || l.equals("jpn")) return "ja";
+        if (l.equals("eng")) return "en";
+        if (l.equals("cn") || l.equals("zho") || l.equals("zh-cn") || l.equals("zh-hans")) return "zh";
+        if (l.equals("kr") || l.equals("kor")) return "ko";
+        if (l.equals("cantonese") || l.equals("hk")) return "yue";
+
+        // 許可リスト
+        switch (l) {
+            case "ja":
+            case "en":
+            case "zh":
+            case "ko":
+            case "yue":
+            case "auto":
+                return l;
+            default:
+                return "ja";
+        }
+    }
     private byte[] applyVoicegerVcBytesIfEnabled(byte[] inWavBytes, Preferences prefs) {
         try {
-            boolean enabled = prefs.getBoolean("voiceger.enabled", false);
-            String baseUrl = prefs.get("voiceger.api_base", "http://127.0.0.1:8501");
-            if (!baseUrl.endsWith("/")) baseUrl += "/";
+            // 優先：tts.engine で管理（Voiceger(WavToWav)選択時だけ有効）
+            String engine = prefs.get("tts.engine", "auto")
+                    .toLowerCase(java.util.Locale.ROOT);
+            boolean vcByEngine = "voiceger_vc".equals(engine) || "voiceger_w2w".equals(engine);
 
-            Config.logDebug("[VG] enabled=" + enabled + " api_base=" + baseUrl);
+            // 互換：古いフラグ（徐々に削れる）
+            boolean enabledLegacy = prefs.getBoolean("voiceger.enabled", false);
+
+            boolean enabled = vcByEngine || enabledLegacy;
             if (!enabled) return null;
 
-            if (!httpOk(baseUrl + "health")) {
+            // キー統一：voiceger.api.base
+            String baseUrl = prefs.get("voiceger.api.base", null);
+            if (baseUrl == null || baseUrl.isBlank()) {
+                // 互換：旧キー
+                baseUrl = prefs.get("voiceger.api_base", "http://127.0.0.1:8501");
+            }
+            if (!baseUrl.endsWith("/")) baseUrl += "/";
+
+            Config.logDebug("[VG] vcEnabled=" + enabled + " engine=" + engine + " api_base=" + baseUrl);
+
+            if (inWavBytes == null || inWavBytes.length < 256) {
+                Config.logDebug("[VG] /vc/bytes in_wav too small: " + (inWavBytes == null ? -1 : inWavBytes.length));
+                return null;
+            }
+
+            if (!voicegerHealthOkCached(baseUrl)) {
                 Config.logDebug("[VG] healthOk=false");
                 return null;
             }
-            Config.logDebug("[VG] healthOk=true");
-
-            HttpClient client = HttpClient.newBuilder()
-                    .connectTimeout(Duration.ofSeconds(3))
-                    .build();
 
             HttpRequest req = HttpRequest.newBuilder()
                     .uri(URI.create(baseUrl + "vc/bytes"))
@@ -3579,13 +3969,18 @@ public class MobMateWhisp implements NativeKeyListener {
                     .POST(HttpRequest.BodyPublishers.ofByteArray(inWavBytes))
                     .build();
 
-            HttpResponse<byte[]> res = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
-            Config.logDebug("[VG] /vc/bytes status=" + res.statusCode());
+            HttpResponse<byte[]> res = VG_HTTP.send(req, HttpResponse.BodyHandlers.ofByteArray());
 
-            if (res.statusCode() != 200) {
+            int status = res.statusCode();
+            Config.logDebug("[VG] /vc/bytes status=" + status);
+
+            if (status != 200) {
                 // 失敗時はテキストボディの先頭だけログ（過多防止）
-                String err = new String(res.body(), java.nio.charset.StandardCharsets.UTF_8);
-                Config.logDebug("[VG] /vc/bytes body=" + cut200(err));
+                String err = "";
+                try {
+                    err = new String(res.body(), java.nio.charset.StandardCharsets.UTF_8);
+                } catch (Exception ignore) {}
+                Config.logDebug("[VG] /vc/bytes body(head)=" + cut200(err));
                 return null;
             }
 
@@ -3601,6 +3996,99 @@ public class MobMateWhisp implements NativeKeyListener {
             return null;
         }
     }
+    byte[] applyVoicegerTtsBytesIfEnabled(String text, Preferences prefs) {
+        try {
+            // 優先：tts.engine で管理（Voiceger(TTS)選択時だけ有効）
+            String engine = prefs.get("tts.engine", "auto")
+                    .toLowerCase(java.util.Locale.ROOT);
+            boolean ttsByEngine = "voiceger_tts".equals(engine);
+
+            // 互換：古いフラグが残ってても動くようにする（徐々に消せる）
+            boolean enabledLegacy = prefs.getBoolean("voiceger.enabled", false);
+            boolean ttsEnabledLegacy = prefs.getBoolean("voiceger.tts.enabled", false);
+
+            boolean ttsEnabled = ttsByEngine || (enabledLegacy && ttsEnabledLegacy);
+            if (!ttsEnabled) return null;
+
+            // キー統一：voiceger.api.base
+            String baseUrl = prefs.get("voiceger.api.base", null);
+            if (baseUrl == null || baseUrl.isBlank()) {
+                // 互換：旧キー
+                baseUrl = prefs.get("voiceger.api_base", "http://127.0.0.1:8501");
+            }
+            if (!baseUrl.endsWith("/")) baseUrl += "/";
+
+            Config.logDebug("[VG] ttsEnabled=" + ttsEnabled + " engine=" + engine + " api_base=" + baseUrl);
+
+            if (!voicegerHealthOkCached(baseUrl)) {
+                Config.logDebug("[VG] /tts healthOk=false");
+                return null;
+            }
+
+            // 内部コードを許容：all_ja/en/all_zh/all_ko/all_yue/auto
+            String rawLang = prefs.get("voiceger.tts.lang", "all_ja");
+            String lang = normalizeVoicegerLang(rawLang);
+
+            String safeText = (text == null) ? "" : text;
+
+            String json = "{"
+                    + "\"text\":" + toJsonString(safeText) + ","
+                    + "\"language\":" + toJsonString(lang)
+                    + "}";
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(baseUrl + "tts"))
+                    .timeout(Duration.ofSeconds(300))
+                    .header("Content-Type", "application/json; charset=utf-8")
+                    .POST(HttpRequest.BodyPublishers.ofString(json, StandardCharsets.UTF_8))
+                    .build();
+
+            HttpResponse<byte[]> resp = VG_HTTP.send(req, HttpResponse.BodyHandlers.ofByteArray());
+            int status = resp.statusCode();
+            Config.logDebug("[VG] /tts status=" + status + " lang(raw)=" + rawLang + " lang(send)=" + lang);
+
+            if (status != 200) {
+                byte[] body = resp.body();
+                String head = "";
+                try {
+                    head = new String(body, 0, Math.min(body.length, 200), StandardCharsets.UTF_8);
+                } catch (Exception ignore) {}
+                Config.logDebug("[VG] /tts body(head)=" + head);
+                return null;
+            }
+
+            byte[] out = resp.body();
+            Config.logDebug("[VG] /tts out_size=" + (out == null ? 0 : out.length));
+            return out;
+
+        } catch (Exception e) {
+            Config.logDebug("[VG] applyTts(bytes) exception: " + e);
+            e.printStackTrace();
+            return null;
+        }
+    }
+    // JSON文字列化（既に同等のがあればそれを使ってOK）
+    private static String toJsonString(String s) {
+        if (s == null) return "null";
+        StringBuilder sb = new StringBuilder();
+        sb.append('"');
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\\': sb.append("\\\\"); break;
+                case '"': sb.append("\\\""); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 0x20) sb.append(String.format("\\u%04x", (int)c));
+                    else sb.append(c);
+            }
+        }
+        sb.append('"');
+        return sb.toString();
+    }
+
 
     private boolean isVoiceVoxAvailable() {
         long now = System.currentTimeMillis();
