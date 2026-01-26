@@ -181,7 +181,11 @@ public class FirstLaunchWizard extends JDialog {
             stopOutputSpeakTest();
         }
         if (s == STEP_VOICEVOX) {
-            // 特にループ系なし
+            // ★ここを追加：VOICEVOXのexe/api/speakerを _outtts.txt に保存
+            saveVoiceVoxSettings();
+        }
+        if (s == STEP_VOICEGER) {
+            // 何もしなくてOK（止めたいなら stopVoicegerApi(); を呼ぶ）
         }
         if (s == STEP_VOICEGER) {
             // 何もしなくてOK（止めたいなら stopVoicegerApi(); を呼ぶ）

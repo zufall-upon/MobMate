@@ -145,6 +145,7 @@ public final class Config {
 
                 String k = line.substring(0, eq).trim();
                 String v = line.substring(eq + 1).trim();
+                v = stripInlineComment(v);
 
                 if ((v.startsWith("\"") && v.endsWith("\""))
                         || (v.startsWith("'") && v.endsWith("'"))) {
@@ -489,6 +490,20 @@ public final class Config {
         } catch (IOException e) {
             logError("Failed to add dictionary entry: " + key, e);
         }
+    }
+    private static String stripInlineComment(String v) {
+        if (v == null) return null;
+        // 先頭の # は色コード等に使うので温存する（例: #1D6F5A）
+        for (int i = 1; i < v.length(); i++) {
+            char c = v.charAt(i);
+            if (c == '#' || c == '＃') {
+                char prev = v.charAt(i - 1);
+                if (Character.isWhitespace(prev)) {
+                    return v.substring(0, i).trim();
+                }
+            }
+        }
+        return v.trim();
     }
 }
 
