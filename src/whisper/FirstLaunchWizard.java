@@ -25,6 +25,10 @@ import java.nio.file.StandardCopyOption;
 import java.util.*;
 import java.util.List;
 import java.util.prefs.BackingStoreException;
+import javax.swing.event.ChangeEvent;
+import javax.swing.event.ChangeListener;
+import java.awt.datatransfer.StringSelection;
+import java.awt.datatransfer.Clipboard;
 
 import static whisper.MobMateWhisp.prefs;
 import static whisper.VoicegerManager.checkVoicegerFiles;
@@ -39,6 +43,10 @@ public class FirstLaunchWizard extends JDialog {
 
     private final CardLayout cardLayout = new CardLayout();
     private final JPanel cardPanel = new JPanel(cardLayout);
+    // ===== Control Center (tabbed) mode =====
+    private boolean controlCenterMode = false; // wizardではなく設定画面として使う
+    private JTabbedPane controlTabs;
+    private int lastStepForTabs = STEP_INPUT; // onStepExit/onStepEnter 用
 
     private static final int STEP_INPUT  = 0;
     private static final int STEP_OUTPUT = 1;
@@ -82,29 +90,50 @@ public class FirstLaunchWizard extends JDialog {
     public FirstLaunchWizard(Frame owner, MobMateWhisp mmw) throws FileNotFoundException, NativeHookException {
         super(owner, UiText.t("wizard.title"), true);
         this.mobmatewhisp = mmw;
+        // 初回だけは「ウィザード(Card)」で最短成功体験、2回目以降は「Control Center(Tab)」
+        boolean completed = prefs.getBoolean("wizard.completed", false);
+        boolean never = prefs.getBoolean("wizard.never", false);
+        if (completed || never) controlCenterMode = true;
 
-        setSize(700, 600);
+        setSize(760, 640);
         setLocationRelativeTo(owner);
         setDefaultCloseOperation(DISPOSE_ON_CLOSE);
 
-        cardPanel.add(stepInputDevice(), "step1");
-        cardPanel.add(stepOutputDevice(), "step2");
-        cardPanel.add(stepVoiceVox(), "step3");
-        cardPanel.add(stepXtts(), "step4");
-        cardPanel.add(stepVoiceger(), "step5");
+        if (controlCenterMode) {
+            controlTabs = buildControlCenterTabs();
+            add(controlTabs, BorderLayout.CENTER);
+            add(controlCenterBottomBar(), BorderLayout.SOUTH);
+        } else {
+            // ===== legacy wizard (CardLayout) =====
+            cardPanel.add(stepInputDevice(), "step1");
+            cardPanel.add(stepOutputDevice(), "step2");
+            cardPanel.add(stepVoiceVox(), "step3");
+            cardPanel.add(stepXtts(), "step4");
+            cardPanel.add(stepVoiceger(), "step5");
 
-        add(cardPanel, BorderLayout.CENTER);
-        add(bottomBar(), BorderLayout.SOUTH);
+            add(cardPanel, BorderLayout.CENTER);
+            add(bottomBar(), BorderLayout.SOUTH);
 
-        // 初期 step enter
-        onStepEnter(step);
+            // 初期 step enter
+            onStepEnter(step);
+        }
 
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
                 // ×で閉じた扱い
-                completed = false;
-                prefs.putBoolean("wizard.completed", false);
+//                completed = false;
+//                prefs.putBoolean("wizard.completed", false);
+
+                // リソース解放（念のため）
+                try {
+                    if (controlCenterMode) {
+                        if (lastStepForTabs >= 0) onStepExit(lastStepForTabs);
+                    } else {
+                        onStepExit(step);
+                    }
+                } catch (Exception ignore) {}
+
                 try { prefs.sync(); } catch (Exception ignore) {}
             }
         });
@@ -120,13 +149,11 @@ public class FirstLaunchWizard extends JDialog {
             public void windowClosing(java.awt.event.WindowEvent e) {
                 try { stopAllWizardTests(); } catch (Throwable ignore) {}
             }
-
             @Override
             public void windowClosed(java.awt.event.WindowEvent e) {
                 try { stopAllWizardTests(); } catch (Throwable ignore) {}
             }
         });
-
     }
     public void stopAllWizardTests() {
         try { stopMicMonitor(); } catch (Throwable ignore) {}
@@ -183,9 +210,6 @@ public class FirstLaunchWizard extends JDialog {
         if (s == STEP_VOICEVOX) {
             // ★ここを追加：VOICEVOXのexe/api/speakerを _outtts.txt に保存
             saveVoiceVoxSettings();
-        }
-        if (s == STEP_VOICEGER) {
-            // 何もしなくてOK（止めたいなら stopVoicegerApi(); を呼ぶ）
         }
         if (s == STEP_VOICEGER) {
             // 何もしなくてOK（止めたいなら stopVoicegerApi(); を呼ぶ）
@@ -1439,6 +1463,167 @@ public class FirstLaunchWizard extends JDialog {
 
 
 
+    /* =========================
+   Control Center (tabbed UI)
+ ========================= */
+
+    private JTabbedPane buildControlCenterTabs() {
+        JTabbedPane tabs = new JTabbedPane();
+
+        // 0=QuickStart, 1=Input, 2=Output, 3=VOICEVOX, 4=XTTS, 5=Voiceger, 6=Diagnostics
+//        tabs.addTab(UiText.t("wizard.tab.quick"), quickStartPanel(tabs));
+        tabs.addTab("InputDevice", stepInputDevice());
+        tabs.addTab("OutputDevice", stepOutputDevice());
+        tabs.addTab("VOICEVOX", stepVoiceVox());
+        tabs.addTab("XTTS", stepXtts());
+        tabs.addTab("Voiceger", stepVoiceger());
+//        tabs.addTab(UiText.t("wizard.tab.diagnostics"), diagnosticsPanel());
+
+        // 初期 enter
+        lastStepForTabs = tabIndexToStep(tabs.getSelectedIndex());
+        if (lastStepForTabs >= 0) onStepEnter(lastStepForTabs);
+
+        tabs.addChangeListener(new ChangeListener() {
+            @Override
+            public void stateChanged(ChangeEvent e) {
+                int newStep = tabIndexToStep(tabs.getSelectedIndex());
+                if (newStep == lastStepForTabs) return;
+
+                if (lastStepForTabs >= 0) onStepExit(lastStepForTabs);
+                if (newStep >= 0) onStepEnter(newStep);
+                lastStepForTabs = newStep;
+            }
+        });
+
+        return tabs;
+    }
+
+    private int tabIndexToStep(int tabIndex) {
+        switch (tabIndex) {
+            case 1: return STEP_INPUT;
+            case 2: return STEP_OUTPUT;
+            case 3: return STEP_VOICEVOX;
+            case 4: return STEP_XTTS;
+            case 5: return STEP_VOICEGER;
+            default: return -1;
+        }
+    }
+
+    private JPanel controlCenterBottomBar() {
+        JPanel p = new JPanel(new BorderLayout());
+
+        JLabel hint = new JLabel(UiText.t("wizard.cc.hint"));
+        hint.setBorder(BorderFactory.createEmptyBorder(6, 10, 6, 10));
+        p.add(hint, BorderLayout.WEST);
+
+        JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+
+        JButton close = new JButton(UiText.t("wizard.finish"));
+        close.addActionListener(e -> {
+            // タブ移動で leave が呼ばれないケースがあるので念のため
+            if (lastStepForTabs >= 0) onStepExit(lastStepForTabs);
+            completed = true;
+//            prefs.putBoolean("wizard.completed", true);
+            try { prefs.sync(); } catch (Exception ignore) {}
+            dispose();
+        });
+
+        right.add(close);
+        p.add(right, BorderLayout.EAST);
+        return p;
+    }
+
+    private JPanel quickStartPanel(JTabbedPane tabs) {
+        JPanel p = basePanel();
+        p.add(title("wizard.quick.title"));
+        p.add(text("wizard.quick.desc"));
+
+        JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton goAudio = new JButton(UiText.t("wizard.quick.goAudio"));
+        goAudio.addActionListener(e -> tabs.setSelectedIndex(1));
+
+        JButton goOutput = new JButton(UiText.t("wizard.quick.goOutput"));
+        goOutput.addActionListener(e -> tabs.setSelectedIndex(2));
+
+        JButton goVoiceger = new JButton(UiText.t("wizard.quick.goVoiceger"));
+        goVoiceger.addActionListener(e -> tabs.setSelectedIndex(5));
+
+        row.add(goAudio);
+        row.add(goOutput);
+        row.add(goVoiceger);
+        p.add(row);
+
+        p.add(text("wizard.quick.tip1"));
+        p.add(text("wizard.quick.tip2"));
+        return p;
+    }
+
+    private JPanel diagnosticsPanel() {
+        JPanel p = basePanel();
+        p.add(title("wizard.diag.title"));
+        p.add(text("wizard.diag.desc"));
+
+        JTextArea area = new JTextArea(14, 60);
+        area.setLineWrap(true);
+        area.setWrapStyleWord(true);
+        area.setEditable(false);
+
+        JScrollPane sp = new JScrollPane(area);
+        p.add(sp);
+
+        JPanel btns = new JPanel(new FlowLayout(FlowLayout.LEFT));
+
+        JButton gen = new JButton(UiText.t("wizard.diag.gen"));
+        gen.addActionListener(e -> area.setText(buildSystemSummary()));
+
+        JButton copy = new JButton(UiText.t("wizard.diag.copy"));
+        copy.addActionListener(e -> {
+            if (area.getText().trim().isEmpty()) area.setText(buildSystemSummary());
+            copyToClipboard(area.getText());
+        });
+
+        btns.add(gen);
+        btns.add(copy);
+        p.add(btns);
+
+        return p;
+    }
+
+    private String buildSystemSummary() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== MobMateWhispTalk Summary ===\n");
+        sb.append("os=").append(System.getProperty("os.name")).append(" ").append(System.getProperty("os.version")).append("\n");
+        sb.append("java=").append(System.getProperty("java.version")).append("\n");
+
+        sb.append("\n[Audio]\n");
+        sb.append("input.device=").append(prefs.get("audio.device", "")).append("\n");
+        sb.append("output.device=").append(prefs.get("audio.output", "")).append("\n");
+
+        sb.append("\n[TTS]\n");
+        sb.append("tts.engine=").append(prefs.get("tts.engine", "")).append("\n");
+        sb.append("voicevox.exe=").append(prefs.get("voicevox.exe", "")).append("\n");
+        sb.append("voicevox.speaker=").append(prefs.get("voicevox.speaker", "")).append("\n");
+        sb.append("xtts.url=").append(prefs.get("xtts.url", "")).append("\n");
+
+        sb.append("\n[Voiceger]\n");
+        sb.append("voiceger.enabled=").append(prefs.getBoolean("voiceger.enabled", false)).append("\n");
+        sb.append("voiceger.dir=").append(prefs.get("voiceger.dir", "")).append("\n");
+        sb.append("voiceger.port=").append(prefs.getInt("voiceger.port", 8501)).append("\n");
+
+        sb.append("\n[Hints]\n");
+        sb.append("- If input meter does not move: check Windows mic level / mic boost / enhancements / default device.\n");
+        sb.append("- If Voiceger fails: open voiceger_api.log and copy the last 50 lines.\n");
+        return sb.toString();
+    }
+
+    private void copyToClipboard(String s) {
+        try {
+            Clipboard cb = Toolkit.getDefaultToolkit().getSystemClipboard();
+            cb.setContents(new StringSelection(s), null);
+        } catch (Exception ex) {
+            ex.printStackTrace();
+        }
+    }
     /* =========================
        Bottom bar
      ========================= */

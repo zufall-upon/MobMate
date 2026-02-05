@@ -17,6 +17,9 @@ public class HistoryFrame extends JFrame implements ChangeListener {
 //    private final JTextArea t = new JTextArea();
     private final JPanel historyListPanel = new JPanel();
     public static final int HISTORY_MAX_LINES = 100;
+    private final java.util.concurrent.BlockingQueue<String> radioSpeakQueue =
+            new java.util.concurrent.LinkedBlockingQueue<>();
+    private volatile boolean radioSpeakWorkerStarted = false;
 
     public HistoryFrame(final MobMateWhisp mobMateWhisp) {
         this.mobMateWhisp = mobMateWhisp;
@@ -62,12 +65,12 @@ public class HistoryFrame extends JFrame implements ChangeListener {
 
             speakField.setText("");
             speakField.requestFocus();
+            ensureRadioSpeakWorker();
+            radioSpeakQueue.offer(text);
 
-            mobMateWhisp.speak(text);
             SwingUtilities.invokeLater(() -> {
-                mobMateWhisp.history.add(""+text);
-                mobMateWhisp.fireHistoryChanged();
-                Config.appendOutTts(text);
+                mobMateWhisp.addHistory(text);      // ★ここで1回だけ追加
+                Config.appendOutTts(text);          // outttsは従来通り1回
             });
         });
 
@@ -79,21 +82,24 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         buttonPanel.setLayout(new FlowLayout(FlowLayout.LEFT));
 
         final JButton clearButton = new JButton("×Clr");
-        final JButton openOutTts = new JButton("■_out");
-        final JButton openIgnore = new JButton("■_ignr");
-        final JButton openDict   = new JButton("■_dict");
-        final JButton openGood   = new JButton("■_good");
+        final JButton openOutTts = new JButton("out");
+        final JButton openIgnore = new JButton("ignr");
+        final JButton openDict   = new JButton("Dict");
+        final JButton openGood   = new JButton("Good");
+        final JButton openRadio  = new JButton("RCmd");
 
         buttonPanel.add(clearButton);
         buttonPanel.add(openOutTts);
         buttonPanel.add(openIgnore);
         buttonPanel.add(openDict);
         buttonPanel.add(openGood);
+        buttonPanel.add(openRadio);
 
         openOutTts.addActionListener(e -> openTextFile("_outtts.txt"));
         openIgnore.addActionListener(e -> openTextFile("_ignore.txt"));
         openDict.addActionListener(e -> openTextFile("_dictionary.txt"));
         openGood.addActionListener(e -> openTextFile("_initprmpt_add.txt"));
+        openRadio.addActionListener(e -> openTextFile("_radiocmd.txt"));
 
         clearButton.addActionListener(e -> mobMateWhisp.clearHistory());
 
@@ -135,6 +141,23 @@ public class HistoryFrame extends JFrame implements ChangeListener {
 //
 //    }
 
+    private void ensureRadioSpeakWorker() {
+        if (radioSpeakWorkerStarted) return;
+        radioSpeakWorkerStarted = true;
+        Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    String s = radioSpeakQueue.take();
+                    mobMateWhisp.speak(s);
+                } catch (Exception ex) {
+                    Config.logError("RadioSpeak worker error: " + ex.getMessage(), ex);
+                }
+            }
+        }, "RadioSpeakWorker");
+        t.setDaemon(true);
+        t.start();
+    }
+
     @Override
     public void stateChanged(ChangeEvent e) {
         historyListPanel.removeAll();
@@ -151,7 +174,7 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         int rowIndex = 0;
         for (int i = arr.length - 1; i >= minIndex; i--) {
             String s = (String) arr[i];
-            HistoryRowPanel row = new HistoryRowPanel(s);
+            HistoryRowPanel row = new HistoryRowPanel(mobMateWhisp, s);
 
             // --- zebra background ---
             if (rowIndex % 2 == 0) {

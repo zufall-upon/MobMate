@@ -273,6 +273,7 @@ public final class Config {
             "_dictionary.txt",
             "_ignore.txt",
             "_initprmpt_add.txt",
+            "_radiocmd.txt",
             "_outtts.txt"
     };
     public static void syncAllFromCloud() {

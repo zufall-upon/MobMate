@@ -28,22 +28,59 @@ public class LocalWhisperCPP {
     private List<Pattern> cachedIgnorePatterns = new ArrayList<>();
     private String cachedIgnoreMode = "simple";
     public static volatile boolean dictionaryDirty = true;
-    private static WhisperCpp whisper = new WhisperCpp();
+    private static WhisperCpp whisperMain = new WhisperCpp();
+    private static WhisperCpp whisperHearing = new WhisperCpp();
+    private WhisperCpp whisper; // ★staticを外してインスタンス変数に
+    private boolean isHearingMode = false; // ★Hearingモードかどうかのフラグ
     private volatile boolean lowGainMic = false;
+    private volatile boolean hearingTranslateToEn = false;
 
+
+    public synchronized void setHearingTranslateToEn(boolean v) {
+        Config.log("[Hearing][Translate] setHearingTranslateToEn: " + v);
+        this.hearingTranslateToEn = v;
+    }
     public void setLowGainMic(boolean v) {
         this.lowGainMic = v;
     }
+    public synchronized void setLanguage(String lang) {
+        if (lang == null || lang.trim().isEmpty()) lang = "auto";
+        this.language = lang;
 
-    public LocalWhisperCPP(File model) throws FileNotFoundException {
+        // ベースparamsも合わせておく（主に安全策）
+        try {
+            if (baseParamsGreedy != null) {
+                baseParamsGreedy.language = lang;
+                baseParamsGreedy.detect_language = "auto".equals(lang) ? CBool.TRUE : CBool.FALSE;
+                baseParamsGreedy.write();
+            }
+        } catch (Exception ignore) {}
+    }
+
+    public LocalWhisperCPP(File model, String mode) throws FileNotFoundException {
+        // ★modeに応じて使うインスタンスを選択
+        this.isHearingMode = "Hearing".equals(mode);
+        if (isHearingMode) {
+            this.whisper = whisperHearing;
+        } else {
+            this.whisper = whisperMain;
+        }
         whisper.initContext(model);
 
-        this.language = Config.loadSetting("language", "en");
-        this.initialPrompt = Config.loadSetting("initial_prompt", null);
-        this.cachedInitialPrompt = null;
-        initialPromptDirty = true;
-        this.initialPrompt = buildInitialPrompt();
-
+        // ★Hearingモードは言語自動検出、プロンプトなし
+        if (isHearingMode) {
+            this.language = "auto"; // 自動検出
+            this.initialPrompt = ""; // プロンプトなし
+            this.cachedInitialPrompt = "";
+            initialPromptDirty = false;
+        } else {
+            // 通常モード（MobMate本体）
+            this.language = Config.loadSetting("language", "en");
+            this.initialPrompt = Config.loadSetting("initial_prompt", null);
+            this.cachedInitialPrompt = null;
+            initialPromptDirty = true;
+            this.initialPrompt = buildInitialPrompt();
+        }
         baseParamsGreedy =
                 whisper.getFullDefaultParams(
                         WhisperSamplingStrategy.WHISPER_SAMPLING_GREEDY
@@ -127,6 +164,47 @@ public class LocalWhisperCPP {
         p.write();
         return p;
     }
+    private WhisperFullParams createGreedyParamsHearing(boolean longMode) {
+        WhisperFullParams p =
+                whisperHearing.getFullDefaultParams(
+                        WhisperSamplingStrategy.WHISPER_SAMPLING_GREEDY
+                );
+        p.print_progress = CBool.FALSE;
+        p.detect_language = CBool.FALSE; // ★FALSEに変更（言語固定の方が安定）
+//        p.detect_language = "auto".equals(this.language) ? CBool.TRUE : CBool.FALSE;
+        p.single_segment = longMode ? CBool.FALSE : CBool.TRUE;
+        p.no_context     = longMode ? CBool.FALSE : CBool.TRUE;
+        p.max_len = 0;
+        p.temperature = 0.0f;
+        if (lowGainMic) {
+            p.temperature = 0.2f;
+        }
+        p.n_threads =
+                (!MobMateWhisp.lowGpuMode) ? Math.min(
+                        12,
+                        Math.max(4, Runtime.getRuntime().availableProcessors() / 3)
+                ) : 1;
+
+        // ★言語と自動検出は「autoのときだけ検出」
+        //   翻訳ON/OFFに関係なく、このルールが一番安定するっす
+        String lang = (this.language == null) ? "auto" : this.language.trim();
+        if (lang.isEmpty()) lang = "auto";
+        boolean auto = "auto".equalsIgnoreCase(lang);
+        p.language = lang;
+//        p.detect_language = auto ? CBool.TRUE : CBool.FALSE;
+
+        p.initial_prompt = ""; // ★Hearing用はプロンプトなし
+        // ★翻訳時は言語を明示的に設定
+        if (this.hearingTranslateToEn) {
+            p.translate = CBool.TRUE;
+        } else {
+            p.translate = CBool.FALSE;
+        }
+        p.write();
+        return p;
+    }
+
+
     private static void applyTranslatePref(WhisperFullParams p) {
         boolean on = false;
         try {
@@ -160,6 +238,11 @@ public class LocalWhisperCPP {
 
 
     private String buildInitialPrompt() {
+        // ★Hearingモードは常に空
+        if (isHearingMode) {
+            return "";
+        }
+
         if (!initialPromptDirty && cachedInitialPrompt != null) {
             return cachedInitialPrompt;
         }
@@ -281,8 +364,73 @@ public class LocalWhisperCPP {
 //        return raw;
 //    }
 
-    private int INSTANT_FINAL_MAX_CHARS = 12;
 
+    // ★Partial ノイズ暴走（!!!!!!!!! 等）を捨てる
+    private static boolean isGarbagePartial(String s) {
+        if (s == null) return true;
+        String t = s.trim();
+        if (t.isEmpty()) return true;
+
+        // 1) 同一文字の繰り返し（!だけ、-だけ等）
+        if (t.length() >= 40) {
+            char c0 = t.charAt(0);
+            boolean allSame = true;
+            for (int i = 1; i < t.length(); i++) {
+                if (t.charAt(i) != c0) { allSame = false; break; }
+            }
+            if (allSame) return true;
+        }
+
+        // 2) 記号率が高すぎる（英数かな漢字がほぼ無い）
+        int good = 0, total = 0;
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            if (Character.isWhitespace(c)) continue;
+            total++;
+            if (Character.isLetterOrDigit(c)) good++;
+            // 日本語も “文字” 扱い（isLetter が true になる）
+        }
+        if (total >= 20) {
+            double ratio = (total == 0) ? 0.0 : (good * 1.0 / total);
+            if (ratio < 0.15) return true; // 文字が15%未満ならゴミ扱い
+        }
+
+        return false;
+    }
+    private static String clampForUi(String s, int max) {
+        if (s == null) return "";
+        String t = s.replace('\r', ' ').replace('\n', ' ').trim();
+        if (t.length() <= max) return t;
+        return t.substring(0, max) + "…";
+    }
+
+    // Hearing(ループバック)経路用：Instant Final を hearing専用ハンドラへ流す
+    public String transcribeRawHearing(byte[] pcmData, final MobMateWhisp.Action action, MobMateWhisp mobMateWhisp) throws IOException {
+        int numSamples = pcmData.length / 2;
+        short[] shorts = new short[numSamples];
+        float[] floats = new float[numSamples];
+        for (int i = 0, j = 0; i < pcmData.length; i += 2, j++) {
+            shorts[j] = (short) (((pcmData[i + 1] & 0xFF) << 8) | (pcmData[i] & 0xFF));
+        }
+        for (int i = 0; i < numSamples; i++) {
+            floats[i] = shorts[i] / 32768.0f;
+        }
+
+        int longSec = Config.getInt("whisper.long_mode_sec", 5); // 例:秒以上は長文扱い
+        boolean longMode = numSamples >= (SAMPLE_RATE_HZ * longSec);
+        WhisperFullParams params = createGreedyParamsHearing(longMode);
+        String raw = whisper.fullTranscribe(params, floats);
+
+        // ★Ignore判定
+        if (isIgnored(raw)) {
+            Config.logDebug("★Ignored text: " + raw);
+            MobMateWhisp.setLastPartial("");
+            return "";
+        }
+        return raw.trim();
+    }
+
+    private int INSTANT_FINAL_MAX_CHARS = 12;
     public String transcribeRaw(byte[] pcmData, final MobMateWhisp.Action action, MobMateWhisp mobMateWhisp) throws IOException {
         int numSamples = pcmData.length / 2;
         short[] shorts = new short[numSamples];
@@ -318,6 +466,13 @@ public class LocalWhisperCPP {
             if (isIgnored(raw)) {
                 MobMateWhisp.setLastPartial("");
             }
+            // ★Partial暴走対策
+            if (isGarbagePartial(raw)) {
+                Config.logDebug("★Partial dropped (garbage): len=" + (raw == null ? 0 : raw.length()));
+                raw = ""; // lastPartial/overlay/speak に流さない
+            }
+            // UI/ログ用は長さ制限（詰まり防止）
+            raw = clampForUi(raw, 100);
             MobMateWhisp.setLastPartial(raw.trim());
             Config.logDebug("★Partial: " + MobMateWhisp.getLastPartial());
         } else {
@@ -336,7 +491,7 @@ public class LocalWhisperCPP {
     }
     public static void main(String[] args) throws Exception {
         Config.logDebug("-1");
-        LocalWhisperCPP w = new LocalWhisperCPP(new File("models", "ggml-small.bin"));
+//        LocalWhisperCPP w = new LocalWhisperCPP(new File("models", "ggml-small.bin"),"");
         Config.logDebug("-");
     }
 }
