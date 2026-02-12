@@ -423,15 +423,19 @@ public class LocalWhisperCPP {
 
         // ★Ignore判定
         if (isIgnored(raw)) {
-            Config.logDebug("★Ignored text: " + raw);
-            MobMateWhisp.setLastPartial("");
+            Config.logDebug("★Hearing Ignored text: " + raw);
             return "";
+        } else {
+            return raw.trim();
         }
-        return raw.trim();
     }
 
     private int INSTANT_FINAL_MAX_CHARS = 12;
+    // ★変更: シグネチャにisEndOfCapture追加（後方互換のためオーバーロード残す）
     public String transcribeRaw(byte[] pcmData, final MobMateWhisp.Action action, MobMateWhisp mobMateWhisp) throws IOException {
+        return transcribeRaw(pcmData, action, mobMateWhisp, true); // 既存呼び出しはfinal扱い
+    }
+    public String transcribeRaw(byte[] pcmData, final MobMateWhisp.Action action, MobMateWhisp mobMateWhisp, boolean isEndOfCapture) throws IOException {
         int numSamples = pcmData.length / 2;
         short[] shorts = new short[numSamples];
         float[] floats = new float[numSamples];
@@ -482,9 +486,17 @@ public class LocalWhisperCPP {
         int len = raw.codePointCount(0, raw.length());
         if (len <= INSTANT_FINAL_MAX_CHARS) {
             String fin = raw.trim();
-            Config.logDebug("★Instant FINAL (short utterance): " + fin);
-            mobMateWhisp.instantFinalFromWhisper(fin, action);
-            return "";
+            if (isEndOfCapture) {
+                // ★Final経路: 即確定OK
+                Config.logDebug("★Instant FINAL (short utterance): " + fin);
+                mobMateWhisp.instantFinalFromWhisper(fin, action);
+                return "";
+            } else {
+                // ★Partial経路: キャッシュだけして即確定しない（暴発防止）
+                // → finalが来ればそちらが正しい結果を出す / finalが空ならrescueが拾う
+                Config.logDebug("★Partial short, skip instant FINAL (awaiting real final): " + fin);
+                return raw.trim();
+            }
         }
 
         return raw.trim();

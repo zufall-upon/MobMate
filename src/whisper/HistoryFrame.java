@@ -176,11 +176,16 @@ public class HistoryFrame extends JFrame implements ChangeListener {
             String s = (String) arr[i];
             HistoryRowPanel row = new HistoryRowPanel(mobMateWhisp, s);
 
-            // --- zebra background ---
+            // --- zebra background (FlatLaf対応) ---
+            Color baseColor = UIManager.getColor("Panel.background");
+            if (baseColor == null) baseColor = getBackground();
+
             if (rowIndex % 2 == 0) {
-                row.setBackground(new Color(245, 245, 245));
+                // 偶数行：ベース色をやや明るく/暗く
+                row.setBackground(adjustBrightness(baseColor, 0.05f));
             } else {
-                row.setBackground(Color.WHITE);
+                // 奇数行：ベース色そのまま
+                row.setBackground(baseColor);
             }
             row.setOpaque(true);
 
@@ -238,5 +243,11 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         } else {
             setIconImage(imageInactive);
         }
+    }
+    // ===== FlatLaf用：色の明るさ調整 =====
+    private Color adjustBrightness(Color color, float factor) {
+        float[] hsb = Color.RGBtoHSB(color.getRed(), color.getGreen(), color.getBlue(), null);
+        float newBrightness = Math.max(0f, Math.min(1f, hsb[2] + factor));
+        return Color.getHSBColor(hsb[0], hsb[1], newBrightness);
     }
 }

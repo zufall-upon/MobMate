@@ -1,0 +1,30 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Platforms>x64</Platforms>
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+  <ItemGroup>
+  <Reference Include="NAudio">
+    <HintPath>..\..\..\ps1\NAudio.dll</HintPath>
+    <Private>true</Private>
+  </Reference>
+  <Reference Include="NAudio.Core">
+    <HintPath>..\..\..\ps1\NAudio.Core.dll</HintPath>
+    <Private>true</Private>
+  </Reference>
+  <Reference Include="NAudio.Wasapi">
+    <HintPath>..\..\..\ps1\NAudio.Wasapi.dll</HintPath>
+    <Private>true</Private>
+  </Reference>
+  <Reference Include="NAudio.WinMM">
+    <HintPath>..\..\..\ps1\NAudio.WinMM.dll</HintPath>
+    <Private>true</Private>
+  </Reference>
+</ItemGroup>
+
+</Project>

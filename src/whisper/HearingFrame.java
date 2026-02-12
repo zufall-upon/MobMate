@@ -48,8 +48,6 @@ public class HearingFrame extends JFrame {
     private HearingOverlayWindow overlay;
     private final java.io.ByteArrayOutputStream pcmAcc = new java.io.ByteArrayOutputStream(16000 * 2 * 2);
     private volatile boolean transcribing = false;
-    private long lastOverlayUpdateMs = 0;
-    private String lastOverlayText = "";
 
     private volatile boolean ignoreToggleEvent = false;
 
@@ -69,6 +67,7 @@ public class HearingFrame extends JFrame {
     // PCMデバッグ用（1秒に1回だけログ）
     private volatile long lastPcmDbgMs = 0;
     private Thread loopProcErrThread;
+    private static final int HEARING_W = 380;
 
     public HearingFrame(Preferences prefs, Image icon, MobMateWhisp host) {
         super("MobMate Hearing (WIP)");
@@ -84,10 +83,21 @@ public class HearingFrame extends JFrame {
 
         addWindowListener(new WindowAdapter() {
             @Override public void windowClosing(WindowEvent e) {
-                stopMonitor();
-                saveBounds();
+                cleanup();  // ★変更: 処理を共通メソッドに
             }
         });
+    }
+    public void cleanup() {
+        stopMonitor();
+        saveBounds();
+        // ===== Overlay 破棄 =====
+        if (overlay != null) {
+            try {
+                overlay.setVisible(false);
+                overlay.dispose();
+            } catch (Exception ignore) {}
+            overlay = null;
+        }
     }
 
     // ★JVM終了/メイン窓終了時に呼ぶ（Swing操作しない・プロセスだけ止める）
@@ -103,6 +113,7 @@ public class HearingFrame extends JFrame {
                 try { l.stop(); } catch (Exception ignore) {}
                 try { l.close(); } catch (Exception ignore) {}
             }
+            cleanup();
         } catch (Throwable ignore) {}
     }
 
@@ -124,7 +135,7 @@ public class HearingFrame extends JFrame {
         // 上段：メーター（メイン画面の GainMeter を流用）
         meter = new GainMeter();
         meter.setFont(root.getFont());
-        Dimension meterSize = new Dimension(260, 22);
+        Dimension meterSize = new Dimension(170, 26);
         meter.setPreferredSize(meterSize);
         meter.setMinimumSize(meterSize);
         meter.setMaximumSize(meterSize);
@@ -137,7 +148,7 @@ public class HearingFrame extends JFrame {
         // 下段：Output選択 + ON/OFF + Prefs
         outputCombo = new JComboBox<>();
         outputCombo.setFocusable(false);
-        Dimension comboSize = new Dimension(210, 26);
+        Dimension comboSize = new Dimension(200, 26);
         outputCombo.setPreferredSize(comboSize);
         outputCombo.setMinimumSize(comboSize);
         outputCombo.setMaximumSize(comboSize);
@@ -159,7 +170,7 @@ public class HearingFrame extends JFrame {
 
         toggle = new JToggleButton("Hearing: OFF");
         toggle.setFocusable(false);
-        Dimension tsize = new Dimension(130, 26);
+        Dimension tsize = new Dimension(150, 26);
         toggle.setPreferredSize(tsize);
         toggle.setMinimumSize(tsize);
         toggle.setMaximumSize(tsize);
@@ -415,7 +426,7 @@ public class HearingFrame extends JFrame {
         forceFullRepaint();
         ensureOverlayVisible();
 
-        int maxW = 450;
+        int maxW = HEARING_W;
         if (getWidth() > maxW) setSize(maxW, getHeight());
         setMinimumSize(new Dimension(maxW, getHeight()));
     }
@@ -882,6 +893,7 @@ public class HearingFrame extends JFrame {
 
             pcmAcc.reset();
             transcribing = false;
+            partialHistory.clear();
 
             // ★ここが肝：startMonitor() 経由の stop では toggle を触らない
             if (updateToggleUi && toggle != null) {
@@ -970,7 +982,6 @@ public class HearingFrame extends JFrame {
 
 
 
-    private static final int HEARING_W = 450;
     private void restoreBounds() {
         int x = prefs.getInt("ui.hearing.x", 30);
         int y = prefs.getInt("ui.hearing.y", 30);
@@ -1396,6 +1407,15 @@ public class HearingFrame extends JFrame {
                 }
             } catch (Exception ex) {
                 Config.logError("[Hearing] WASAPI helper crashed", ex);
+                Config.log("[Hearing][WASAPI] restarting helper in 500ms...");
+                new Thread(() -> {
+                    try { Thread.sleep(500); } catch (Exception ignore) {}
+                    try {
+                        if (running) startWasapiLoopbackProc(); // 既存の起動関数名に合わせる
+                    } catch (Exception ex2) {
+                        Config.logError("[Hearing][WASAPI] restart failed", ex2);
+                    }
+                }).start();
             } finally {
                 running = false;
                 try { if (p != null) p.destroyForcibly(); } catch (Exception ignore) {}

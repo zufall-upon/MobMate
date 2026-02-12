@@ -48,6 +48,10 @@ import com.github.kwhat.jnativehook.keyboard.NativeKeyListener;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+// ===== FlatLaf Imports =====
+import com.formdev.flatlaf.FlatDarkLaf;
+import com.formdev.flatlaf.FlatLightLaf;
+
 import static whisper.LocalWhisperCPP.dictionaryDirty;
 import static whisper.VoicegerManager.httpOk;
 
@@ -85,6 +89,8 @@ public class MobMateWhisp implements NativeKeyListener {
 
     // Add calibration status tracking field
     private volatile boolean isCalibrationComplete = false;
+    // ★ADD: 話者照合プロファイル
+    private SpeakerProfile speakerProfile;
 
     // Audio capture
     private AudioFormat audioFormat;
@@ -109,6 +115,19 @@ public class MobMateWhisp implements NativeKeyListener {
     public JFrame window;
     private JButton button = null;
     final JLabel label = new JLabel(UiText.t("ui.main.ready"));
+    // ===== ステータスバー用 =====
+    private JLabel statusLabel;
+    private JLabel engineLabel;
+    private JLabel versionLabel;
+    private JLabel vvStatusLabel;      // VoiceVox接続状態
+    private JLabel vgStatusLabel;      // Voiceger接続状態（★追加）
+    private JLabel durationLabel;      // 録音時間
+    private JLabel memLabel;           // メモリ使用量
+    private JLabel modelLabel;         // 利用モデル（★追加）
+    private JLabel speakerStatusLabel; // ★話者照合ステータス
+    private Timer statusUpdateTimer;   // ステータスバー更新タイマー
+    private long recordingStartTime2 = 0; // 録音開始時刻
+    private JPanel statusBar;          // ★ステータスバー本体（再構築用）
 
     private Process psProcess;
     private BufferedWriter psWriter;
@@ -170,7 +189,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private static final long LAUGH_PARTIAL_WINDOW_MS = 1200;
 
     // ★ GPU負荷軽減モード
-    public static volatile boolean lowGpuMode = false;
+    public static volatile boolean lowGpuMode = true;
 
     private static long PARTIAL_INTERVAL_MS = 300;
     private static final int  PARTIAL_TAIL_BYTES  = 16000*2;
@@ -232,6 +251,12 @@ public class MobMateWhisp implements NativeKeyListener {
                 new WString("MobMate.MobMateWhispTalk")
         );
         this.prefs = Preferences.userRoot().node("MobMateWhispTalk");
+        // ★話者プロファイル初期化（prefsから設定値を取得）
+        this.speakerProfile = new SpeakerProfile(
+                this.prefs.getInt("speaker.enroll_samples", 5),
+                this.prefs.getFloat("speaker.threshold_initial", 0.60f),
+                this.prefs.getFloat("speaker.threshold_target", 0.82f)
+        );
         UiText.load(UiLang.resolveUiFile(prefs.get("ui.language", "en")));
         Config.syncAllFromCloud();
         Config.log("JVM: " + System.getProperty("java.vm.name"));
@@ -242,7 +267,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
         int size = prefs.getInt("ui.font.size", 12);
         applyUIFont(size);
-        lowGpuMode = prefs.getBoolean("perf.low_gpu_mode", false);
+        lowGpuMode = prefs.getBoolean("perf.low_gpu_mode", true);
         useAlternateLaugh = prefs.getBoolean("silence.alternate", false);
         autoGainEnabled = prefs.getBoolean("audio.autoGain", true);
         reloadAudioPrefsForMeter();
@@ -815,8 +840,13 @@ public class MobMateWhisp implements NativeKeyListener {
         requiredMenu.add(modeMenu);
         popup.add(requiredMenu);
 
-        Config.log("[TRAY] popup: add Input...");
-        // Get available audio input devices
+        // ========================================
+        // Audio Settings
+        // ========================================
+        Config.log("[TRAY] popup: add Audio Settings...");
+        Menu audioMenu = new Menu("Audio Settings");
+
+        // Input Devices
         final Menu audioInputsItem = new Menu(trayText("menu.audioInputs"));
         String audioDevice = this.prefs.get("audio.device", "");
         String previsouAudipDevice = this.prefs.get("audio.device.previous", "");
@@ -845,7 +875,6 @@ public class MobMateWhisp implements NativeKeyListener {
                 }
                 audioInputsItem.add(menuItem);
                 all2.add(menuItem);
-                // Add action listener to each menu item
                 menuItem.addItemListener(new ItemListener() {
                     @Override
                     public void itemStateChanged(ItemEvent e) {
@@ -853,8 +882,6 @@ public class MobMateWhisp implements NativeKeyListener {
                             for (CheckboxMenuItem m : all2) {
                                 m.setState(m == menuItem);
                             }
-
-                            // prefs 更新
                             MobMateWhisp.this.prefs.put("audio.device.previous",
                                     MobMateWhisp.this.prefs.get("audio.device", ""));
                             MobMateWhisp.this.prefs.put("audio.device", name);
@@ -863,8 +890,6 @@ public class MobMateWhisp implements NativeKeyListener {
                             } catch (BackingStoreException ex) {
                                 ex.printStackTrace();
                             }
-
-                            // ★追加：入力デバイス変更 → 再キャリブレーション
                             SwingUtilities.invokeLater(() -> {
                                 isCalibrationComplete = false;
                                 button.setEnabled(false);
@@ -880,13 +905,12 @@ public class MobMateWhisp implements NativeKeyListener {
                 });
             }
         }
-        popup.add(audioInputsItem);
+        audioMenu.add(audioInputsItem);
 
-        Config.log("[TRAY] popup: add Output...");
+        // Output Devices
         Menu audioOutputsItem = new Menu(trayText("menu.audioOutputs"));
         String outputDevice = this.prefs.get("audio.output.device", "");
         String prevOutputDevice = this.prefs.get("audio.output.device.previous", "");
-
         List<String> outputMixers = getOutputMixerNames();
         if (!outputMixers.isEmpty()) {
             Collections.sort(outputMixers);
@@ -916,51 +940,169 @@ public class MobMateWhisp implements NativeKeyListener {
                 });
             }
         }
-        popup.add(audioOutputsItem);
+        audioMenu.add(audioOutputsItem);
 
-        Config.log("[TRAY] popup: add GPU Selection...");
-        // ===== GPU selection (CPU / Vulkan only) =====
+        // Input Gain
+        Menu inputGainMenu = new Menu(trayText("menu.inputGain"));
+        boolean autogaintuner = prefs.getBoolean("audio.autoGain", true);
+        float currentGain = prefs.getFloat("audio.inputGainMultiplier", 1.0f);
+        CheckboxMenuItem autoGainItem = new CheckboxMenuItem(trayText("menu.autoGainTuner"));
+        autoGainItem.setState(autogaintuner);
+        autoGainItem.addItemListener(e -> {
+            prefs.putBoolean("audio.autoGain", autoGainItem.getState());
+            autoGainEnabled = autoGainItem.getState();
+            try { prefs.sync(); } catch (Exception ignore) {}
+            reloadAudioPrefsForMeter();
+        });
+        inputGainMenu.add(autoGainItem);
+        inputGainMenu.addSeparator();
+        List<CheckboxMenuItem> gainItems = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            float gain = 1.0f + (0.8f * i);
+            String label = String.format("x %.1f", gain);
+            CheckboxMenuItem item = new CheckboxMenuItem(label, gain == currentGain);
+            item.addItemListener(e -> {
+                for (CheckboxMenuItem it : gainItems) {
+                    it.setState(false);
+                }
+                item.setState(true);
+                prefs.putFloat("audio.inputGainMultiplier", gain);
+                try { prefs.sync(); } catch (Exception ignore) {}
+                if (isRecording()) {
+                    stopRecording();
+                }
+                reloadAudioPrefsForMeter();
+            });
+            gainItems.add(item);
+            inputGainMenu.add(item);
+        }
+        audioMenu.add(inputGainMenu);
+        popup.add(audioMenu);
+
+        // ========================================
+        // Speaker Verification Settings
+        // ========================================
+        Menu speakerMenu = new Menu("Speaker Verification");
+
+        CheckboxMenuItem speakerEnabledItem = new CheckboxMenuItem("Enable Speaker Filter");
+        speakerEnabledItem.setState(prefs.getBoolean("speaker.enabled", false));
+        speakerEnabledItem.addItemListener(e -> {
+            boolean on = speakerEnabledItem.getState();
+            prefs.putBoolean("speaker.enabled", on);
+            try { prefs.sync(); } catch (Exception ignore) {}
+            if (!on) {
+                speakerProfile.reset();
+                File spkFile = new File("speaker_profile.dat");
+                if (spkFile.exists()) spkFile.delete();
+                Config.log("★Speaker verification disabled, profile cleared");
+            }
+            updateSpeakerStatus();
+        });
+        speakerMenu.add(speakerEnabledItem);
+        speakerMenu.addSeparator();
+
+        // エンロールサンプル数 (5〜10)
+        Menu enrollCountMenu = new Menu("Enroll Samples");
+        int currentEnrollSamples = prefs.getInt("speaker.enroll_samples", 5);
+        List<CheckboxMenuItem> enrollItems = new ArrayList<>();
+        for (int cnt : new int[]{3, 5, 7, 10}) {
+            String label = cnt + " samples" + (cnt == 5 ? " (default)" : "");
+            CheckboxMenuItem item = new CheckboxMenuItem(label, cnt == currentEnrollSamples);
+            final int val = cnt;
+            item.addItemListener(e -> {
+                for (CheckboxMenuItem it : enrollItems) it.setState(false);
+                item.setState(true);
+                prefs.putInt("speaker.enroll_samples", val);
+                speakerProfile.updateSettings(
+                        val,
+                        prefs.getFloat("speaker.threshold_initial", 0.55f),
+                        prefs.getFloat("speaker.threshold_target", 0.72f));
+                try { prefs.sync(); } catch (Exception ignore) {}
+            });
+            enrollItems.add(item);
+            enrollCountMenu.add(item);
+        }
+        speakerMenu.add(enrollCountMenu);
+
+        // 感度（initial threshold）
+        Menu sensitivityMenu = new Menu("Sensitivity");
+        float currentInitTh = prefs.getFloat("speaker.threshold_initial", 0.55f);
+        List<CheckboxMenuItem> sensItems = new ArrayList<>();
+        for (float[] opt : new float[][]{
+                {0.45f}, {0.55f}, {0.60f}, {0.70f}}) {
+            float th = opt[0];
+            String label = String.format("%.0f%%", th * 100)
+                    + (th == 0.60f ? " (default)" : "")
+                    + (th <= 0.45f ? " - loose" : th >= 0.60f ? " - strict" : "");
+            CheckboxMenuItem item = new CheckboxMenuItem(label,
+                    Math.abs(th - currentInitTh) < 0.01f);
+            item.addItemListener(e -> {
+                for (CheckboxMenuItem it : sensItems) it.setState(false);
+                item.setState(true);
+                prefs.putFloat("speaker.threshold_initial", th);
+                speakerProfile.updateSettings(
+                        prefs.getInt("speaker.enroll_samples", 5),
+                        th,
+                        prefs.getFloat("speaker.threshold_target", 0.72f));
+                try { prefs.sync(); } catch (Exception ignore) {}
+            });
+            sensItems.add(item);
+            sensitivityMenu.add(item);
+        }
+        speakerMenu.add(sensitivityMenu);
+
+        speakerMenu.addSeparator();
+
+        // プロファイルリセット
+        MenuItem resetProfileItem = new MenuItem("Reset Speaker Profile");
+        resetProfileItem.addActionListener(e -> {
+            int confirm = JOptionPane.showConfirmDialog(null,
+                    "Reset speaker profile?\nYou will need to re-enroll on next Start.",
+                    "Speaker Verification", JOptionPane.YES_NO_OPTION);
+            if (confirm == JOptionPane.YES_OPTION) {
+                speakerProfile.reset();
+                File spkFile = new File("speaker_profile.dat");
+                if (spkFile.exists()) spkFile.delete();
+                Config.log("★Speaker profile reset by user");
+                updateSpeakerStatus();
+            }
+        });
+        speakerMenu.add(resetProfileItem);
+        popup.add(speakerMenu);
+
+        // ========================================
+        // Performance
+        // ========================================
+        Config.log("[TRAY] popup: add Performance...");
+        Menu performanceMenu = new Menu("Performance");
+
+        // GPU Selection
         Menu gpuMenu = new Menu(trayText("menu.gpuSelect"));
-        int gpuIndex = prefs.getInt("vulkan.gpu.index", -1); // -1 = auto
-        List<CheckboxMenuItem> items = new ArrayList<>();
-
-        CheckboxMenuItem autoItem = new CheckboxMenuItem(trayText("menu.gpu.auto"));
-        autoItem.setState(gpuIndex < 0);
-        gpuMenu.add(autoItem);
-        items.add(autoItem);
-
-        autoItem.addItemListener(e -> {
-            if (autoItem.getState()) {
-                for (CheckboxMenuItem m : items) m.setState(m == autoItem);
+        int gpuIndex = prefs.getInt("vulkan.gpu.index", -1);
+        List<CheckboxMenuItem> gpuItems = new ArrayList<>();
+        CheckboxMenuItem autoGpuItem = new CheckboxMenuItem(trayText("menu.gpu.auto"));
+        autoGpuItem.setState(gpuIndex < 0);
+        gpuMenu.add(autoGpuItem);
+        gpuItems.add(autoGpuItem);
+        autoGpuItem.addItemListener(e -> {
+            if (autoGpuItem.getState()) {
+                for (CheckboxMenuItem m : gpuItems) m.setState(m == autoGpuItem);
                 prefs.putInt("vulkan.gpu.index", -1);
                 try { prefs.sync(); } catch (Exception ignore) {}
-                JOptionPane.showMessageDialog(
-                        null,
-                        "GPU selection changed.\nPlease restart MobMate.",
-                        "MobMate",
-                        JOptionPane.INFORMATION_MESSAGE
-                );
+                JOptionPane.showMessageDialog(null, "GPU selection changed.\nPlease restart MobMate.",
+                        "MobMate", JOptionPane.INFORMATION_MESSAGE);
                 restartSelf(true);
             }
         });
-
         gpuMenu.addSeparator();
-
-        // ★Vulkanが“存在する時だけ”GPU列挙する（ここ重要）
-        //   起動ログで Vulkan dir not exists だったPCは、このチェックで列挙をスキップできる
-        File vulkanDir = new File(getExeDir(), "libs/vulkan"); // ★作業フォルダ依存を排除
-        boolean vulkanBackendPresent =
-                vulkanDir.exists() &&
-                        new File(vulkanDir, "whisper.dll").exists(); // 目安ファイル（必要に応じて調整）
-
+        File vulkanDir = new File(getExeDir(), "libs/vulkan");
+        boolean vulkanBackendPresent = vulkanDir.exists() && new File(vulkanDir, "whisper.dll").exists();
         Config.log("[TRAY] gpuMenu: vulkanBackendPresent=" + vulkanBackendPresent);
-
         if (!vulkanBackendPresent) {
             MenuItem na = new MenuItem("Vulkan not available");
             na.setEnabled(false);
             gpuMenu.add(na);
         } else {
-            // ★列挙が固まる環境があるので、タイムアウト付きで呼ぶ
             int count = 0;
             try {
                 ExecutorService ex = Executors.newSingleThreadExecutor(r -> {
@@ -970,7 +1112,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 });
                 try {
                     Future<Integer> f = ex.submit(() -> VulkanGpuUtil.getGpuCount());
-                    count = f.get(1200, TimeUnit.MILLISECONDS); // 1.2秒で諦める
+                    count = f.get(1200, TimeUnit.MILLISECONDS);
                 } finally {
                     ex.shutdownNow();
                 }
@@ -998,236 +1140,24 @@ public class MobMateWhisp implements NativeKeyListener {
                     CheckboxMenuItem item = new CheckboxMenuItem(name);
                     item.setState(gpuIndex == idx);
                     gpuMenu.add(item);
-                    items.add(item);
-
+                    gpuItems.add(item);
                     item.addItemListener(e -> {
                         if (item.getState()) {
-                            for (CheckboxMenuItem m : items) m.setState(m == item);
+                            for (CheckboxMenuItem m : gpuItems) m.setState(m == item);
                             prefs.putInt("vulkan.gpu.index", idx);
                             try { prefs.sync(); } catch (Exception ignore) {}
-                            JOptionPane.showMessageDialog(
-                                    null,
-                                    "GPU selection changed.\nPlease restart MobMate.",
-                                    "MobMate",
-                                    JOptionPane.INFORMATION_MESSAGE
-                            );
+                            JOptionPane.showMessageDialog(null, "GPU selection changed.\nPlease restart MobMate.",
+                                    "MobMate", JOptionPane.INFORMATION_MESSAGE);
                             restartSelf(true);
                         }
                     });
                 }
             }
         }
-        popup.add(gpuMenu);
-        popup.addSeparator();
+        performanceMenu.add(gpuMenu);
 
-        Config.log("[TRAY] popup: add TTS Engine...");
-        // ===== TTS Engine select (Auto / VOICEVOX / XTTS / Windows / Voiceger) =====
-        Menu ttsEngineMenu = new Menu("TTS Engine");
-        String enginePref = prefs.get("tts.engine", "auto");
-        List<CheckboxMenuItem> engItems = new ArrayList<>();
-        CheckboxMenuItem engAuto = new CheckboxMenuItem("Auto");
-        CheckboxMenuItem engXtts = new CheckboxMenuItem("XTTS");
-        CheckboxMenuItem engWin  = new CheckboxMenuItem("Windows");
-        CheckboxMenuItem engVgWav = new CheckboxMenuItem("Voiceger(WavToWav)");
-        Menu engVgTtsMenu = new Menu("Voiceger(TTS)");
-        CheckboxMenuItem engVgTts = new CheckboxMenuItem("Use Voiceger(TTS)");
-        // ★VOICEVOXは子メニューにする（トップにチェックは付かないので、内部に「Use VOICEVOX」チェックを置く）
-        engVvMenu = new Menu("VOICEVOX");
-        engVv = new CheckboxMenuItem("Use VOICEVOX");
-        engAuto.setState("auto".equalsIgnoreCase(enginePref));
-        engVv.setState("voicevox".equalsIgnoreCase(enginePref));
-        engXtts.setState("xtts".equalsIgnoreCase(enginePref));
-        engWin.setState("windows".equalsIgnoreCase(enginePref));
-        String eng = enginePref == null ? "auto" : enginePref.toLowerCase(Locale.ROOT);
-        engVgWav.setState("voiceger".equals(eng) || "voiceger_w2w".equals(eng) || "voiceger_vc".equals(eng));
-        engVgTts.setState("voiceger_tts".equals(eng));
-        engItems.add(engAuto);
-        engItems.add(engVv);
-        engItems.add(engXtts);
-        engItems.add(engWin);
-        engItems.add(engVgWav);
-        engItems.add(engVgTts);
-        engListener = e -> {
-            CheckboxMenuItem src = (CheckboxMenuItem) e.getSource();
-            if (!src.getState()) return;
-
-            // ラジオ制御（エンジンは必ず1つだけ）
-            for (CheckboxMenuItem m : engItems) m.setState(m == src);
-
-            String prev = prefs.get("tts.engine", "auto");
-            String v = "auto";
-            if (src == engVv) v = "voicevox";
-            else if (src == engXtts) v = "xtts";
-            else if (src == engWin) v = "windows";
-            else if (src == engVgWav) v = "voiceger_vc";   // or voiceger_w2w
-            else if (src == engVgTts) v = "voiceger_tts";
-
-            prefs.put("tts.engine", v);
-            try { prefs.sync(); } catch (Exception ignore) {}
-            // ★非Voiceger→Voiceger の時だけ API再起動
-            String pv = (prev == null) ? "" : prev.toLowerCase(Locale.ROOT);
-            String nv = (v == null) ? "" : v.toLowerCase(Locale.ROOT);
-            if (!nv.equals(pv) && nv.startsWith("voiceger")) {
-                restartVoicegerApiAsync();
-            }
-        };
-        // 既存のエンジン選択チェック群
-        engAuto.addItemListener(engListener);
-        engVv.addItemListener(engListener);
-        engXtts.addItemListener(engListener);
-        engWin.addItemListener(engListener);
-        engVgWav.addItemListener(engListener);
-        engVgTts.addItemListener(engListener);
-        // --- VOICEVOX submenu contents ---
-        engVvMenu.add(engVv);
-        engVvMenu.addSeparator();
-        // --- Voiceger(TTS) submenu contents ---
-        engVgTtsMenu.add(engVgTts);
-        engVgTtsMenu.addSeparator();
-        // 言語サブメニュー（内部コード保存：all_ja/en/all_zh/all_ko/all_yue/auto）
-        String curLang = prefs.get("voiceger.tts.lang", "all_ja");
-        List<CheckboxMenuItem> vgLangItems = new ArrayList<>();
-        boolean anySelected = false;
-        String[][] langs = {
-                {"Japanese", "all_ja"},
-                {"English", "en"},
-                {"Chinese", "all_zh"},
-                {"Korean", "all_ko"},
-                {"Cantonese", "all_yue"},
-//                {"Auto (later)", "auto"},
-        };
-        for (String[] it : langs) {
-            String label = it[0];
-            String code  = it[1];
-            CheckboxMenuItem mi = new CheckboxMenuItem(label);
-            boolean selected = code.equalsIgnoreCase(curLang);
-            mi.setState(selected);
-            if (selected) anySelected = true;
-            vgLangItems.add(mi);
-            engVgTtsMenu.add(mi);
-            mi.addItemListener(ev -> {
-                if (!mi.getState()) return;
-
-                // ラジオ制御（言語は必ず1つだけ）
-                for (CheckboxMenuItem m : vgLangItems) m.setState(m == mi);
-
-                // 言語保存（内部コード）
-                prefs.put("voiceger.tts.lang", code);
-                try { prefs.sync(); } catch (Exception ignore) {}
-
-                // ここが肝：言語選択＝Voiceger(TTS)を有効化
-                // 直接 setState(true) だけだと、他エンジンがOFFにならない場合があるので
-                // engListener を「正しいItemEvent」で叩いて確実にラジオ更新する
-                if (!engVgTts.getState()) {
-                    engVgTts.setState(true);
-                }
-                engListener.itemStateChanged(
-                        new ItemEvent(engVgTts, ItemEvent.ITEM_STATE_CHANGED, engVgTts, ItemEvent.SELECTED)
-                );
-            });
-        }
-        // どれも選ばれてない（設定値が変な時）なら、日本語に倒して保存しておく
-        if (!anySelected) {
-            prefs.put("voiceger.tts.lang", "all_ja");
-            try { prefs.sync(); } catch (Exception ignore) {}
-        }
-
-//        if (isVoiceVoxAvailable()) {
-//            String vvVoicePref = prefs.get("tts.voice", "auto");
-//            List<CheckboxMenuItem> vvAll = new ArrayList<>();
-//
-//            List<VoiceVoxSpeaker> speakers = getVoiceVoxSpeakers(); // id + name
-//            for (VoiceVoxSpeaker sp : speakers) {
-//                String key = "" + sp.id();
-//                String label = key + ":" + sp.name();
-//                CheckboxMenuItem item = new CheckboxMenuItem(label);
-//                item.setState(key.equals(vvVoicePref));
-//                engVvMenu.add(item);
-//                vvAll.add(item);
-//
-//                item.addItemListener(ev -> {
-//                    if (item.getState()) {
-//                        // 話者を選んだら VOICEVOXエンジンも有効化（迷いを減らす）
-//                        engVv.setState(true);
-//                        engListener.itemStateChanged(new ItemEvent(engVv, 0, engVv, ItemEvent.SELECTED));
-//
-//                        for (CheckboxMenuItem m : vvAll) m.setState(m == item);
-//                        prefs.put("tts.voice", key);
-//                        try { prefs.sync(); } catch (Exception ignore) {}
-//                    }
-//                });
-//            }
-//        } else {
-//            MenuItem na = new MenuItem("VOICEVOX not available");
-//            na.setEnabled(false);
-//            engVvMenu.add(na);
-//        }
-        ttsEngineMenu.add(engAuto);
-        ttsEngineMenu.addSeparator();
-        ttsEngineMenu.add(engVvMenu);
-        ttsEngineMenu.add(engXtts);
-        ttsEngineMenu.add(engWin);
-        ttsEngineMenu.addSeparator();
-        ttsEngineMenu.add(engVgWav);
-        ttsEngineMenu.add(engVgTtsMenu);
-        popup.add(ttsEngineMenu);
-
-
-        Config.log("[TRAY] popup: add Voice...");
-        Menu ttsVoicesItem = new Menu(trayText("menu.voices"));
-        String voicePref = prefs.get("tts.windows.voice", "auto");
-        List<CheckboxMenuItem> all = new ArrayList<>();
-        // --- auto ---
-        CheckboxMenuItem autoItem2 =
-                new CheckboxMenuItem(trayText("menu.voice.auto"));
-        autoItem2.setState("auto".equals(voicePref));
-        ttsVoicesItem.add(autoItem2);
-        all.add(autoItem2);
-        autoItem2.addItemListener(e -> {
-            if (autoItem2.getState()) {
-                for (CheckboxMenuItem m : all) m.setState(m == autoItem2);
-                prefs.put("tts.windows.voice", "auto");
-                try { prefs.sync(); } catch (Exception ignore) {}
-            }
-        });
-        ttsVoicesItem.addSeparator();
-        // --- voices ---
-        List<String> voices = getWindowsVoices();
-        Collections.sort(voices);
-        for (int i = 0; i < voices.size(); i++) {
-            String voice = voices.get(i);
-            String label = String.format("%02d: %s", i, voice);
-            CheckboxMenuItem item = new CheckboxMenuItem(label);
-            item.setState(voice.equals(voicePref));
-            ttsVoicesItem.add(item);
-            all.add(item);
-            item.addItemListener(e -> {
-                if (item.getState()) {
-                    for (CheckboxMenuItem m : all) m.setState(m == item);
-                    prefs.put("tts.windows.voice", voice);
-                    try { prefs.sync(); } catch (Exception ignore) {}
-                }
-            });
-        }
-        ttsVoicesItem.addSeparator();
-        popup.add(ttsVoicesItem);
-
-
-        Config.log("[TRAY] menu.settings:");
-        Menu settingsMenu = new Menu(trayText("menu.settings"));
-
-        Menu RecommendMenu = new Menu(trayText("menu.recommend"));
-        CheckboxMenuItem rmDesktopMic =
-                new CheckboxMenuItem(trayText("menu.recommend.desktopMic"));
-        CheckboxMenuItem rmHeadsetMic =
-                new CheckboxMenuItem(trayText("menu.recommend.headsetMic"));
-        RecommendMenu.add(rmDesktopMic);
-        RecommendMenu.add(rmHeadsetMic);
-        settingsMenu.add(RecommendMenu);
-
-        Menu performanceMenu = new Menu(trayText("menu.performance"));
-        CheckboxMenuItem lowGpuItem =
-                new CheckboxMenuItem(trayText("menu.lowGpuMode"));
+        // Low GPU Mode
+        CheckboxMenuItem lowGpuItem = new CheckboxMenuItem(trayText("menu.lowGpuMode"));
         lowGpuItem.setState(MobMateWhisp.lowGpuMode);
         lowGpuItem.addItemListener(e -> {
             boolean enabled = lowGpuItem.getState();
@@ -1251,8 +1181,8 @@ public class MobMateWhisp implements NativeKeyListener {
         });
         performanceMenu.add(lowGpuItem);
 
-        CheckboxMenuItem vadLaughItem =
-                new CheckboxMenuItem(trayText("menu.vadLaugh"));
+        // VAD Laugh
+        CheckboxMenuItem vadLaughItem = new CheckboxMenuItem(trayText("menu.vadLaugh"));
         vadLaughItem.setState(useAlternateLaugh);
         vadLaughItem.addItemListener(e -> {
             boolean enabled = vadLaughItem.getState();
@@ -1261,151 +1191,208 @@ public class MobMateWhisp implements NativeKeyListener {
             try { prefs.sync(); } catch (Exception ignore) {}
         });
         performanceMenu.add(vadLaughItem);
+        popup.add(performanceMenu);
 
-        List<CheckboxMenuItem> gainItems = new ArrayList<>();
-        rmDesktopMic.addItemListener(e -> {
-            if (!rmDesktopMic.getState()) return;
-            rmHeadsetMic.setState(false);
-            MobMateWhisp.setSilenceAlternate(false);
-            MobMateWhisp.lowGpuMode = true;
-            prefs.putBoolean("perf.low_gpu_mode", true);
-            prefs.putFloat("audio.inputGainMultiplier", 1.0f);
-            for (CheckboxMenuItem it : gainItems) {
-                it.setState(false);
-                if (it.getLabel().equals(String.format("x %.1f", 1.0f))) {
-                    it.setState(true);
-                }
-            }
-            try { prefs.sync(); } catch (Exception ignore) {}
-            lowGpuItem.setState(true);
-            vadLaughItem.setState(false);
-            Config.log("Applied Desktop Mic recommended settings");
-            if (isRecording()) {
-                stopRecording();
-            }
-        });
-        rmHeadsetMic.addItemListener(e -> {
-            if (!rmHeadsetMic.getState()) return;
-            rmDesktopMic.setState(false);
-            MobMateWhisp.setSilenceAlternate(true);
-            MobMateWhisp.lowGpuMode = false;
-            prefs.putBoolean("perf.low_gpu_mode", false);
-            prefs.putFloat("audio.inputGainMultiplier", 3.4f);
-            for (CheckboxMenuItem it : gainItems) {
-                it.setState(false);
-                if (it.getLabel().equals(String.format("x %.1f", 3.4f))) {
-                    it.setState(true);
-                }
-            }
-            try { prefs.sync(); } catch (Exception ignore) {}
-            lowGpuItem.setState(false);
-            vadLaughItem.setState(true);
-            Config.log("Applied Headset Mic recommended settings");
-            if (isRecording()) {
-                stopRecording();
-            }
-        });
+        // ========================================
+        // TTS Settings
+        // ========================================
+        Config.log("[TRAY] popup: add TTS Settings...");
+        Menu ttsMenu = new Menu("TTS Settings");
 
-        Menu inputGainMenu = new Menu(trayText("menu.inputGain"));
-        boolean autogaintuner = prefs.getBoolean("audio.autoGain", true); // -1 = auto
-        float currentGain = prefs.getFloat("audio.inputGainMultiplier", 1.0f);
-        CheckboxMenuItem autoItem3 =
-                new CheckboxMenuItem(trayText("menu.autoGainTuner"));
-        autoItem3.setState(autogaintuner);
-        autoItem3.addItemListener(e -> {
-            prefs.putBoolean("audio.autoGain", autoItem3.getState());
-            autoGainEnabled = autoItem3.getState();
+        // TTS Engine
+        Menu ttsEngineMenu = new Menu("Engine");
+        String enginePref = prefs.get("tts.engine", "auto");
+        List<CheckboxMenuItem> engItems = new ArrayList<>();
+        CheckboxMenuItem engAuto = new CheckboxMenuItem("Auto");
+        CheckboxMenuItem engXtts = new CheckboxMenuItem("XTTS");
+        CheckboxMenuItem engWin  = new CheckboxMenuItem("Windows");
+        CheckboxMenuItem engVgWav = new CheckboxMenuItem("Voiceger(WavToWav)");
+        Menu engVgTtsMenu = new Menu("Voiceger(TTS)");
+        CheckboxMenuItem engVgTts = new CheckboxMenuItem("Use Voiceger(TTS)");
+        engVvMenu = new Menu("VOICEVOX");
+        engVv = new CheckboxMenuItem("Use VOICEVOX");
+        engAuto.setState("auto".equalsIgnoreCase(enginePref));
+        engVv.setState("voicevox".equalsIgnoreCase(enginePref));
+        engXtts.setState("xtts".equalsIgnoreCase(enginePref));
+        engWin.setState("windows".equalsIgnoreCase(enginePref));
+        String eng = enginePref == null ? "auto" : enginePref.toLowerCase(Locale.ROOT);
+        engVgWav.setState("voiceger".equals(eng) || "voiceger_w2w".equals(eng) || "voiceger_vc".equals(eng));
+        engVgTts.setState("voiceger_tts".equals(eng));
+        engItems.add(engAuto);
+        engItems.add(engVv);
+        engItems.add(engXtts);
+        engItems.add(engWin);
+        engItems.add(engVgWav);
+        engItems.add(engVgTts);
+        engListener = e -> {
+            CheckboxMenuItem src = (CheckboxMenuItem) e.getSource();
+            if (!src.getState()) return;
+            for (CheckboxMenuItem m : engItems) m.setState(m == src);
+            String prev = prefs.get("tts.engine", "auto");
+            String v = "auto";
+            if (src == engVv) v = "voicevox";
+            else if (src == engXtts) v = "xtts";
+            else if (src == engWin) v = "windows";
+            else if (src == engVgWav) v = "voiceger_vc";
+            else if (src == engVgTts) v = "voiceger_tts";
+            prefs.put("tts.engine", v);
             try { prefs.sync(); } catch (Exception ignore) {}
-            reloadAudioPrefsForMeter();
-        });
-        inputGainMenu.add(autoItem3);
-        inputGainMenu.addSeparator();
-        for (int i = 0; i < 10; i++) {
-            float gain = 1.0f + (0.8f * i); // 1.0, 1.8, 2.6 ...
-            String label = String.format("x %.1f", gain);
-            CheckboxMenuItem item =
-                    new CheckboxMenuItem(label, gain == currentGain);
-            item.addItemListener(e -> {
-                for (CheckboxMenuItem it : gainItems) {
-                    it.setState(false);
-                }
-                item.setState(true);
-                prefs.putFloat("audio.inputGainMultiplier", gain);
+            String pv = (prev == null) ? "" : prev.toLowerCase(Locale.ROOT);
+            String nv = (v == null) ? "" : v.toLowerCase(Locale.ROOT);
+            if (!nv.equals(pv) && nv.startsWith("voiceger")) {
+                restartVoicegerApiAsync();
+            }
+        };
+        engAuto.addItemListener(engListener);
+        engVv.addItemListener(engListener);
+        engXtts.addItemListener(engListener);
+        engWin.addItemListener(engListener);
+        engVgWav.addItemListener(engListener);
+        engVgTts.addItemListener(engListener);
+        engVvMenu.add(engVv);
+        engVvMenu.addSeparator();
+        engVgTtsMenu.add(engVgTts);
+        engVgTtsMenu.addSeparator();
+        String curLang = prefs.get("voiceger.tts.lang", "all_ja");
+        List<CheckboxMenuItem> vgLangItems = new ArrayList<>();
+        boolean anySelected = false;
+        String[][] langs = {
+                {"Japanese", "all_ja"},
+                {"English", "en"},
+                {"Chinese", "all_zh"},
+                {"Korean", "all_ko"},
+                {"Cantonese", "all_yue"},
+        };
+        for (String[] it : langs) {
+            String label = it[0];
+            String code  = it[1];
+            CheckboxMenuItem mi = new CheckboxMenuItem(label);
+            boolean selected = code.equalsIgnoreCase(curLang);
+            mi.setState(selected);
+            if (selected) anySelected = true;
+            vgLangItems.add(mi);
+            engVgTtsMenu.add(mi);
+            mi.addItemListener(ev -> {
+                if (!mi.getState()) return;
+                for (CheckboxMenuItem m : vgLangItems) m.setState(m == mi);
+                prefs.put("voiceger.tts.lang", code);
                 try { prefs.sync(); } catch (Exception ignore) {}
-                if (isRecording()) {
-                    stopRecording();
+                if (!engVgTts.getState()) {
+                    engVgTts.setState(true);
                 }
-                reloadAudioPrefsForMeter();
+                engListener.itemStateChanged(
+                        new ItemEvent(engVgTts, ItemEvent.ITEM_STATE_CHANGED, engVgTts, ItemEvent.SELECTED)
+                );
             });
-            gainItems.add(item);
-            inputGainMenu.add(item);
         }
-        settingsMenu.add(performanceMenu);
-        settingsMenu.add(inputGainMenu);
+        if (!anySelected) {
+            prefs.put("voiceger.tts.lang", "all_ja");
+            try { prefs.sync(); } catch (Exception ignore) {}
+        }
+        ttsEngineMenu.add(engAuto);
+        ttsEngineMenu.addSeparator();
+        ttsEngineMenu.add(engVvMenu);
+        ttsEngineMenu.add(engXtts);
+        ttsEngineMenu.add(engWin);
+        ttsEngineMenu.addSeparator();
+        ttsEngineMenu.add(engVgWav);
+        ttsEngineMenu.add(engVgTtsMenu);
+        ttsMenu.add(ttsEngineMenu);
 
-        // === Radio Chat Hotkey (modifier + key) ===
-        Menu radioMenu = new Menu("Radio Chat Hotkey");
+        // Voice Selection
+        Menu ttsVoicesItem = new Menu(trayText("menu.voices"));
+        String voicePref = prefs.get("tts.windows.voice", "auto");
+        List<CheckboxMenuItem> voiceAll = new ArrayList<>();
+        CheckboxMenuItem autoVoiceItem = new CheckboxMenuItem(trayText("menu.voice.auto"));
+        autoVoiceItem.setState("auto".equals(voicePref));
+        ttsVoicesItem.add(autoVoiceItem);
+        voiceAll.add(autoVoiceItem);
+        autoVoiceItem.addItemListener(e -> {
+            if (autoVoiceItem.getState()) {
+                for (CheckboxMenuItem m : voiceAll) m.setState(m == autoVoiceItem);
+                prefs.put("tts.windows.voice", "auto");
+                try { prefs.sync(); } catch (Exception ignore) {}
+            }
+        });
+        ttsVoicesItem.addSeparator();
+        List<String> voices = getWindowsVoices();
+        Collections.sort(voices);
+        for (int i = 0; i < voices.size(); i++) {
+            String voice = voices.get(i);
+            String label = String.format("%02d: %s", i, voice);
+            CheckboxMenuItem item = new CheckboxMenuItem(label);
+            item.setState(voice.equals(voicePref));
+            ttsVoicesItem.add(item);
+            voiceAll.add(item);
+            item.addItemListener(e -> {
+                if (item.getState()) {
+                    for (CheckboxMenuItem m : voiceAll) m.setState(m == item);
+                    prefs.put("tts.windows.voice", voice);
+                    try { prefs.sync(); } catch (Exception ignore) {}
+                }
+            });
+        }
+        ttsVoicesItem.addSeparator();
+        ttsMenu.add(ttsVoicesItem);
 
-        // --- Modifier (bitmask) ---
+        // Auto Emotion (VOICEVOX)
+        CheckboxMenuItem autoEmotionItem = new CheckboxMenuItem(trayText("menu.voicevox.autoEmotion"));
+        boolean currentAutoEmotion = prefs.getBoolean("voicevox.auto_emotion", true);
+        autoEmotionItem.setState(currentAutoEmotion);
+        autoEmotionItem.addItemListener(e -> {
+            boolean enabled = autoEmotionItem.getState();
+            prefs.putBoolean("voicevox.auto_emotion", enabled);
+            try { prefs.sync(); } catch (Exception ignore) {}
+            Config.log("VOICEVOX auto emotion set to: " + enabled);
+        });
+        ttsMenu.add(autoEmotionItem);
+        popup.add(ttsMenu);
+
+        // ========================================
+        // Radio Chat
+        // ========================================
+        Config.log("[TRAY] popup: add Radio Chat...");
+        Menu radioMenu = new Menu("Radio Chat");
+
+        // Hotkey Settings
+        Menu radioHotkeyMenu = new Menu("Hotkey");
         Menu radioModMenu = new Menu("Modifier");
-        // NONE=0, SHIFT=1, CTRL=2, SHIFT+CTRL=3
         final String[] MODS = { "NONE", "SHIFT", "CTRL", "SHIFT+CTRL" };
         final int[] MODMASK = { 0, 1, 2, 3 };
-
         final int curModMask = prefs.getInt("radio.modMask", 0);
         final java.util.List<CheckboxMenuItem> modItems = new java.util.ArrayList<>();
-
         for (int idx = 0; idx < MODS.length; idx++) {
             final String label = MODS[idx];
             final int mask = MODMASK[idx];
-
             final CheckboxMenuItem it = new CheckboxMenuItem(label);
             it.setState(mask == curModMask);
             modItems.add(it);
             radioModMenu.add(it);
-
             it.addItemListener(ev -> {
                 if (!it.getState()) return;
-
-                // 排他チェック
                 for (CheckboxMenuItem other : modItems) other.setState(other == it);
-
-                // Recording hotkey と完全一致だけ禁止（キー＋修飾が同じ）
                 int recMask = getRecordingModMask();
-                String recKeyName = MobMateWhisp.this.hotkey; // 既存の録音ホットキー名（例: "F9"）
-                // radio側の現在キー（まだ未保存の可能性あるので prefs から読む）
+                String recKeyName = MobMateWhisp.this.hotkey;
                 int curKeyCode = prefs.getInt("radio.keyCode",
                         com.github.kwhat.jnativehook.keyboard.NativeKeyEvent.VC_F18);
                 String curKeyName2 = com.github.kwhat.jnativehook.keyboard.NativeKeyEvent.getKeyText(curKeyCode);
-
-                // getKeyTextは "F9" になる想定。もし違うならここはログ見て調整っす
                 if (mask == recMask && curKeyName2.equalsIgnoreCase(recKeyName)) {
                     it.setState(false);
-                    JOptionPane.showMessageDialog(
-                            null,
+                    JOptionPane.showMessageDialog(null,
                             "This hotkey conflicts with Recording hotkey.\nChoose another modifier or key.",
-                            "MobMate",
-                            JOptionPane.WARNING_MESSAGE
-                    );
-                    // 元に戻す（どれかがONになるように）
+                            "MobMate", JOptionPane.WARNING_MESSAGE);
                     for (CheckboxMenuItem other : modItems) {
                         if (prefs.getInt("radio.modMask", 0) == mask) other.setState(true);
                     }
                     return;
                 }
-
                 prefs.putInt("radio.modMask", mask);
                 try { prefs.sync(); } catch (Exception ignore) {}
-
-                // 実行中にも即反映（＝ここが“登録”相当っす）
                 MobMateWhisp.this.radioModMask = mask;
-
                 Config.log("Radio modMask set: " + mask + " (" + label + ")");
             });
         }
-        radioMenu.add(radioModMenu);
-
-        // --- Key (F1..F18 -> keyCode int) ---
+        radioHotkeyMenu.add(radioModMenu);
         Menu radioKeyMenu = new Menu("Key");
         final int curKeyCode = prefs.getInt("radio.keyCode",
                 com.github.kwhat.jnativehook.keyboard.NativeKeyEvent.VC_F18);
@@ -1423,33 +1410,25 @@ public class MobMateWhisp implements NativeKeyListener {
                 int mask = prefs.getInt("radio.modMask", 0);
                 int recMask = getRecordingModMask();
                 String recKeyName = MobMateWhisp.this.hotkey;
-                // Recording hotkey と完全一致だけ禁止（修飾も含めて一致）
                 if (mask == recMask && label.equalsIgnoreCase(recKeyName)) {
                     it.setState(false);
-                    JOptionPane.showMessageDialog(
-                            null,
+                    JOptionPane.showMessageDialog(null,
                             "This hotkey conflicts with Recording hotkey.\nChoose another key or add a modifier.",
-                            "MobMate",
-                            JOptionPane.WARNING_MESSAGE
-                    );
+                            "MobMate", JOptionPane.WARNING_MESSAGE);
                     return;
                 }
-                // 排他チェック
                 for (CheckboxMenuItem other : keyItems) other.setState(other == it);
                 prefs.putInt("radio.keyCode", keyCode);
                 try { prefs.sync(); } catch (Exception ignore) {}
-                // 実行中にも即反映
                 MobMateWhisp.this.radioKeyCode = keyCode;
                 Config.log("Radio key set: " + label + " (keyCode=" + keyCode + ")");
             });
         }
-        radioMenu.add(radioKeyMenu);
+        radioHotkeyMenu.add(radioKeyMenu);
+        radioMenu.add(radioHotkeyMenu);
 
-        // === Radio Chat Overlay Settings ===
-        // === Radio Chat Overlay Settings ===
+        // Overlay Settings
         Menu overlaySettingsMenu = new Menu("Overlay Settings");
-
-// Enable/Disable
         CheckboxMenuItem overlayEnableItem = new CheckboxMenuItem("Enable Overlay");
         overlayEnableItem.setState(overlayEnable);
         overlayEnableItem.addItemListener(e -> {
@@ -1458,8 +1437,6 @@ public class MobMateWhisp implements NativeKeyListener {
         });
         overlaySettingsMenu.add(overlayEnableItem);
         overlaySettingsMenu.addSeparator();
-
-// Position
         Menu overlayPosMenu = new Menu("Position");
         String currentPos = (overlayPosition == null ? "TOP_LEFT" : overlayPosition).toUpperCase();
         String[] positions = {"TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"};
@@ -1476,8 +1453,6 @@ public class MobMateWhisp implements NativeKeyListener {
             overlayPosMenu.add(item);
         }
         overlaySettingsMenu.add(overlayPosMenu);
-
-// Display
         Menu overlayDisplayMenu = new Menu("Display");
         int currentDisplay = overlayDisplay;
         GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
@@ -1501,8 +1476,6 @@ public class MobMateWhisp implements NativeKeyListener {
             overlayDisplayMenu.add(item);
         }
         overlaySettingsMenu.add(overlayDisplayMenu);
-
-// Font Size
         Menu overlayFontMenu = new Menu("Font Size");
         int currentFontSize = overlayFontSize;
         List<CheckboxMenuItem> fontItems = new ArrayList<>();
@@ -1519,8 +1492,6 @@ public class MobMateWhisp implements NativeKeyListener {
             overlayFontMenu.add(item);
         }
         overlaySettingsMenu.add(overlayFontMenu);
-
-// Opacity
         Menu overlayOpacityMenu = new Menu("Opacity");
         int currentOpacity = (int) (overlayOpacity * 100.0f);
         List<CheckboxMenuItem> opacityItems = new ArrayList<>();
@@ -1537,42 +1508,30 @@ public class MobMateWhisp implements NativeKeyListener {
             overlayOpacityMenu.add(item);
         }
         overlaySettingsMenu.add(overlayOpacityMenu);
-
-        // Theme (BG preset)
         overlaySettingsMenu.addSeparator();
         Menu overlayThemeMenu = new Menu("Theme");
-
         String[][] colors = {
                 {"Green", "green", "30,90,50"},
                 {"Blue", "blue", "30,50,90"},
                 {"Gray", "gray", "40,40,40"},
                 {"Dark Red", "red", "70,30,30"}
         };
-
-        String currentBgHex = toHex(overlayBg); // 既存の toHex(Color) を利用
+        String currentBgHex = toHex(overlayBg);
         List<CheckboxMenuItem> themeItems = new ArrayList<>();
-
         for (String[] c : colors) {
             final String label = c[0];
             final String bgHex = rgbCsvToHex(c[2]);
             CheckboxMenuItem item = new CheckboxMenuItem(label);
             item.setState(bgHex.equalsIgnoreCase(currentBgHex));
             themeItems.add(item);
-
             item.addItemListener(e -> {
                 if (!item.getState()) return;
                 for (CheckboxMenuItem other : themeItems) other.setState(other == item);
-
-                // fgは白固定（見やすさ最優先）
                 setRadioOverlayColors(bgHex, "#FFFFFF");
             });
-
             overlayThemeMenu.add(item);
         }
-
         overlaySettingsMenu.add(overlayThemeMenu);
-
-        // Max Lines
         Menu overlayLinesMenu = new Menu("Max Lines");
         int currentMaxLines = overlayMaxLines;
         List<CheckboxMenuItem> lineItems = new ArrayList<>();
@@ -1589,49 +1548,16 @@ public class MobMateWhisp implements NativeKeyListener {
             overlayLinesMenu.add(item);
         }
         overlaySettingsMenu.add(overlayLinesMenu);
-
         radioMenu.add(overlaySettingsMenu);
-        settingsMenu.add(radioMenu);
+        popup.add(radioMenu);
 
-        // Settings メニューをpopupに追加
-        popup.add(settingsMenu);
-        popup.addSeparator();
-
-//        CheckboxMenuItem openWindowItem = new CheckboxMenuItem("Open Window");
-//        openWindowItem.setState(this.prefs.getBoolean("open-window", true));
-//        openWindowItem.addItemListener(new ItemListener() {
-//            @Override
-//            public void itemStateChanged(ItemEvent e) {
-//                boolean state = openWindowItem.getState();
-//                MobMateWhisp.this.prefs.putBoolean("open-window", state);
-//                try {
-//                    MobMateWhisp.this.prefs.sync();
-//                } catch (BackingStoreException ex) {
-//                    ex.printStackTrace();
-//                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + ex.getMessage());
-//                }
-//                if (state) {
-//                    if (MobMateWhisp.this.window == null || !MobMateWhisp.this.window.isVisible()) {
-//                        MobMateWhisp.this.openWindow();
-//                    }
-//                    if (MobMateWhisp.this.window != null) {
-//                        MobMateWhisp.this.window.toFront();
-//                        MobMateWhisp.this.window.requestFocus();
-//                    }
-//                } else {
-//                    if (MobMateWhisp.this.window != null && MobMateWhisp.this.window.isVisible()) {
-//                        MobMateWhisp.this.window.setVisible(false);
-//                    }
-//                }
-//            }
-//        });
-//        popup.add(openWindowItem);
-
-//        final MenuItem historyItem = new MenuItem("History");
-//        popup.add(historyItem);
-
+        // ========================================
+        // Appearance
+        // ========================================
+        Config.log("[TRAY] popup: add Appearance...");
+        Menu appearanceMenu = new Menu("Appearance");
         Menu fontSizeMenu = new Menu(trayText("menu.fontSize"));
-        int currentSize = prefs.getInt("ui.font.size", 12);
+        int currentSize = prefs.getInt("ui.font.size", 16);
         List<CheckboxMenuItem> fontItems2 = new ArrayList<>();
         for (int size = 12; size <= 24; size += 2) {
             String label = size + " px";
@@ -1656,74 +1582,110 @@ public class MobMateWhisp implements NativeKeyListener {
                     }
                     if (window != null) {
                         SwingUtilities.updateComponentTreeUI(window);
+                        // フォント変更後にサイズを再計算させる
+                        window.invalidate();
                         window.pack();
+                        window.setSize(window.getPreferredSize());
+
+                        window.validate();
+                        window.repaint();
                     }
                 }
             });
             fontItems2.add(item);
             fontSizeMenu.add(item);
         }
-        settingsMenu.add(fontSizeMenu);
+        appearanceMenu.add(fontSizeMenu);
 
-        // ===== VOICEVOX感情自動寄せ =====
-        CheckboxMenuItem autoEmotionItem = new CheckboxMenuItem(trayText("menu.voicevox.autoEmotion"));
-        boolean currentAutoEmotion = prefs.getBoolean("voicevox.auto_emotion", true); // デフォルトtrue
-        autoEmotionItem.setState(currentAutoEmotion);
-        autoEmotionItem.addItemListener(e -> {
-            boolean enabled = autoEmotionItem.getState();
-            prefs.putBoolean("voicevox.auto_emotion", enabled);
+        // ===== Theme Toggle =====
+        MenuItem themeToggleItem = new MenuItem("Toggle Dark/Light Theme");
+        appearanceMenu.add(themeToggleItem);
+        themeToggleItem.addActionListener(e -> {
+            // 現在のテーマを反転
+            boolean currentDark = prefs.getBoolean("ui.theme.dark", true);
+            prefs.putBoolean("ui.theme.dark", !currentDark);
             try {
                 prefs.sync();
-            } catch (Exception ignore) {}
-            Config.log("VOICEVOX auto emotion set to: " + enabled);
+            } catch (BackingStoreException ex) {
+                ex.printStackTrace();
+            }
+
+            // テーマを即座に切り替え
+            SwingUtilities.invokeLater(() -> {
+                try {
+                    if (!currentDark) {
+                        com.formdev.flatlaf.FlatDarkLaf.setup();
+                    } else {
+                        com.formdev.flatlaf.FlatLightLaf.setup();
+                    }
+                    // 全ウィンドウを更新
+                    for (Window w : Window.getWindows()) {
+                        SwingUtilities.updateComponentTreeUI(w);
+                    }
+                } catch (Exception ex) {
+                    ex.printStackTrace();
+                }
+            });
         });
-        settingsMenu.add(autoEmotionItem);
+        popup.add(appearanceMenu);
 
-        boolean readyToZip = Config.getBool("log.debug", false);
-        Menu debugMenu = new Menu("MobMateWhispTalk v" + Version.APP_VERSION);
-        if (!readyToZip) {
-            MenuItem enableDebugItem = new MenuItem(trayText("menu.debug.enableLog"));
-            enableDebugItem.addActionListener(e -> {
-                try {
-                    Config.appendOutTts("log.debug=true");
-                    Config.appendOutTts("log.vad.detailed=true");
-                    JOptionPane.showMessageDialog(
-                            null,
-                            "Debug logging enabled temporarily.\n" +
-                                    "Restart the app and reproduce the issue.\n" +
-                                    "(Automatically turns off after ~500 messages.)",
-                            "MobMate",
-                            JOptionPane.INFORMATION_MESSAGE
-                    );
-                    restartSelf(true);
-                } catch (Exception ex) {
-                    Config.log("Failed to Debug Log Output ON..");
-                }
-            });
-            debugMenu.add(enableDebugItem);
-        } else {
-            MenuItem zipLogsItem = new MenuItem(trayText("menu.debug.createZip"));
-            zipLogsItem.addActionListener(e -> {
-                try {
-                    File zip = DebugLogZipper.createZip();
-                    JOptionPane.showMessageDialog(
-                            null,
-                            "Debug logs have been collected.\n\n" +
-                                    "Please attach this zip file and send it to support.\n\n" +
-                                    zip.getAbsolutePath(),
-                            "MobMate",
-                            JOptionPane.INFORMATION_MESSAGE
-                    );
-                } catch (Exception ex) {
-                    Config.log("Failed to Debug Log Output Zipping..");
-                }
-            });
-            debugMenu.add(zipLogsItem);
-        }
-        debugMenu.addSeparator(); // 必要なら区切り
+        // ========================================
+        // Advanced
+        // ========================================
+        Config.log("[TRAY] popup: add Advanced...");
+        Menu advancedMenu = new Menu("Advanced");
 
+//        // Recommended Settings
+//        Menu RecommendMenu = new Menu(trayText("menu.recommend"));
+//        CheckboxMenuItem rmDesktopMic = new CheckboxMenuItem(trayText("menu.recommend.desktopMic"));
+//        CheckboxMenuItem rmHeadsetMic = new CheckboxMenuItem(trayText("menu.recommend.headsetMic"));
+//        RecommendMenu.add(rmDesktopMic);
+//        RecommendMenu.add(rmHeadsetMic);
+//        rmDesktopMic.addItemListener(e -> {
+//            if (!rmDesktopMic.getState()) return;
+//            rmHeadsetMic.setState(false);
+//            MobMateWhisp.setSilenceAlternate(false);
+//            MobMateWhisp.lowGpuMode = true;
+//            prefs.putBoolean("perf.low_gpu_mode", true);
+//            prefs.putFloat("audio.inputGainMultiplier", 1.0f);
+//            for (CheckboxMenuItem it : gainItems) {
+//                it.setState(false);
+//                if (it.getLabel().equals(String.format("x %.1f", 1.0f))) {
+//                    it.setState(true);
+//                }
+//            }
+//            try { prefs.sync(); } catch (Exception ignore) {}
+//            lowGpuItem.setState(true);
+//            vadLaughItem.setState(false);
+//            Config.log("Applied Desktop Mic recommended settings");
+//            if (isRecording()) {
+//                stopRecording();
+//            }
+//        });
+//        rmHeadsetMic.addItemListener(e -> {
+//            if (!rmHeadsetMic.getState()) return;
+//            rmDesktopMic.setState(false);
+//            MobMateWhisp.setSilenceAlternate(true);
+//            MobMateWhisp.lowGpuMode = false;
+//            prefs.putBoolean("perf.low_gpu_mode", false);
+//            prefs.putFloat("audio.inputGainMultiplier", 3.4f);
+//            for (CheckboxMenuItem it : gainItems) {
+//                it.setState(false);
+//                if (it.getLabel().equals(String.format("x %.1f", 3.4f))) {
+//                    it.setState(true);
+//                }
+//            }
+//            try { prefs.sync(); } catch (Exception ignore) {}
+//            lowGpuItem.setState(false);
+//            vadLaughItem.setState(true);
+//            Config.log("Applied Headset Mic recommended settings");
+//            if (isRecording()) {
+//                stopRecording();
+//            }
+//        });
+//        advancedMenu.add(RecommendMenu);
 
-        Config.log("[TRAY] wizard:");
+        // Wizard
         MenuItem openWizardItem = new MenuItem(trayText("menu.wizard.open"));
         openWizardItem.addActionListener(e -> {
             SwingUtilities.invokeLater(() -> {
@@ -1737,7 +1699,7 @@ public class MobMateWhisp implements NativeKeyListener {
                         throw new RuntimeException(ex);
                     }
                     wizard.setLocationRelativeTo(window);
-                    wizard.setVisible(true); // modal想定
+                    wizard.setVisible(true);
                 } finally {
                     try {
                         if (wizard != null) wizard.stopAllWizardTests();
@@ -1745,9 +1707,53 @@ public class MobMateWhisp implements NativeKeyListener {
                 }
             });
         });
-        debugMenu.add(openWizardItem);
+        advancedMenu.add(openWizardItem);
 
-        // ===== Hearing (β) を「バージョン情報(menu)の上」に追加 =====
+        // Debug Menu
+        boolean readyToZip = Config.getBool("log.debug", false);
+        Menu debugMenu = new Menu("MobMateWhispTalk v" + Version.APP_VERSION);
+        if (!readyToZip) {
+            MenuItem enableDebugItem = new MenuItem(trayText("menu.debug.enableLog"));
+            enableDebugItem.addActionListener(e -> {
+                try {
+                    Config.appendOutTts("log.debug=true");
+                    Config.appendOutTts("log.vad.detailed=true");
+                    JOptionPane.showMessageDialog(null,
+                            "Debug logging enabled temporarily.\n" +
+                                    "Restart the app and reproduce the issue.\n" +
+                                    "(Automatically turns off after ~500 messages.)",
+                            "MobMate", JOptionPane.INFORMATION_MESSAGE);
+                    restartSelf(true);
+                } catch (Exception ex) {
+                    Config.log("Failed to Debug Log Output ON..");
+                }
+            });
+            debugMenu.add(enableDebugItem);
+        } else {
+            MenuItem zipLogsItem = new MenuItem(trayText("menu.debug.createZip"));
+            zipLogsItem.addActionListener(e -> {
+                try {
+                    File zip = DebugLogZipper.createZip();
+                    JOptionPane.showMessageDialog(null,
+                            "Debug logs have been collected.\n\n" +
+                                    "Please attach this zip file and send it to support.\n\n" +
+                                    zip.getAbsolutePath(),
+                            "MobMate", JOptionPane.INFORMATION_MESSAGE);
+                } catch (Exception ex) {
+                    Config.log("Failed to Debug Log Output Zipping..");
+                }
+            });
+            debugMenu.add(zipLogsItem);
+        }
+        debugMenu.addSeparator();
+        advancedMenu.add(debugMenu);
+        popup.add(advancedMenu);
+
+
+        // ========================================
+        // Other Items
+        // ========================================
+        popup.addSeparator();
         MenuItem hearingBetaItem = new MenuItem("Hearing (β)");
         hearingBetaItem.addActionListener(e -> {
             SwingUtilities.invokeLater(() -> {
@@ -1760,7 +1766,11 @@ public class MobMateWhisp implements NativeKeyListener {
         });
         popup.add(hearingBetaItem);
 
-        popup.add(debugMenu);
+        popup.addSeparator();
+        // ===== Soft Restart =====
+        MenuItem softRestartItem = new MenuItem("Soft Restart");
+        popup.add(softRestartItem);
+        softRestartItem.addActionListener(e -> softRestart());
 
         popup.addSeparator();
         MenuItem exitItem = new MenuItem(trayText("menu.exit"));
@@ -1771,16 +1781,9 @@ public class MobMateWhisp implements NativeKeyListener {
                 try { VoicegerManager.stopIfRunning(MobMateWhisp.prefs); } catch (Throwable ignore) {}
                 Config.mirrorAllToCloud();
                 System.exit(0);
-
             }
         });
-//        historyItem.addActionListener(new ActionListener() {
-//            @Override
-//            public void actionPerformed(ActionEvent e) {
-//                showHistory();
-//
-//            }
-//        });
+
         Font awtFont = new Font(UIManager.getFont("Menu.font").getFamily(), Font.PLAIN,
                 prefs.getInt("ui.font.size", 12));
         applyAwtFontRecursive(popup, awtFont);
@@ -1788,6 +1791,8 @@ public class MobMateWhisp implements NativeKeyListener {
         Config.log("[TRAY] popup: end");
         return popup;
     }
+
+
     private void rebuildVoiceVoxSpeakerMenu(Menu engVvMenu, CheckboxMenuItem engVv, ItemListener engListener, Preferences prefs) {
         engVvMenu.removeAll();
 
@@ -1838,7 +1843,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private static final int RADIO_PAGE_MAX = 3;
     private void loadRadioHotkeyFromPrefs() {
         // prefs は既に初期化されている前提
-        this.radioModMask = prefs.getInt("radio.modMask", 0);
+        this.radioModMask = prefs.getInt("radio.modMask", java.awt.event.KeyEvent.VK_Q);
         this.radioKeyCode = prefs.getInt("radio.keyCode",
                 com.github.kwhat.jnativehook.keyboard.NativeKeyEvent.VC_F18);
         Config.log("Radio hotkey loaded: modMask=" + radioModMask + " keyCode=" + radioKeyCode);
@@ -2573,7 +2578,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
 
     public int getUIFontSize() {
-        return prefs.getInt("ui.font.size", 12); // default 12
+        return prefs.getInt("ui.font.size", 16); // default 16
     }
     public static void applyUIFont(int size) {
         Font base = UIManager.getFont("Label.font");
@@ -2698,6 +2703,60 @@ public class MobMateWhisp implements NativeKeyListener {
         Config.loadGoodWords();
         Config.loadDictionary();
         LocalWhisperCPP.dictionaryDirty = false;
+
+        // ★ステータスバーを再構築（最新情報を反映）
+        refreshStatusBar();
+    }
+    // ===== ステータスバー再構築 =====
+    private void refreshStatusBar() {
+        if (window == null || statusBar == null) return;
+
+        SwingUtilities.invokeLater(() -> {
+            // 既存のステータスバーを削除
+            Container parent = statusBar.getParent();
+            if (parent != null) {
+                parent.remove(statusBar);
+
+                // 新しいステータスバーを作成
+                statusBar = createStatusBar();
+
+                // 再追加
+                parent.add(statusBar, BorderLayout.SOUTH);
+
+                // 再描画
+                parent.revalidate();
+                parent.repaint();
+            }
+        });
+    }
+    /** ★話者照合ステータスをステータスバーに反映 */
+    private void updateSpeakerStatus() {
+        if (speakerStatusLabel == null) return;
+        SwingUtilities.invokeLater(() -> {
+            if (!prefs.getBoolean("speaker.enabled", false)) {
+                speakerStatusLabel.setText("○SPK");
+                speakerStatusLabel.setForeground(Color.GRAY);
+                speakerStatusLabel.setToolTipText("Speaker Filter: OFF");
+            } else if (speakerProfile == null || !speakerProfile.isReady()) {
+                int cnt = (speakerProfile != null) ? speakerProfile.getEnrollCount() : 0;
+                int need = (speakerProfile != null) ? speakerProfile.getRequiredSamples() : 0;
+                if (cnt > 0) {
+                    speakerStatusLabel.setText("◎SPK " + cnt + "/" + need + " plz speak something!");
+                } else {
+                    speakerStatusLabel.setText("◎SPK" + " plz speak something!");
+                }
+                speakerStatusLabel.setForeground(new Color(255, 193, 7)); // yellow
+                speakerStatusLabel.setToolTipText("Speaker Filter: Enrolling...");
+            } else {
+                speakerStatusLabel.setText("●SPK");
+                speakerStatusLabel.setForeground(new Color(76, 175, 80)); // green
+                speakerStatusLabel.setToolTipText(String.format(
+                        "Speaker Filter: ON (pass=%d reject=%d thr=%.0f%%)",
+                        speakerProfile.getTotalAccepted(),
+                        speakerProfile.getTotalRejected(),
+                        speakerProfile.getThreshold() * 100));
+            }
+        });
     }
 
 //    @Override
@@ -3036,6 +3095,86 @@ public class MobMateWhisp implements NativeKeyListener {
 
                         SwingUtilities.invokeLater(() -> window.setTitle("[CALIBRATING](" + effectiveDevice + ")..."));
                         ensureVADCalibrationForDevice(targetDataLine, effectiveDevice);
+
+                        // ★話者エンロール（speaker.enabled=true時のみ）
+                        if (prefs.getBoolean("speaker.enabled", false) && !speakerProfile.isReady()) {
+                            // 既存プロファイルがあれば復元を試みる
+                            File spkFile = new File("speaker_profile.dat");
+                            if (spkFile.exists() && speakerProfile.loadFromFile(spkFile)) {
+                                Config.log("★Speaker profile restored from file");
+                                updateSpeakerStatus();
+                            } else {
+                                // エンロール実施
+                                int need = speakerProfile.getRequiredSamples();
+                                Config.log("★Speaker enrollment starting: need " + need + " samples");
+//                                SwingUtilities.invokeLater(() ->
+//                                        window.setTitle("[ENROLLING] plz speak something..."));
+                                updateSpeakerStatus();
+
+                                byte[] enrollBuf = new byte[4096];
+                                ByteArrayOutputStream enrollChunk = new ByteArrayOutputStream();
+                                int enrolled = 0;
+                                int enrollSilence = 0;
+                                boolean enrollSpeaking = false;
+                                long enrollStart = System.currentTimeMillis();
+                                long enrollTimeoutMs = prefs.getInt("speaker.enroll_timeout_sec", 30) * 1000L;
+                                int minEnrollBytes = 16000 * 2; // ★最低1秒分の発話（短すぎると精度低下）
+
+                                while (enrolled < need
+                                        && (System.currentTimeMillis() - enrollStart) < enrollTimeoutMs
+                                        && isRecording()) {
+                                    int r = targetDataLine.read(enrollBuf, 0, enrollBuf.length);
+                                    if (r <= 0) continue;
+
+                                    int peak = vad.getPeak(enrollBuf, r);
+                                    boolean speech = (vad instanceof ImprovedVAD)
+                                            ? ((ImprovedVAD) vad).isSpeech(enrollBuf, r, enrollChunk.size())
+                                            : vad.isSpeech(enrollBuf, r);
+
+                                    if (speech) {
+                                        if (!enrollSpeaking) {
+                                            enrollSpeaking = true;
+                                            enrollChunk.reset();
+                                            enrollSilence = 0;
+                                        }
+                                        enrollChunk.write(enrollBuf, 0, r);
+                                    } else if (enrollSpeaking) {
+                                        enrollSilence++;
+                                        if (enrollSilence >= 3) { // 発話終了
+                                            byte[] chunk = enrollChunk.toByteArray();
+                                            if (chunk.length >= minEnrollBytes) {
+                                                speakerProfile.enrollSample(chunk);
+                                                enrolled++;
+                                                final int cnt = enrolled;
+                                                SwingUtilities.invokeLater(() ->
+                                                        window.setTitle("[ENROLLING] " + cnt + "/" + need));
+                                                updateSpeakerStatus();
+                                                Config.logDebug("★Speaker enroll accepted: "
+                                                        + enrolled + "/" + need
+                                                        + " bytes=" + chunk.length);
+                                            } else {
+                                                Config.logDebug("★Speaker enroll skipped (too short): "
+                                                        + chunk.length + " bytes");
+                                            }
+                                            enrollSpeaking = false;
+                                            enrollChunk.reset();
+                                            enrollSilence = 0;
+                                        }
+                                    }
+                                }
+
+                                if (speakerProfile.isReady()) {
+                                    speakerProfile.saveToFile(spkFile);
+                                    Config.log("★Speaker enrollment complete: "
+                                            + enrolled + " samples enrolled");
+                                } else {
+                                    Config.log("★Speaker enrollment incomplete: "
+                                            + enrolled + "/" + need
+                                            + " (timeout or stopped)");
+                                }
+                                updateSpeakerStatus();
+                            }
+                        }
                         SwingUtilities.invokeLater(() -> window.setTitle(UiText.t("ui.title.rec")));
 
                         // --- ここから先は元の処理（録音ループ） ---
@@ -3227,6 +3366,14 @@ public class MobMateWhisp implements NativeKeyListener {
                                         ? ((ImprovedVAD) vad).isSpeech(pcm, n, buffer.size())
                                         : vad.isSpeech(pcm, n);
 
+                                // ===== 話者照合（VAD後・transient前）=====
+                                if (speech && speakerProfile != null && speakerProfile.isReady()) {
+                                    double sim = speakerProfile.similarity(pcm);
+                                    if (sim < speakerProfile.getThreshold()) {
+                                        continue;
+                                    }
+                                }
+
                                 // ===== [ADD] strong signal but speech=false guard =====
                                 if (vad instanceof ImprovedVAD) {
                                     AdaptiveNoiseProfile np = ((ImprovedVAD) vad).getNoiseProfile();
@@ -3288,7 +3435,14 @@ public class MobMateWhisp implements NativeKeyListener {
                                 }
 
                                 long now = System.currentTimeMillis();
-                                maybeRescueSpeakFromPartial(action, now, currentUtteranceSeq);
+                                // ★Finalが直前に迫っているときはrescueスキップ（暴発防止）
+                                // → finalが空でもFinalブロック内のdoRescueFromPartialが拾う
+                                boolean finalImminent = isSpeaking && !isProcessingFinal.get() &&
+                                        (silenceFrames >= SILENCE_FRAMES_FOR_FINAL || forceFinalizePending);
+                                if (!finalImminent) {
+                                    maybeRescueSpeakFromPartial(action, now, currentUtteranceSeq);
+                                }
+
                                 laughDet.notifySpeechState(speech, now);
                                 if (frameCount % 30 == 0) {
                                     Config.logDebug(String.format("★VAD状況: speech=%s, silence=%d, peak=%d, bufSize=%d",
@@ -3548,21 +3702,51 @@ public class MobMateWhisp implements NativeKeyListener {
                                                     handleFinalText(rescueText, action, true);
                                                 } else {
                                                     final long uttSeq = currentUtteranceSeq;
-                                                    Config.logDebug("★Final send");
-                                                    transcribe(finalChunk, action, true, uttSeq);
-                                                    // ★ADD: 発話（Final）ごとに mic_debug_0..4.wav をローテで上書き
-                                                    if (micDump && finalChunk.length > 0) {
-                                                        try {
-                                                            int idx = MIC_DUMP_SEQ.getAndIncrement() % MIC_DUMP_ROTATE;
-                                                            File out = new File("mic_debug_" + idx + ".wav");
-                                                            writePcm16leToWav(finalChunk, audioFormat, out);
-                                                            Config.logDebug("★MIC: wrote " + out.getAbsolutePath()
-                                                                    + " bytes=" + finalChunk.length + " (per-utterance)");
-                                                        } catch (Exception ex) {
-                                                            Config.logDebug("★MIC: per-utterance dump failed: " + ex);
+
+                                                    // ★ADD: 話者ゲート（speaker.enabled時のみ）
+                                                    boolean speakerOk = true;
+                                                    if (prefs.getBoolean("speaker.enabled", false)
+                                                            && speakerProfile.isReady()) {
+                                                        speakerOk = speakerProfile.isMatchingSpeaker(finalChunk);
+                                                        if (!speakerOk) {
+                                                            Config.logDebug("★Speaker REJECTED: sim="
+                                                                    + String.format("%.3f", speakerProfile.similarity(finalChunk))
+                                                                    + " bytes=" + finalChunk.length);
                                                         }
+                                                        updateSpeakerStatus();
                                                     }
 
+                                                    if (speakerOk) {
+                                                        Config.logDebug("★Final send");
+                                                        transcribe(finalChunk, action, true, uttSeq);
+
+                                                        // ★話者プロファイル微調整＆定期保存
+                                                        if (prefs.getBoolean("speaker.enabled", false)
+                                                                && speakerProfile.isReady()) {
+                                                            boolean shouldSave = speakerProfile.refineSample(finalChunk);
+                                                            if (shouldSave) {
+                                                                speakerProfile.saveToFile(new File("speaker_profile.dat"));
+                                                            }
+                                                        }
+
+                                                        // ★Mic debug wav (既存処理そのまま)
+                                                        if (micDump && finalChunk.length > 0) {
+                                                            try {
+                                                                int idx = MIC_DUMP_SEQ.getAndIncrement() % MIC_DUMP_ROTATE;
+                                                                File out = new File("mic_debug_" + idx + ".wav");
+                                                                writePcm16leToWav(finalChunk, audioFormat, out);
+                                                                Config.logDebug("★MIC: wrote " + out.getAbsolutePath()
+                                                                        + " bytes=" + finalChunk.length + " (per-utterance)");
+                                                            } catch (Exception ex) {
+                                                                Config.logDebug("★MIC: per-utterance dump failed: " + ex);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        // 話者不一致 → transcribeスキップ
+                                                        Config.logDebug("★Speaker gate: utterance blocked (not matching speaker)");
+                                                        SwingUtilities.invokeLater(() ->
+                                                                window.setTitle(UiText.t("ui.title.rec")));
+                                                    }
                                                 }
                                             } catch (Exception ex) {
                                                 Config.logError("Final error", ex);
@@ -3812,17 +3996,18 @@ public class MobMateWhisp implements NativeKeyListener {
         });
     }
     // === Final確定の共通処理（rescueでも必ずここを通す） ===
-    // ★ADD: final text de-dup
-    private volatile String lastFinalText = null;
-    private volatile long lastFinalTextMs = 0;
-    // === Final確定の共通処理（rescueでも必ずここを通す） ===
     private String lastSpeakStr = "";
     private long lastSpeakMs = 0;
-
     private void handleFinalText(String finalStr, Action action, boolean flgRescue) {
         if (finalStr == null) return;
         String s = finalStr.replace('\n',' ').replace('\r',' ').replace('\t',' ').trim();
         if (s.isEmpty()) return;
+
+        // ★繰り返しスパム検出（問答無用で削除）
+        if (isRepeatingSpam(s)) {
+            Config.logDebug("★Final skip (repeating spam): " + (s.length() > 100 ? s.substring(0, 100) + "..." : s));
+            return;
+        }
 
         // ★BGMチェック
         String lower = s.toLowerCase();
@@ -3837,20 +4022,32 @@ public class MobMateWhisp implements NativeKeyListener {
             return;
         }
 
-        // ★同一文の連続を捨てすぎない（内部二重発火だけ潰す）
-        if (flgRescue) {
-            long now = System.currentTimeMillis();
-            if (lastSpeakStr.equals(s) && (now - lastSpeakMs) <= 250) {
-                Config.logDebug("★Final skip (lastSpeak<250ms): " + s);
+        // ★同一文の連続を捨てすぎない(内部二重発火だけ潰す)
+        // ★★修正: 前回発話と同じ、または前回発話で始まる場合もブロック
+        long now = System.currentTimeMillis();
+        if (!lastSpeakStr.isEmpty() && (now - lastSpeakMs) <= 3000) {  // ★3秒以内
+            // 完全一致 → 捨てる
+            if (lastSpeakStr.equals(s)) {
+                Config.logDebug("★Final skip (exact dup <3s): " + s);
                 return;
             }
-            lastSpeakMs = now;
+            // 前回が今回で始まる(前回の方が短い) → 前回を上書きして今回を処理
+            if (lastSpeakStr.startsWith(s)) {
+                Config.logDebug("★Final skip (shorter <3s): prev=[" + lastSpeakStr + "] new=[" + s + "]");
+                return;
+            }
+            // 今回が前回で始まる(今回の方が長い) → 前回を上書きして今回を処理
+            if (s.startsWith(lastSpeakStr)) {
+                Config.logDebug("★Final update (longer <3s): prev=[" + lastSpeakStr + "] new=[" + s + "]");
+                // ここでは return しない → 下で lastSpeakStr を更新して処理続行
+            }
         }
+        lastSpeakMs = now;
+        lastSpeakStr = s;
 
         final String out = s;
-        lastSpeakStr = out;
 
-        // アクション（タイプ/貼り付け）
+        // アクション(タイプ/貼り付け)
         SwingUtilities.invokeLater(() -> {
             if (action == Action.TYPE_STRING) {
                 try { new RobotTyper().typeString(out, 11); } catch (Exception ignore) {}
@@ -3875,7 +4072,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 }
             }
         });
-        // ★読み上げ（Hearing経路だけ抑制）
+        // ★読み上げ(Hearing経路だけ抑制)
         if (action != Action.NOTHING_NO_SPEAK) {
             // 履歴
             SwingUtilities.invokeLater(() -> addHistory(out));
@@ -3887,6 +4084,19 @@ public class MobMateWhisp implements NativeKeyListener {
             });
         } else {
             Config.logDebug("speak skipped (hearing): " + out);
+        }
+    }
+    // ★繰り返しスパム検出: 同じフレーズが3回以上繰り返されてたらtrue
+    private boolean isRepeatingSpam(String text) {
+        if (text == null || text.length() < 20) return false;
+
+        // 2-20文字のパターンが3回以上繰り返される = (.{2,20})\1{2,}
+        try {
+//            Pattern p = Pattern.compile("(.{2,20})\\1{2,}");
+            Pattern p = Pattern.compile("(.{7,20})\\1{1,}"); // x2
+            return p.matcher(text).find();
+        } catch (Exception e) {
+            return false;
         }
     }
     private boolean containsLaughTokenByConfig(String text) {
@@ -3929,6 +4139,9 @@ public class MobMateWhisp implements NativeKeyListener {
     private static final long PARTIAL_RESCUE_MIN_SILENCE_MS = 40; // 無音が続いてる判定
     private static final long PARTIAL_RESCUE_COOLDOWN_MS = 400;    // 連発防止
     void maybeRescueSpeakFromPartial(Action action, long nowMs, long utteranceSeq) {
+        // ★ADD: Final処理中はrescueしない（セーフティネット）
+        if (isProcessingFinal.get()) return;
+
         String p = MobMateWhisp.getLastPartial();
         if (p == null) return;
         String s = p.trim();
@@ -3943,13 +4156,14 @@ public class MobMateWhisp implements NativeKeyListener {
 
         Config.logDebug("★Partial rescue -> maybeRescueSpeakFromPartial: " + s);
 
-        // ★超即時 short-partial
-        if (shouldInstantSpeakShortPartialForLowGain(s)
+        // ★超即時 short-partial → lowGainMicのみ（normal gainでは暴発の原因になる）
+        if (vad.getNoiseProfile().isLowGainMic
+                && shouldInstantSpeakShortPartialForLowGain(s)
                 && (nowMs - lastPartialUpdateMs) <= 80
                 && (nowMs - lastRescueSpeakMs) >= 500) {
             lastRescueSpeakMs = nowMs;
             MobMateWhisp.setLastPartial("");
-            Config.logDebug("★Instant short partial speak: " + s);
+            Config.logDebug("★Instant short partial speak (lowGain): " + s);
             if (utteranceSeq > 0) {
                 lastRescueUtteranceSeq = utteranceSeq;
                 lastRescueAtMs = nowMs;
@@ -3964,7 +4178,10 @@ public class MobMateWhisp implements NativeKeyListener {
         if (s.equalsIgnoreCase("BGM") || s.startsWith("BGM")) return;
 
         // 最低限:partial更新が止まっていて、かつ無音が続いている
-        boolean stale = (nowMs - lastPartialUpdateMs) >= PARTIAL_RESCUE_STALE_MS;
+        // ★短文（≤10文字）は900ms待ってfinalに任せる / 長文は従来通り90ms
+        int cpLen = s.codePointCount(0, s.length());
+        long staleThreshold = (cpLen <= 10) ? 900 : PARTIAL_RESCUE_STALE_MS;
+        boolean stale = (nowMs - lastPartialUpdateMs) >= staleThreshold;
         boolean silent = (lastSpeechEndTime > 0) && ((nowMs - lastSpeechEndTime) >= PARTIAL_RESCUE_MIN_SILENCE_MS);
         boolean cooldownOk = (nowMs - lastRescueSpeakMs) >= PARTIAL_RESCUE_COOLDOWN_MS;
 
@@ -4092,6 +4309,14 @@ public class MobMateWhisp implements NativeKeyListener {
             }
         }
 
+        // ★ADD: Final処理中のpartialは実行しない（レース防止）
+        // kickPartialTranscribeの投入時点ではisProcessingFinal=falseでも、
+        // executorで実行される頃にはFinalが始まっている可能性がある
+        if (!isEndOfCapture && isProcessingFinal.get()) {
+            Config.logDebug("★Partial transcribe aborted (final in progress)");
+            return "";
+        }
+
         String str = "";
         // ★追加ログ: 何秒の音声を投げてるか
         int bytes = (audioData == null) ? 0 : audioData.length;
@@ -4121,10 +4346,13 @@ public class MobMateWhisp implements NativeKeyListener {
             long t0 = System.currentTimeMillis();
             try {
                 setTranscribing(true);
-                str = w.transcribeRaw(audioData, action, MobMateWhisp.this);
+                str = w.transcribeRaw(audioData, action, MobMateWhisp.this, isEndOfCapture);
                 long dt = System.currentTimeMillis() - t0;
                 Config.logDebug("★TRANSCRIBE DONE ms=" + dt + " raw=" + (str == null ? "null" : ("len=" + str.length() + " text=" + str.replace("\n"," ").replace("\r"," "))));
                 if (str == null) return "";
+            } catch (Throwable t) {
+                Config.logError("[Whisper][RUN] crashed ms=" + (System.currentTimeMillis()-t0), t);
+                throw t;
             } finally {
                 setTranscribing(false);
                 transcribeBusy.set(false);
@@ -4286,20 +4514,16 @@ public class MobMateWhisp implements NativeKeyListener {
                 }
                 if (isEndOfCapture) {
                     instantFinalFromWhisper(finalStr, action);
-//                    CompletableFuture.runAsync(() -> {
-//                        speak(finalStr);
-//                        Config.appendOutTts(finalStr);
-//                        Config.logDebug("speak:" + finalStr);
-//                    });
-//                    SwingUtilities.invokeLater(() -> {
-//                        window.setTitle(cpugpumode);
-//                    });
                 }
             }
         });
 
         SwingUtilities.invokeLater(() -> {
             window.setTitle(cpugpumode);
+            // ★エンジン情報をステータスバーにも表示
+            if (engineLabel != null) {
+                engineLabel.setText(cpugpumode);
+            }
         });
 
         setTranscribing(false);
@@ -4318,6 +4542,12 @@ public class MobMateWhisp implements NativeKeyListener {
     }
     public synchronized void setRecording(boolean b) {
         this.recording = b;
+        // ★録音開始時に時刻を記録
+        if (b) {
+            recordingStartTime2 = System.currentTimeMillis();
+        } else {
+            recordingStartTime2 = 0;
+        }
         updateIcon();
     }
     private void updateIcon() {
@@ -4353,6 +4583,20 @@ public class MobMateWhisp implements NativeKeyListener {
                     MobMateWhisp.this.label.setText(UiText.t("ui.main.recording"));
                 } else {
                     MobMateWhisp.this.label.setText(UiText.t("ui.main.ready"));
+                }
+
+                // ★ステータスバーも更新
+                if (statusLabel != null) {
+                    if (tr) {
+                        statusLabel.setText("◉ TRANS");
+                        statusLabel.setForeground(new Color(255, 152, 0)); // オレンジ
+                    } else if (rec) {
+                        statusLabel.setText("● [REC]");
+                        statusLabel.setForeground(new Color(220, 53, 69)); // 赤
+                    } else {
+                        statusLabel.setText("▪ Ready");
+                        statusLabel.setForeground(UIManager.getColor("Label.foreground")); // 通常色
+                    }
                 }
 
                 Image img = tr ? MobMateWhisp.this.imageTranscribing
@@ -4398,6 +4642,14 @@ public class MobMateWhisp implements NativeKeyListener {
             return;
         }
         setRecording(false);
+
+        // ★話者プロファイルを保存（学習結果の永続化）
+        if (prefs.getBoolean("speaker.enabled", false) && speakerProfile.isReady()) {
+            speakerProfile.saveToFile(new File("speaker_profile.dat"));
+            Config.logDebug("★Speaker profile saved on stop (accepted="
+                    + speakerProfile.getTotalAccepted() + ")");
+        }
+        updateSpeakerStatus();
     }
     public void setModelPref(String name) {
         this.prefs.put("model", name);
@@ -4452,25 +4704,30 @@ public class MobMateWhisp implements NativeKeyListener {
                 e.printStackTrace();
             }
         });
-        keepAlive.setDaemon(false); // ★non-daemonにする
+        keepAlive.setDaemon(false);
         keepAlive.start();
-        try {
-            java.nio.file.Files.writeString(
-                    java.nio.file.Path.of("started_from_steam.txt"),
-                    java.time.LocalDateTime.now() + " pid=" + ProcessHandle.current().pid() + System.lineSeparator(),
-                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND
-            );
-        } catch (Exception ignore) {}
         SwingUtilities.invokeLater(() -> {
-            // 以下は元のコードと同じ
-            try {
-                UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-            FontBootstrap.registerBundledFonts();
+            // ===== FlatLaf Look&Feel =====
             Preferences p = Preferences.userRoot().node("MobMateWhispTalk");
             prefs = p;
+            try {
+                // 設定からテーマを読み込み（デフォルト：ダーク）
+                boolean isDark = p.getBoolean("ui.theme.dark", true);
+                if (isDark) {
+                    com.formdev.flatlaf.FlatDarkLaf.setup();
+                } else {
+                    com.formdev.flatlaf.FlatLightLaf.setup();
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+                // フォールバック：システムデフォルト
+                try {
+                    UIManager.setLookAndFeel(UIManager.getSystemLookAndFeelClassName());
+                } catch (Exception ex) {
+                    ex.printStackTrace();
+                }
+            }
+            FontBootstrap.registerBundledFonts();
             String suffix = p.get("ui.language", "en");
             UiFontApplier.applyDefaultUIFontBySuffix(suffix);
             if (!new File("_radiocmd.txt").exists()) {
@@ -4563,45 +4820,76 @@ public class MobMateWhisp implements NativeKeyListener {
     private Timer meterUpdateTimer;
     private final AtomicInteger meterSkipCounter = new AtomicInteger(0);
     private static final int METER_UPDATE_INTERVAL = 3; // 3フレームに1回
-
     private void openWindow() {
         this.window = new JFrame("MobMateWhispTalk");
+        this.window.setUndecorated(true); // ★タイトルバーを消す
         this.window.setIconImage(this.imageInactive);
         this.window.setFocusable(true);
         this.window.setFocusableWindowState(true);
         SwingUtilities.updateComponentTreeUI(this.window);
 
-        JPanel p = new JPanel();
-        p.setLayout(new BoxLayout(p, BoxLayout.X_AXIS));
-        p.add(Box.createHorizontalGlue());
-        p.add(Box.createHorizontalStrut(6));
+        // ★ウィンドウドラッグ移動を有効化
+        enableWindowDragging(this.window);
+
+        // ===== メインコンテンツパネル（コンパクト化） =====
+        JPanel mainPanel = new JPanel();
+        mainPanel.setLayout(new BoxLayout(mainPanel, BoxLayout.X_AXIS));
+        mainPanel.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6)); // 上下左右の余白を削減
+
         MobMateWhisp.this.window.setTitle(cpugpumode);
 
-        // ★入力音量メーター
-//        gainLabel = new JLabel("-dB| ░░░░░░░░");
-//        gainLabel.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 11));
-//        gainLabel.setForeground(Color.DARK_GRAY);
+        // ===== カスタムタイトルバー（ボタン類） =====
+        JPanel titleBar = new JPanel();
+        titleBar.setLayout(new BoxLayout(titleBar, BoxLayout.X_AXIS));
+        titleBar.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, UIManager.getColor("Separator.foreground")),
+                BorderFactory.createEmptyBorder(3, 6, 3, 6)
+        ));
+
+        // 左側：レベルメーター（広く取る）
         gainMeter = new GainMeter();
+        gainMeter.setFont(titleBar.getFont());
+        titleBar.add(gainMeter);
+        titleBar.add(Box.createHorizontalStrut(8));
 
-        JPanel bottomPanel = new JPanel();
-        bottomPanel.setLayout(new BoxLayout(bottomPanel, BoxLayout.X_AXIS));
-        gainMeter.setFont(bottomPanel.getFont());
-        bottomPanel.add(gainMeter);
-        bottomPanel.add(Box.createHorizontalGlue());
-
-        p.add(Box.createHorizontalStrut(8));
-        p.add(bottomPanel);
-        p.add(Box.createHorizontalStrut(6));
-        p.add(this.button);
+        // 中央：ボタン類
+        titleBar.add(this.button);
 
         final JButton historyButton = new JButton(UiText.t("ui.main.history"));
-        p.add(Box.createHorizontalStrut(6));
-        p.add(historyButton);
-        final JButton prefButton = new JButton(UiText.t("ui.main.prefs"));
-        p.add(Box.createHorizontalStrut(6));
-        p.add(prefButton);
+        titleBar.add(Box.createHorizontalStrut(4));
+        titleBar.add(historyButton);
 
-        this.window.setContentPane(p);
+        final JButton prefButton = new JButton(UiText.t("ui.main.prefs"));
+        titleBar.add(Box.createHorizontalStrut(4));
+        titleBar.add(prefButton);
+
+        // 右側：×ボタン
+        titleBar.add(Box.createHorizontalStrut(8));
+        JButton closeButton = createCloseButton();
+        titleBar.add(closeButton);
+
+        // ===== Ctrl+Shift+R でソフトリスタート =====
+        window.getRootPane().getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                .put(KeyStroke.getKeyStroke("ctrl shift R"), "softRestart");
+        window.getRootPane().getActionMap().put("softRestart", new AbstractAction() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                softRestart();
+            }
+        });
+
+        // ===== ステータスバー =====
+        statusBar = createStatusBar();
+
+        // ===== メインレイアウト =====
+        JPanel contentPane = new JPanel();
+        contentPane.setLayout(new BoxLayout(contentPane, BoxLayout.Y_AXIS));
+        contentPane.add(Box.createVerticalStrut(6));
+        contentPane.add(titleBar, BorderLayout.CENTER);
+        contentPane.add(Box.createVerticalStrut(4));
+        contentPane.add(statusBar, BorderLayout.SOUTH);
+
+        this.window.setContentPane(contentPane);
         this.label.setText(UiText.t("ui.main.transcribing"));
 
         this.window.pack();
@@ -4663,6 +4951,10 @@ public class MobMateWhisp implements NativeKeyListener {
                 if (meterUpdateTimer != null) {
                     meterUpdateTimer.stop();
                 }
+                // ★ステータス更新タイマーも停止
+                if (statusUpdateTimer != null) {
+                    statusUpdateTimer.stop();
+                }
                 Config.mirrorAllToCloud();
                 try {
                     if (hearingFrame != null) hearingFrame.shutdownForExit();
@@ -4677,6 +4969,9 @@ public class MobMateWhisp implements NativeKeyListener {
 
         // ★メーター更新タイマー開始
         startMeterUpdateTimer();
+
+        // ★ステータスバー更新タイマー開始
+        startStatusUpdateTimer();
 
         SwingUtilities.invokeLater(() -> {
             Timer timer = new Timer(1000, e -> {
@@ -4738,6 +5033,40 @@ public class MobMateWhisp implements NativeKeyListener {
                     } catch (Throwable ignore) {}
                 }
 
+                // ★ウィザード終了後、PopupMenuを再構築
+                prefButton.removeAll();
+                PopupMenu newPopup = createPopupMenu();
+                prefButton.add(newPopup);
+                // prefButtonのActionListenerも更新（既存のままだと古いpopupを参照）
+                for (ActionListener al : prefButton.getActionListeners()) {
+                    prefButton.removeActionListener(al);
+                }
+                PopupMenu finalNewPopup = newPopup;
+                prefButton.addActionListener(new ActionListener() {
+                    @Override
+                    public void actionPerformed(ActionEvent e) {
+                        rebuildVoiceVoxSpeakerMenu(engVvMenu, engVv, engListener, prefs);
+                        finalNewPopup.show((Component) e.getSource(), 0, 0);
+                    }
+                });
+
+                // ★ウィザード終了後、PopupMenuを再構築
+                prefButton.removeAll();
+                newPopup = createPopupMenu();
+                prefButton.add(newPopup);
+                // prefButtonのActionListenerも更新（既存のままだと古いpopupを参照）
+                for (ActionListener al : prefButton.getActionListeners()) {
+                    prefButton.removeActionListener(al);
+                }
+                PopupMenu finalNewPopup1 = newPopup;
+                prefButton.addActionListener(new ActionListener() {
+                    @Override
+                    public void actionPerformed(ActionEvent e) {
+                        rebuildVoiceVoxSpeakerMenu(engVvMenu, engVv, engListener, prefs);
+                        finalNewPopup1.show((Component) e.getSource(), 0, 0);
+                    }
+                });
+
 //                prefs.putBoolean("wizard.completed", true);
                 try { prefs.sync(); } catch (Exception ignore) {}
 
@@ -4766,6 +5095,255 @@ public class MobMateWhisp implements NativeKeyListener {
             } catch (Throwable t) {
                 Config.log("Wizard failed: " + t.getMessage());
                 t.printStackTrace();
+            }
+        });
+    }
+    // ===== ウィンドウドラッグ移動を有効化 =====
+    private void enableWindowDragging(JFrame frame) {
+        final Point[] dragOffset = new Point[1];
+
+        frame.addMouseListener(new java.awt.event.MouseAdapter() {
+            public void mousePressed(java.awt.event.MouseEvent e) {
+                dragOffset[0] = e.getPoint();
+            }
+        });
+
+        frame.addMouseMotionListener(new java.awt.event.MouseMotionAdapter() {
+            public void mouseDragged(java.awt.event.MouseEvent e) {
+                if (dragOffset[0] != null) {
+                    Point current = frame.getLocationOnScreen();
+                    frame.setLocation(
+                            current.x + e.getX() - dragOffset[0].x,
+                            current.y + e.getY() - dragOffset[0].y
+                    );
+                }
+            }
+        });
+    }
+    // ===== ×ボタン作成 =====
+    private JButton createCloseButton() {
+        JButton closeBtn = new JButton("×");
+        closeBtn.setFont(closeBtn.getFont().deriveFont(16f).deriveFont(java.awt.Font.BOLD));
+        closeBtn.setFocusPainted(false);
+        closeBtn.setBorderPainted(false);
+        closeBtn.setContentAreaFilled(false);
+        closeBtn.setPreferredSize(new Dimension(32, 24));
+        closeBtn.setToolTipText("Close");
+
+        // ホバー時の背景色
+        closeBtn.addMouseListener(new java.awt.event.MouseAdapter() {
+            public void mouseEntered(java.awt.event.MouseEvent evt) {
+                closeBtn.setContentAreaFilled(true);
+                closeBtn.setBackground(new Color(232, 17, 35)); // 赤
+                closeBtn.setForeground(Color.WHITE);
+            }
+            public void mouseExited(java.awt.event.MouseEvent evt) {
+                closeBtn.setContentAreaFilled(false);
+                closeBtn.setForeground(UIManager.getColor("Button.foreground"));
+            }
+        });
+
+        closeBtn.addActionListener(e -> {
+            if (isRecording()) {
+                stopRecording();
+            }
+            if (meterUpdateTimer != null) {
+                meterUpdateTimer.stop();
+            }
+            // ★ステータス更新タイマーも停止
+            if (statusUpdateTimer != null) {
+                statusUpdateTimer.stop();
+            }
+            Config.mirrorAllToCloud();
+            try {
+                if (hearingFrame != null) hearingFrame.shutdownForExit();
+            } catch (Throwable ignore) {}
+            System.exit(0);
+        });
+
+        return closeBtn;
+    }
+
+    // ===== ステータスバー作成（充実版） =====
+    private JPanel createStatusBar() {
+        JPanel statusBar = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 2));
+        statusBar.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(1, 0, 0, 0, UIManager.getColor("Separator.foreground")),
+                BorderFactory.createEmptyBorder(2, 6, 2, 6)
+        ));
+
+        // エンジン情報
+        engineLabel = new JLabel(cpugpumode);
+        engineLabel.setFont(engineLabel.getFont().deriveFont(11f));
+
+        // 状態表示（アイコン＋英語）
+        statusLabel = new JLabel("▪ Ready");
+        statusLabel.setFont(statusLabel.getFont().deriveFont(11f));
+        statusLabel.setForeground(UIManager.getColor("Label.foreground"));
+
+        // ★ラジオチャットホットキー表示（変更）
+        JLabel hotkeyLabel = new JLabel("R: " + getRadioHotkeyString());
+        hotkeyLabel.setFont(hotkeyLabel.getFont().deriveFont(11f));
+        hotkeyLabel.setToolTipText("Radio Chat Hotkey");
+
+        // ★利用モデル（追加）
+        String modelName = (model != null) ? model.replace("ggml-", "").replace(".bin", "") : "N/A";
+        modelLabel = new JLabel("Mdl:" + modelName);
+        modelLabel.setFont(modelLabel.getFont().deriveFont(11f));
+        modelLabel.setToolTipText("Whisper Model");
+
+        // ★話者照合ステータス
+        boolean spkEnabled = prefs.getBoolean("speaker.enabled", false);
+        boolean spkReady = spkEnabled && speakerProfile != null && speakerProfile.isReady();
+        speakerStatusLabel = new JLabel(spkReady ? "●SPK" : (spkEnabled ? "◎SPK" : "○SPK"));
+        speakerStatusLabel.setFont(speakerStatusLabel.getFont().deriveFont(11f));
+        speakerStatusLabel.setForeground(spkReady ? new Color(76, 175, 80) : (spkEnabled ? new Color(255, 193, 7) : Color.GRAY));
+        speakerStatusLabel.setToolTipText("Speaker Filter");
+
+        // ★VoiceVox接続状態
+        vvStatusLabel = new JLabel(voiceVoxAlive ? "●VV" : "○VV");
+        vvStatusLabel.setFont(vvStatusLabel.getFont().deriveFont(11f));
+        vvStatusLabel.setForeground(voiceVoxAlive ? new Color(76, 175, 80) : Color.GRAY);
+        vvStatusLabel.setToolTipText("VoiceVox Status");
+
+        // ★Voiceger接続状態（追加）
+        boolean vgAlive = isVoicegerAlive();
+        vgStatusLabel = new JLabel(vgAlive ? "●VG" : "○VG");
+        vgStatusLabel.setFont(vgStatusLabel.getFont().deriveFont(11f));
+        vgStatusLabel.setForeground(vgAlive ? new Color(76, 175, 80) : Color.GRAY);
+        vgStatusLabel.setToolTipText("Voiceger Status");
+
+        // ★録音時間
+        durationLabel = new JLabel("0:00");
+        durationLabel.setFont(durationLabel.getFont().deriveFont(11f));
+        durationLabel.setToolTipText("Recording Duration");
+
+        // ★メモリ使用量
+        Runtime runtime = Runtime.getRuntime();
+        long usedMB = (runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024;
+        memLabel = new JLabel("Mem: " + usedMB + "MB");
+        memLabel.setFont(memLabel.getFont().deriveFont(11f));
+        memLabel.setToolTipText("Memory Usage");
+
+        // バージョン
+        versionLabel = new JLabel("v" + Version.APP_VERSION);
+        versionLabel.setFont(versionLabel.getFont().deriveFont(11f));
+
+        // 区切り線（8本に増やす）
+        JSeparator sep1 = new JSeparator(SwingConstants.VERTICAL);
+        sep1.setPreferredSize(new Dimension(1, 12));
+        JSeparator sep2 = new JSeparator(SwingConstants.VERTICAL);
+        sep2.setPreferredSize(new Dimension(1, 12));
+        JSeparator sep3 = new JSeparator(SwingConstants.VERTICAL);
+        sep3.setPreferredSize(new Dimension(1, 12));
+        JSeparator sep4 = new JSeparator(SwingConstants.VERTICAL);
+        sep4.setPreferredSize(new Dimension(1, 12));
+        JSeparator sep5 = new JSeparator(SwingConstants.VERTICAL);
+        sep5.setPreferredSize(new Dimension(1, 12));
+        JSeparator sep6 = new JSeparator(SwingConstants.VERTICAL);
+        sep6.setPreferredSize(new Dimension(1, 12));
+        JSeparator sep7 = new JSeparator(SwingConstants.VERTICAL);
+        sep7.setPreferredSize(new Dimension(1, 12));
+        JSeparator sep8 = new JSeparator(SwingConstants.VERTICAL);
+        sep8.setPreferredSize(new Dimension(1, 12));
+
+        // 追加順序
+        statusBar.add(durationLabel);
+        statusBar.add(sep7);
+        statusBar.add(statusLabel);
+        statusBar.add(sep1);
+        statusBar.add(speakerStatusLabel);
+        JSeparator sepSpk = new JSeparator(SwingConstants.VERTICAL);
+        sepSpk.setPreferredSize(new Dimension(1, 12));
+        statusBar.add(sepSpk);
+        statusBar.add(vvStatusLabel);
+        statusBar.add(sep5);
+        statusBar.add(vgStatusLabel);
+        statusBar.add(sep6);
+//        statusBar.add(engineLabel);
+//        statusBar.add(sep2);
+        statusBar.add(hotkeyLabel);
+        statusBar.add(sep3);
+        statusBar.add(modelLabel);
+        statusBar.add(sep4);
+        statusBar.add(memLabel);
+        statusBar.add(sep8);
+        statusBar.add(versionLabel);
+
+        return statusBar;
+    }
+
+    // ===== ホットキー文字列取得 =====
+    private String getHotkeyString() {
+        StringBuilder sb = new StringBuilder();
+        if (ctrltHotkey) sb.append("Ctrl+");
+        if (shiftHotkey) sb.append("Shift+");
+        sb.append(hotkey);
+        return sb.toString();
+    }
+    // ===== ラジオチャットホットキー文字列取得（★追加） =====
+    private String getRadioHotkeyString() {
+        StringBuilder sb = new StringBuilder();
+
+        // Modifier
+        switch (radioModMask) {
+            case 1: sb.append("Shift+"); break;
+            case 2: sb.append("Ctrl+"); break;
+            case 3: sb.append("Ctrl+Shift+"); break;
+        }
+
+        // Key
+        String keyName = NativeKeyEvent.getKeyText(radioKeyCode);
+        sb.append(keyName);
+
+        return sb.toString();
+    }
+    // ===== Voiceger生存確認（★追加） =====
+    private boolean isVoicegerAlive() {
+        long now = System.currentTimeMillis();
+        return now < vgHealthOkUntilMs;
+    }
+    // ===== ステータスバー更新タイマー =====
+    private void startStatusUpdateTimer() {
+        if (statusUpdateTimer != null) {
+            statusUpdateTimer.stop();
+        }
+
+        statusUpdateTimer = new Timer(500, e -> updateStatusBar()); // 0.5秒ごとに更新
+        statusUpdateTimer.start();
+    }
+    private void updateStatusBar() {
+        SwingUtilities.invokeLater(() -> {
+            // VoiceVox接続状態を更新
+            if (vvStatusLabel != null) {
+                boolean alive = voiceVoxAlive;
+                vvStatusLabel.setText(alive ? "●VV" : "○VV");
+                vvStatusLabel.setForeground(alive ? new Color(76, 175, 80) : Color.GRAY);
+            }
+            // ★Voiceger接続状態を更新（追加）
+            if (vgStatusLabel != null) {
+                boolean vgAlive = isVoicegerAlive();
+                vgStatusLabel.setText(vgAlive ? "●VG" : "○VG");
+                vgStatusLabel.setForeground(vgAlive ? new Color(76, 175, 80) : Color.GRAY);
+            }
+
+            // 録音時間を更新
+            if (durationLabel != null) {
+                if (isRecording() && recordingStartTime2 > 0) {
+                    long elapsed = (System.currentTimeMillis() - recordingStartTime2) / 1000;
+                    long minutes = elapsed / 60;
+                    long seconds = elapsed % 60;
+                    durationLabel.setText(String.format("%d:%02d", minutes, seconds));
+                } else {
+                    durationLabel.setText("0:00");
+                }
+            }
+
+            // メモリ使用量を更新
+            if (memLabel != null) {
+                Runtime runtime = Runtime.getRuntime();
+                long usedMB = (runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024;
+                memLabel.setText("Mem: " + usedMB + "MB");
             }
         });
     }
@@ -4844,7 +5422,7 @@ public class MobMateWhisp implements NativeKeyListener {
         if (gainMeter == null) return;
 
         // prefsから都度読む（UI表示用）
-        boolean autoGainEnabledNow = prefs.getBoolean("audio.autoGain", true);
+        boolean autoGainEnabledNow = prefs.getBoolean("audio.autoGain", false);
         float userGain = prefs.getFloat("audio.inputGainMultiplier", 1.0f);
 
         // 「最近喋ってたか？」判定：ここが無音で0へ戻すコア
@@ -5998,6 +6576,15 @@ public class MobMateWhisp implements NativeKeyListener {
     private int psHealthCounter = 0;
     private static final int PS_HEALTH_CHECK_INTERVAL = 3;
     public void playViaPowerShellAsync(File wavFile) {
+
+        // ★ファイルを読み込んでバイト配列に変換
+        try {
+            byte[] wavBytes = Files.readAllBytes(wavFile.toPath());
+            playViaPowerShellBytesAsync(wavBytes); // ★こっちを呼べば自動的にメーター更新される
+        } catch (Exception e) {
+            Config.logDebug("Failed to play wav file: " + e.getMessage());
+        }
+
         playExecutor.submit(() -> {
             synchronized (psLock) {
                 try {
@@ -6034,6 +6621,9 @@ public class MobMateWhisp implements NativeKeyListener {
     }
     public void playViaPowerShellBytesAsync(byte[] wavBytes) {
         if (wavBytes == null || wavBytes.length < 256) return;
+
+        // ★スピーカー出力レベルを計算してメーターに反映
+        updateSpeakerMeterFromWav(wavBytes);
 
         playExecutor.submit(() -> {
             synchronized (psLock) {
@@ -6074,6 +6664,63 @@ public class MobMateWhisp implements NativeKeyListener {
                 }
             }
         });
+    }
+    // ===== スピーカー出力レベル計算 =====
+    private void updateSpeakerMeterFromWav(byte[] wavBytes) {
+        if (wavBytes == null || wavBytes.length < 44) return;
+        if (gainMeter == null) return;
+
+        try {
+            // WAVヘッダーをスキップ（44バイト）
+            int dataStart = 44;
+            int dataLength = wavBytes.length - dataStart;
+
+            if (dataLength <= 0) return;
+
+            // RMS計算（16bit PCM想定）
+            long sumSquares = 0;
+            int sampleCount = 0;
+
+            for (int i = dataStart; i + 1 < wavBytes.length; i += 2) {
+                // 16bit little-endian
+                int sample = (short) ((wavBytes[i + 1] << 8) | (wavBytes[i] & 0xFF));
+                sumSquares += (long) sample * sample;
+                sampleCount++;
+            }
+
+            if (sampleCount == 0) return;
+
+            // RMS値を計算
+            double rms = Math.sqrt((double) sumSquares / sampleCount);
+
+            // dB計算（-60dB ～ 0dB）
+            double db = -60.0;
+            if (rms > 0) {
+                db = 20.0 * Math.log10(rms / 32768.0);
+                db = Math.max(-60.0, Math.min(0.0, db));
+            }
+
+            // レベル計算（0-100）
+            // -60dB = 0, 0dB = 100
+            int level = (int) ((db + 60.0) / 60.0 * 100.0);
+            level = Math.max(0, Math.min(100, level));
+
+            // メーターに反映
+            gainMeter.setSpeakerValue(level, db);
+
+            // 音声の長さに応じて自動的にリセット（再生終了後にメーターを下げる）
+            int durationMs = (sampleCount * 1000) / 16000; // 16kHz想定
+            Timer resetTimer = new Timer(durationMs, e -> {
+                if (gainMeter != null) {
+                    gainMeter.setSpeakerValue(0, -60.0);
+                }
+            });
+            resetTimer.setRepeats(false);
+            resetTimer.start();
+
+        } catch (Exception e) {
+            Config.logDebug("Failed to update speaker meter: " + e.getMessage());
+        }
     }
 
     private static boolean looksLikeWav(byte[] b) {
@@ -6432,7 +7079,8 @@ public class MobMateWhisp implements NativeKeyListener {
             Config.logError("Failed to load: " + path + " (" + e.getMessage() + ")", e);
             return false;
         }
-    }private List<File> copyDllsToExeDir(Backend b, File exeDir) {
+    }
+    private List<File> copyDllsToExeDir(Backend b, File exeDir) {
         List<File> copied = new ArrayList<>();
         for (String dep : b.deps) {
             File src = new File(b.dir, dep);
@@ -6558,6 +7206,254 @@ public class MobMateWhisp implements NativeKeyListener {
             Config.logError("RadioCmd load failed: " + e.getMessage(), e);
         }
     }
+
+
+    // ===== ソフトリスタート（プロセス内再初期化） =====
+    private void softRestart() {
+        Config.log("[SOFT_RESTART] ========== BEGIN ==========");
+        SwingUtilities.invokeLater(() -> {
+            try {
+                softRestartInternal();
+            } catch (Throwable t) {
+                Config.logError("[SOFT_RESTART] FAILED: " + t, t);
+                JOptionPane.showMessageDialog(window,
+                        "Soft restart failed:\n" + t.getMessage()
+                                + "\n\nFalling back to full restart.",
+                        "MobMate", JOptionPane.WARNING_MESSAGE);
+                restartSelf(true);
+            }
+        });
+    }
+
+    private void softRestartInternal() throws Exception {
+        // ===== Phase 1: クリーンアップ =====
+        Config.log("[SOFT_RESTART] Phase 1: cleanup");
+
+        // (0) 後で復元するためにHearingの開閉状態を記憶
+        final boolean hearingWasOpen =
+                (hearingFrame != null && hearingFrame.isVisible());
+        Config.log("[SOFT_RESTART] hearingWasOpen=" + hearingWasOpen);
+
+        // (1) 録音停止
+        if (isRecording()) {
+            Config.log("[SOFT_RESTART] stopping recording...");
+            stopRecording();
+        }
+
+        // (2) タイマー停止
+        if (meterUpdateTimer != null) {
+            meterUpdateTimer.stop();
+            meterUpdateTimer = null;
+        }
+        if (statusUpdateTimer != null) {
+            statusUpdateTimer.stop();
+            statusUpdateTimer = null;
+        }
+        Config.log("[SOFT_RESTART] timers stopped");
+
+        // (3) PSサーバー停止
+        synchronized (psLock) {
+            stopPsServerLocked();
+        }
+        Config.log("[SOFT_RESTART] PSServer stopped");
+
+        // (4) HearingFrame停止
+        try {
+            if (hearingFrame != null) {
+                hearingFrame.shutdownForExit();
+                hearingFrame.setVisible(false);
+                hearingFrame.dispose();
+                hearingFrame = null;
+                hearingActive = false;
+            }
+        } catch (Throwable ignore) {}
+
+        // (5) Hearing用Whisper解放
+        synchronized (hearingWhisperLock) {
+            wHearing = null;
+        }
+        hw = null;  // ★transcribeHearingRaw用キャッシュもクリア
+
+        // (6) HistoryFrame閉じる
+        if (historyFrame != null) {
+            try {
+                historyFrame.setVisible(false);
+                historyFrame.dispose();
+            } catch (Throwable ignore) {}
+            historyFrame = null;
+        }
+
+        // (7) トレイアイコン削除
+        if (trayIcon != null && SystemTray.isSupported()) {
+            try {
+                SystemTray.getSystemTray().remove(trayIcon);
+            } catch (Throwable ignore) {}
+            trayIcon = null;
+        }
+
+        // (8) ウィンドウ位置保存 → dispose
+        if (window != null) {
+            saveBoundsNow(window, "ui.main");
+            window.setVisible(false);
+            window.dispose();
+            window = null;
+        }
+        Config.log("[SOFT_RESTART] UI disposed");
+
+        // (9) VAD / ノイズプロファイル リセット
+        sharedNoiseProfile = new AdaptiveNoiseProfile();
+        vad = new ImprovedVAD(sharedNoiseProfile);
+        vadPrimed = false;
+        isCalibrationComplete = false;
+        lastCalibratedInputDevice = "";
+
+        // (9.5) ラジオオーバーレイ破棄 + 一時状態リセット
+        if (radioOverlay != null) {
+            try {
+                radioOverlay.setVisible(false);
+                radioOverlay.dispose();
+            } catch (Throwable ignore) {}
+            radioOverlay = null;
+            radioOverlayArea = null;
+            radioOverlayPanel = null;
+        }
+        radioHeld = false;
+        radioConsumed = false;
+        radioPage = 0;
+        Config.log("[SOFT_RESTART] RadioOverlay disposed, state reset");
+
+        // (10) 各種フラグリセット
+        recording = false;
+        transcribing = false;
+        isPriming = false;
+        hotkeyPressed = false;
+        transcribeBusy.set(false);
+        isStartingRecording.set(false);
+        isProcessingFinal.set(false);
+        isProcessingPartial.set(false);
+        lastPartialResult.set("");
+        earlyFinalizeRequested = false;
+        pendingLaughAppend = false;
+        pendingLaughText = null;
+        lastOutput = null;
+        Config.log("[SOFT_RESTART] Phase 1 complete");
+
+        // ===== Phase 2: 再初期化 =====
+        Config.log("[SOFT_RESTART] Phase 2: reinitialize");
+
+        // (1) Config再読み込み
+        Config.syncAllFromCloud();
+
+        // (2) UiText再読み込み
+        UiText.load(UiLang.resolveUiFile(prefs.get("ui.language", "en")));
+
+        // (3) フォント再適用（順序重要：family設定→サイズ上書き）
+        FontBootstrap.registerBundledFonts();
+        String suffix = prefs.get("ui.language", "en");
+        UiFontApplier.applyDefaultUIFontBySuffix(suffix);  // family設定（size=12固定）
+        int fontSize = prefs.getInt("ui.font.size", 14);   // ★デフォルト16に修正
+        applyUIFont(fontSize);                              // ★ユーザーサイズで上書き
+
+        // (4) Whisperモデル再読み込み（DLLは既ロードなのでスキップ）
+        try {
+            File dir = new File(model_dir);
+            model = prefs.get("model", model);
+            File modelFile = new File(dir, model);
+            if (modelFile.exists()) {
+                this.w = new LocalWhisperCPP(modelFile, "");
+                Config.log("[SOFT_RESTART] Whisper model reloaded: " + model);
+            } else {
+                Config.logError("[SOFT_RESTART] Model not found: " + modelFile, null);
+            }
+        } catch (Throwable t) {
+            Config.logError("[SOFT_RESTART] Whisper reload failed: " + t, t);
+        }
+
+        // (5) SpeakerProfile再作成
+        this.speakerProfile = new SpeakerProfile(
+                prefs.getInt("speaker.enroll_samples", 5),
+                prefs.getFloat("speaker.threshold_initial", 0.60f),
+                prefs.getFloat("speaker.threshold_target", 0.82f)
+        );
+
+        // (6) 各種設定再読み込み
+        String laughSetting = Config.getString("laughs", "ワハハハハハ");
+        laughOptions = laughSetting.split(",");
+        for (int i = 0; i < laughOptions.length; i++) {
+            laughOptions[i] = laughOptions[i].trim();
+        }
+        this.hotkey = prefs.get("hotkey", "F9");
+        this.shiftHotkey = prefs.getBoolean("shift-hotkey", false);
+        this.ctrltHotkey = prefs.getBoolean("ctrl-hotkey", false);
+        lowGpuMode = prefs.getBoolean("perf.low_gpu_mode", true);
+        useAlternateLaugh = prefs.getBoolean("silence.alternate", false);
+        autoGainEnabled = prefs.getBoolean("audio.autoGain", true);
+        reloadAudioPrefsForMeter();
+        loadRadioHotkeyFromPrefs();
+
+        // (6.5) ラジオチャット設定再読み込み
+        loadRadioCmdFileToPrefs(prefs, new File("_radiocmd.txt"));
+        radioCmdLastLoadedMtime = 0L;   // 強制リロード
+        reloadRadioCmdCacheIfUpdated();
+        loadOverlayConfigFromOuttts();
+        Config.log("[SOFT_RESTART] RadioChat config reloaded");
+
+        // (7) ボタン・ラベル再作成
+        this.button = new JButton(UiText.t("ui.main.start"));
+        label.setText(UiText.t("ui.main.ready"));
+
+        // (8) VoiceVoxステータスリセット（再起動はしない＝既に動いてる可能性）
+        lastVoiceVoxCheckMs = 0;
+        vgHealthOkUntilMs = 0L;
+
+        // (9) PSサーバー再起動
+        try {
+            startPsServer();
+        } catch (Throwable t) {
+            Config.logError("[SOFT_RESTART] PSServer restart failed: " + t, t);
+        }
+
+        // (10) Voiceger再確認
+        String engine = prefs.get("tts.engine", "auto").toLowerCase(Locale.ROOT);
+        if (engine.contains("voiceger")) {
+            VoicegerManager.ensureRunningIfEnabledAsync(prefs);
+        }
+
+        // (11) トレイアイコン再作成
+        try {
+            createTrayIcon();
+        } catch (Throwable t) {
+            Config.logError("[SOFT_RESTART] TrayIcon failed: " + t, t);
+        }
+
+        // (12) ウィンドウ再作成
+        openWindow();
+
+        // (13) HearingFrameが開いていたなら復元
+        if (hearingWasOpen) {
+            try {
+                showHearingWindow();
+                Config.log("[SOFT_RESTART] HearingFrame restored");
+            } catch (Throwable t) {
+                Config.logError("[SOFT_RESTART] HearingFrame restore failed: " + t, t);
+            }
+        }
+
+        Config.log("[SOFT_RESTART] ========== COMPLETE ==========");
+    }
+
+    /** ウィンドウ位置を即座にprefsへ保存（dispose前用） */
+    private void saveBoundsNow(JFrame frame, String prefix) {
+        if (frame == null) return;
+        Rectangle b = frame.getBounds();
+        if (b.width <= 0 || b.height <= 0) return;
+        prefs.putInt(k(prefix, "x"), b.x);
+        prefs.putInt(k(prefix, "y"), b.y);
+        prefs.putInt(k(prefix, "w"), b.width);
+        prefs.putInt(k(prefix, "h"), b.height);
+        try { prefs.flush(); } catch (Exception ignore) {}
+    }
+
     private static void restartSelf(boolean issyncneed) {
         try {
             String javaBin = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java";
@@ -6616,6 +7512,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
 
 class GainMeter extends JComponent {
+    // ★マイク入力用
     private int targetLevel;         // 0-100
     private double targetDb;         // -60..0
     private boolean auto;
@@ -6627,6 +7524,16 @@ class GainMeter extends JComponent {
 
     private int peakHold = 0;        // 0-100
     private long peakHoldAt = 0;
+
+    // ★スピーカー出力用（追加）
+    private int targetSpeakerLevel = 0;
+    private double targetSpeakerDb = -60.0;
+
+    private float dispSpeakerLevel = 0f;
+    private double dispSpeakerDb = -60.0;
+
+    private int speakerPeakHold = 0;
+    private long speakerPeakHoldAt = 0;
 
     private final Timer animTimer;
 
@@ -6712,12 +7619,18 @@ class GainMeter extends JComponent {
             this.targetDb = db;
         }
     }
+    // ★スピーカー出力レベル設定（追加）
+    public void setSpeakerValue(int level, double db) {
+        this.targetSpeakerLevel = Math.max(0, Math.min(100, level));
+        this.targetSpeakerDb = db;
+    }
 
     private void animateStep() {
         // 攻撃(上がる)は速く、リリース(下がる)はゆっくり
         float attack = 0.35f;
         float release = 0.12f;
 
+        // ★マイク入力のアニメーション
         float t = targetLevel;
         float a = (t > dispLevel) ? attack : release;
         dispLevel += (t - dispLevel) * a;
@@ -6729,7 +7642,19 @@ class GainMeter extends JComponent {
         if (targetLevel == 0 && dispLevel < 0.6f) dispLevel = 0f;
         if (targetDb <= -59.9 && dispDb < -59.5) dispDb = -60.0;
 
-        // ピークホールド（700ms保持→ゆっくり落下）
+        // ★スピーカー出力のアニメーション（追加）
+        float ts = targetSpeakerLevel;
+        float as = (ts > dispSpeakerLevel) ? attack : release;
+        dispSpeakerLevel += (ts - dispSpeakerLevel) * as;
+
+        double tsd = targetSpeakerDb;
+        double asd = (tsd > dispSpeakerDb) ? 0.35 : 0.12;
+        dispSpeakerDb += (tsd - dispSpeakerDb) * asd;
+
+        if (targetSpeakerLevel == 0 && dispSpeakerLevel < 0.6f) dispSpeakerLevel = 0f;
+        if (targetSpeakerDb <= -59.9 && dispSpeakerDb < -59.5) dispSpeakerDb = -60.0;
+
+        // ★マイクピークホールド
         long now = System.currentTimeMillis();
         int lvlInt = Math.round(dispLevel);
         if (lvlInt >= peakHold) {
@@ -6739,6 +7664,18 @@ class GainMeter extends JComponent {
             long dt = now - peakHoldAt;
             if (dt > 700) {
                 peakHold = Math.max(lvlInt, peakHold - 1);
+            }
+        }
+
+        // ★スピーカーピークホールド（追加）
+        int speakerLvlInt = Math.round(dispSpeakerLevel);
+        if (speakerLvlInt >= speakerPeakHold) {
+            speakerPeakHold = speakerLvlInt;
+            speakerPeakHoldAt = now;
+        } else {
+            long dt = now - speakerPeakHoldAt;
+            if (dt > 700) {
+                speakerPeakHold = Math.max(speakerLvlInt, speakerPeakHold - 1);
             }
         }
 
@@ -6810,13 +7747,28 @@ class GainMeter extends JComponent {
             }
 
 
+            // ★左半分：マイク入力レベル
             int lvl = Math.max(0, Math.min(100, Math.round(dispLevel)));
-            int fillW = (int) (barW * (lvl / 100.0));
+            int halfW = barW / 2;
+            int fillW = (int) (halfW * (lvl / 100.0));
             Color c = colorFor(lvl);
-            // ★透明度を上げて、波形が見えるように
-            g2.setColor(new Color(c.getRed(), c.getGreen(), c.getBlue(), 90)); // 0-255（小さいほど透明）
+            g2.setColor(new Color(c.getRed(), c.getGreen(), c.getBlue(), 90));
             g2.fillRoundRect(barX, barY, Math.max(0, fillW), barH, 8, 8);
 
+            // ★右半分：スピーカー出力レベル
+            // ★右半分：スピーカー出力レベル（ピンク系）
+            int speakerLvl = Math.max(0, Math.min(100, Math.round(dispSpeakerLevel)));
+            int speakerFillW = (int) (halfW * (speakerLvl / 100.0));
+            Color speakerC = speakerColorFor(speakerLvl); // ★ピンク系の色に変更
+            g2.setColor(new Color(speakerC.getRed(), speakerC.getGreen(), speakerC.getBlue(), 90));
+            // 右側から左に向かって描画
+            int speakerStartX = barX + barW - speakerFillW;
+            g2.fillRoundRect(speakerStartX, barY, Math.max(0, speakerFillW), barH, 8, 8);
+
+            // ★中央の区切り線
+            int centerX = barX + halfW;
+            g2.setColor(new Color(255, 255, 255, 60));
+            g2.drawLine(centerX, barY, centerX, barY + barH);
 
             // 目盛り
             g2.setColor(new Color(255, 255, 255, 35));
@@ -6825,45 +7777,58 @@ class GainMeter extends JComponent {
                 g2.drawLine(x, barY + 2, x, barY + barH - 2);
             }
 
-            // ピークホールド線
-            int peakX = barX + (barW * peakHold) / 100;
+            // ★マイクピークホールド線（左半分）
+            int peakX = barX + (halfW * peakHold) / 100;
             g2.setColor(new Color(255, 255, 255, 170));
             g2.drawLine(peakX, barY, peakX, barY + barH);
+
+            // ★スピーカーピークホールド線（右半分）
+            int speakerPeakX = barX + halfW + (halfW * speakerPeakHold) / 100;
+            g2.setColor(new Color(255, 255, 255, 170));
+            g2.drawLine(speakerPeakX, barY, speakerPeakX, barY + barH);
 
             // 枠線
             g2.setColor(new Color(255, 255, 255, 60));
             g2.drawRoundRect(0, 0, w - 1, h - 1, 10, 10);
 
-            // 文字（dB + gain）
-            String dbStr = String.format("%+.1f dB", dispDb);
+            // ★マイク入力のdB + gain（左側）
+            String micDbStr = String.format("%+.1f dB", dispDb);
             float effective = userMul * autoMul;
             String gainStr;
             if (auto) {
-                // 実効倍率を表示（必要なら内訳も表示）
-                gainStr = String.format("A-x%.2f", effective);          // ←これが欲しいやつ
-                // gainStr = String.format("A-x%.2f (U-x%.2f)", effective, userMul); // 内訳出すならこっち
+                gainStr = String.format("A-x%.2f", effective);
             } else {
                 gainStr = (userMul > 1.01f) ? String.format("x%.1f", userMul) : "";
             }
-            String text = gainStr.isEmpty() ? dbStr : (dbStr + "  " + gainStr);
+            String micText = gainStr.isEmpty() ? micDbStr : (micDbStr + " " + gainStr);
+
+            // ★スピーカー出力のdB（右側）
+            String speakerText = String.format("%+.1f dB", dispSpeakerDb);
 
             g2.setFont(getFont().deriveFont(Font.BOLD, Math.max(11f, h * 0.55f)));
 
             // ★dBテキスト：左下寄せ＆一回り小さく
             Font base = getFont();
-            Font small = base.deriveFont(Math.max(10f, base.getSize2D() * 0.85f)); // 小さめ
+            Font small = base.deriveFont(Math.max(9f, base.getSize2D() * 0.75f)); // さらに小さめ
             g2.setFont(small);
 
             FontMetrics fm = g2.getFontMetrics();
-            int tx = barX + 6;
-            int ty = barY + barH - 6; // 左下
+            int ty = barY + barH - 4; // 下寄せ
 
-            // 文字が読みやすいように、うっすら影
+            // ★マイク入力テキスト（左下）
+            int micTx = barX + 4;
             g2.setColor(new Color(0, 0, 0, 140));
-            g2.drawString(text, tx + 1, ty + 1);
-
+            g2.drawString(micText, micTx + 1, ty + 1);
             g2.setColor(new Color(235, 235, 235, 220));
-            g2.drawString(text, tx, ty);
+            g2.drawString(micText, micTx, ty);
+
+            // ★スピーカー出力テキスト（右下）
+            int speakerTextW = fm.stringWidth(speakerText);
+            int speakerTx = barX + barW - speakerTextW - 4;
+            g2.setColor(new Color(0, 0, 0, 140));
+            g2.drawString(speakerText, speakerTx + 1, ty + 1);
+            g2.setColor(new Color(235, 235, 235, 220));
+            g2.drawString(speakerText, speakerTx, ty);
 
             g2.setComposite(AlphaComposite.SrcOver);
 
@@ -6877,6 +7842,13 @@ class GainMeter extends JComponent {
         if (level >= 60) return new Color(255, 150, 40);
         if (level >= 30) return new Color(60, 180, 90);
         return new Color(120, 120, 120);
+    }
+    // ★スピーカー出力用：ピンク系グラデーション
+    private static Color speakerColorFor(int level) {
+        if (level >= 80) return new Color(220, 20, 100);   // クリムゾンピンク（高音量）
+        if (level >= 60) return new Color(255, 20, 147);   // ディープピンク
+        if (level >= 30) return new Color(255, 105, 180);  // ホットピンク
+        return new Color(180, 140, 160);                   // グレーピンク（低音量）
     }
 }
 

@@ -68,11 +68,11 @@ public class HistoryRowPanel extends JPanel {
 
             set.remove(word);
             set.add(word);
-            label.setForeground(Color.LIGHT_GRAY);
+            label.setForeground(getNgTextColor());
         } else {
 
             set.remove(word);
-            label.setForeground(Color.BLACK);
+            label.setForeground(getNormalTextColor());
         }
         Config.saveIgnoreSet(set);
         LocalWhisperCPP.markIgnoreDirty();
@@ -81,9 +81,9 @@ public class HistoryRowPanel extends JPanel {
     public void setNG(boolean ng) {
         this.ng = ng;
         if (ng) {
-            label.setForeground(Color.LIGHT_GRAY);
+            label.setForeground(getNgTextColor());
         } else {
-            label.setForeground(Color.BLACK);
+            label.setForeground(getNormalTextColor());
         }
     }
 
@@ -99,10 +99,10 @@ public class HistoryRowPanel extends JPanel {
         if (good) {
             set.remove(word);
             set.add(word);
-            label.setForeground(new Color(255, 153, 51));
+            label.setForeground(getGoodTextColor());
         } else {
             set.remove(word);
-            label.setForeground(Color.BLACK);
+            label.setForeground(getNormalTextColor());
         }
         Config.saveGoodSet(set);
         LocalWhisperCPP.markInitialPromptDirty();
@@ -111,9 +111,9 @@ public class HistoryRowPanel extends JPanel {
     public void setGood(boolean good) {
         this.good = good;
         if (good) {
-            label.setForeground(new Color(255, 153, 51));
+            label.setForeground(getGoodTextColor());
         } else {
-            label.setForeground(Color.BLACK);
+            label.setForeground(getNormalTextColor());
         }
     }
 
@@ -133,7 +133,7 @@ public class HistoryRowPanel extends JPanel {
     }
     private void applyDictionaryRegisteredStyle() {
 
-        label.setForeground(new Color(100, 140, 255));
+        label.setForeground(getDictTextColor());
         repaint();
     }
     // ★AddRC: ポップアップ（p0..p2 / 1..9）を出して登録
@@ -174,7 +174,7 @@ public class HistoryRowPanel extends JPanel {
                         mob.upsertRadioCmd(fp, fd, text);
 
                         // 見た目上ちょい色（登録した感）
-                        label.setForeground(new Color(120, 120, 120));
+                        label.setForeground(getRegisteredTextColor());
                         repaint();
                     } catch (Exception ex) {
                         JOptionPane.showMessageDialog(
@@ -195,10 +195,53 @@ public class HistoryRowPanel extends JPanel {
         popup.pack();
         popup.show(invoker, 0, 0);
     }
+
     private static String shortText(String s, int max) {
         if (s == null) return "";
         s = s.trim().replace("\r", "").replace("\n", " ");
         if (s.length() <= max) return s;
         return s.substring(0, Math.max(0, max - 1)) + "…";
+    }
+
+    // ===== FlatLaf対応：テーマに応じた色を返す =====
+    private Color getNormalTextColor() {
+        Color fg = UIManager.getColor("Label.foreground");
+        return (fg != null) ? fg : Color.BLACK;
+    }
+
+    private Color getNgTextColor() {
+        // ダークモード時は明るめ、ライトモード時は暗めのグレー
+        return isDarkMode()
+                ? new Color(160, 160, 160)  // ダーク時：明るいグレー
+                : new Color(140, 140, 140); // ライト時：暗めのグレー
+    }
+
+    private Color getGoodTextColor() {
+        // オレンジ系（ダークモード時は少し明るく）
+        return isDarkMode()
+                ? new Color(255, 180, 80)   // ダーク時：明るいオレンジ
+                : new Color(255, 153, 51);  // ライト時：通常のオレンジ
+    }
+
+    private Color getDictTextColor() {
+        // 青系（ダークモード時は明るく）
+        return isDarkMode()
+                ? new Color(120, 180, 255)  // ダーク時：明るい青
+                : new Color(100, 140, 255); // ライト時：通常の青
+    }
+
+    private Color getRegisteredTextColor() {
+        // グレー系（ダークモード時は明るく）
+        return isDarkMode()
+                ? new Color(160, 160, 160)  // ダーク時：明るいグレー
+                : new Color(120, 120, 120); // ライト時：暗めのグレー
+    }
+
+    private boolean isDarkMode() {
+        Color bg = UIManager.getColor("Panel.background");
+        if (bg == null) return false;
+        // 背景色の明るさで判定（0.5以下ならダークモード）
+        int rgb = bg.getRed() + bg.getGreen() + bg.getBlue();
+        return rgb < 384; // (128 * 3)
     }
 }
