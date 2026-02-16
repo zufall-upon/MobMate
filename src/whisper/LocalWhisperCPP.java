@@ -18,19 +18,21 @@ public class LocalWhisperCPP {
     // initialPromptDirty is shared intentionally.
     private String language;
     private String initialPrompt;
-    private WhisperFullParams baseParamsGreedy;
-    private WhisperFullParams baseParamsBeam;
+    private final WhisperFullParams baseParamsGreedy;
+    private final WhisperFullParams baseParamsBeam;
     private static volatile boolean initialPromptDirty = true;
     private String cachedInitialPrompt = null;
     // ignore cache
+
     private static volatile boolean ignoreDirty = true;
     private List<String> cachedIgnoreWords = new ArrayList<>();
-    private List<Pattern> cachedIgnorePatterns = new ArrayList<>();
+    private final List<Pattern> cachedIgnorePatterns = new ArrayList<>();
     private String cachedIgnoreMode = "simple";
+    private boolean instanceIgnoreLoaded = false;   // ★追加
     public static volatile boolean dictionaryDirty = true;
-    private static WhisperCpp whisperMain = new WhisperCpp();
-    private static WhisperCpp whisperHearing = new WhisperCpp();
-    private WhisperCpp whisper; // ★staticを外してインスタンス変数に
+    private static final WhisperCpp whisperMain = new WhisperCpp();
+    private static final WhisperCpp whisperHearing = new WhisperCpp();
+    private final WhisperCpp whisper; // ★staticを外してインスタンス変数に
     private boolean isHearingMode = false; // ★Hearingモードかどうかのフラグ
     private volatile boolean lowGainMic = false;
     private volatile boolean hearingTranslateToEn = false;
@@ -65,6 +67,8 @@ public class LocalWhisperCPP {
         } else {
             this.whisper = whisperMain;
         }
+        // ★既存コンテキストを解放してからロード（ネイティブメモリリーク防止）
+//        try { whisper.close(); } catch (Throwable ignore) {}
         whisper.initContext(model);
 
         // ★Hearingモードは言語自動検出、プロンプトなし
@@ -220,14 +224,14 @@ public class LocalWhisperCPP {
             if (t == boolean.class) {
                 f.setBoolean(p, on);
             } else if (t == Boolean.class) {
-                f.set(p, Boolean.valueOf(on));
+                f.set(p, on);
             } else if (t == int.class) {
                 f.setInt(p, on ? 1 : 0);
             } else if (t.getSimpleName().equals("CBool")) {
                 f.set(p, on ? CBool.TRUE : CBool.FALSE);
             } else {
                 // last resort
-                f.set(p, Boolean.valueOf(on));
+                f.set(p, on);
             }
         } catch (Exception ignore) {
             // bindingsにフィールドが無い場合は何もしない
@@ -258,7 +262,7 @@ public class LocalWhisperCPP {
             }
         }
         cachedInitialPrompt =
-                prompt.length() > 0 ? prompt.toString() : null;
+                !prompt.isEmpty() ? prompt.toString() : null;
         initialPromptDirty = false;
         return cachedInitialPrompt;
     }
@@ -272,7 +276,7 @@ public class LocalWhisperCPP {
     }
 
     private void reloadIgnoreIfNeeded() {
-        if (!ignoreDirty) return;
+        if (!ignoreDirty && instanceIgnoreLoaded) return;   // ★変更
         cachedIgnoreMode = Config.get("ignore.mode", "simple");
         cachedIgnoreWords = Config.loadIgnoreWords();
         cachedIgnorePatterns.clear();
@@ -285,6 +289,7 @@ public class LocalWhisperCPP {
                 }
             }
         }
+        instanceIgnoreLoaded = true;    // ★追加
         ignoreDirty = false;
     }
 
@@ -391,8 +396,8 @@ public class LocalWhisperCPP {
             // 日本語も “文字” 扱い（isLetter が true になる）
         }
         if (total >= 20) {
-            double ratio = (total == 0) ? 0.0 : (good * 1.0 / total);
-            if (ratio < 0.15) return true; // 文字が15%未満ならゴミ扱い
+            double ratio = good * 1.0 / total;
+            return ratio < 0.15; // 文字が15%未満ならゴミ扱い
         }
 
         return false;
@@ -430,7 +435,6 @@ public class LocalWhisperCPP {
         }
     }
 
-    private int INSTANT_FINAL_MAX_CHARS = 12;
     // ★変更: シグネチャにisEndOfCapture追加（後方互換のためオーバーロード残す）
     public String transcribeRaw(byte[] pcmData, final MobMateWhisp.Action action, MobMateWhisp mobMateWhisp) throws IOException {
         return transcribeRaw(pcmData, action, mobMateWhisp, true); // 既存呼び出しはfinal扱い
@@ -472,7 +476,7 @@ public class LocalWhisperCPP {
             }
             // ★Partial暴走対策
             if (isGarbagePartial(raw)) {
-                Config.logDebug("★Partial dropped (garbage): len=" + (raw == null ? 0 : raw.length()));
+                Config.logDebug("★Partial dropped (garbage): len=" + raw.length());
                 raw = ""; // lastPartial/overlay/speak に流さない
             }
             // UI/ログ用は長さ制限（詰まり防止）
@@ -482,7 +486,7 @@ public class LocalWhisperCPP {
         } else {
             return "";
         }
-        INSTANT_FINAL_MAX_CHARS = (MobMateWhisp.isSilenceAlternate() && !lowGainMic) ? 12 : 10;
+        int INSTANT_FINAL_MAX_CHARS = (MobMateWhisp.isSilenceAlternate() && !lowGainMic) ? 12 : 10;
         int len = raw.codePointCount(0, raw.length());
         if (len <= INSTANT_FINAL_MAX_CHARS) {
             String fin = raw.trim();
@@ -505,6 +509,38 @@ public class LocalWhisperCPP {
         Config.logDebug("-1");
 //        LocalWhisperCPP w = new LocalWhisperCPP(new File("models", "ggml-small.bin"),"");
         Config.logDebug("-");
+    }
+    /**
+     * ★ネイティブのwhisperコンテキスト(モデル+KVキャッシュ)だけを解放する。
+     *
+     * WhisperCpp.close() は freeParams() → freeContext() の順で呼ぶが、
+     * freeParams() 内の JNA Native.free() がネイティブ SEGFAULT を起こし
+     * JVM ごと即死するケースがある（hs_err_pid*.log で確認済み）。
+     *
+     * そのためリフレクションで freeContext() だけを呼び、
+     * モデルメモリ (~3 GB) を安全に解放する。
+     * params はそのまま残るが、次の initContext() で上書きされるので問題ない。
+     */
+    public static void freeAllContexts() {
+        freeContextOnly(whisperMain,    "main");
+        freeContextOnly(whisperHearing, "hearing");
+        Config.log("★ Whisper native contexts freed (freeContext only, params kept)");
+    }
+
+    private static void freeContextOnly(WhisperCpp wc, String label) {
+        try {
+            java.lang.reflect.Method m =
+                    WhisperCpp.class.getDeclaredMethod("freeContext");
+            m.setAccessible(true);
+            m.invoke(wc);
+            Config.log("★ freeContextOnly(" + label + ") OK");
+        } catch (NoSuchMethodException nsm) {
+            // freeContext メソッドが存在しない場合（バインディング差異）
+            Config.logError("★ freeContextOnly(" + label
+                    + ") skipped: freeContext() not found in WhisperCpp", nsm);
+        } catch (Throwable t) {
+            Config.logError("★ freeContextOnly(" + label + ") failed", t);
+        }
     }
 }
 
@@ -679,9 +715,9 @@ class AdaptiveNoiseProfile {
 
         isCalibrated = true;
 
-        // ★修正: 低ゲインマイクの判定基準を大幅に緩和
-        // ノイズフロア10以下 または (ノイズフロア30以下 かつ 標準偏差20以下)
-        boolean looksLowGain = (noiseFloor <= 10) || (noiseFloor <= 30 && noiseStdDev <= 20);
+        // ★修正: 少数サンプルでの誤判定防止（samples<30ではLOW GAIN判定しない）
+        boolean looksLowGain = (noiseSamples.size() >= 30) &&
+                ((noiseFloor <= 10) || (noiseFloor <= 30 && noiseStdDev <= 20));
 
         if (looksLowGain) {
             isLowGainMic = true;
@@ -764,7 +800,7 @@ class AdaptiveNoiseProfile {
 }
 
 class ImprovedVAD extends SimpleVAD {
-    private AdaptiveNoiseProfile noiseProfile;
+    private final AdaptiveNoiseProfile noiseProfile;
     private static final int MAX_BUFFER_SIZE = 16000 * 30;
     private static final int WARN_BUFFER_SIZE = 16000 * 20;
     private int consecutiveSilenceFrames = 0;
@@ -987,18 +1023,11 @@ class LaughDetector {
     private double burstEnergySum = 0;
     private int zcrStableCount = 0;
 
-    private double zcrStableMin = 0.04;
-    private double zcrStableMax = 0.25;
-
     private long cooldownUntilMs = 0;
 
     private final ArrayDeque<Long> burstTimes = new ArrayDeque<>();
 
     private boolean lowGain = false;
-
-    private long cooldownMs = 1200;
-
-    private double midRatioMin = 0.12;
 
     public void setMinPeakForBurst(int v) { this.minPeakForBurst = Math.max(60, v); }
     public void setLowGain(boolean v) { this.lowGain = v; }
@@ -1047,7 +1076,7 @@ class LaughDetector {
         int coughThreshold = Math.max(coughAbsoluteMax, (int)(minPeakForBurst * 4.0f)); // 3.5 → 4.0
 
         if (peak > coughThreshold) {
-            if (debugLog && burstTimes.size() > 0) {
+            if (debugLog && !burstTimes.isEmpty()) {
                 Config.logDebug("[Laugh] Blocked by cough (peak=" + peak + " > " + coughThreshold + ")");
             }
             reset();
@@ -1056,7 +1085,7 @@ class LaughDetector {
 
         if (peak < minPeakForBurst) {
             cleanupOld(nowMs);
-            if (burstTimes.size() > 0 && debugLog) {
+            if (!burstTimes.isEmpty() && debugLog) {
                 Config.logDebug("[Laugh] peak=" + peak + " < minPeak=" + minPeakForBurst +
                         " (burstCount=" + burstTimes.size() + ")");
             }
@@ -1065,6 +1094,8 @@ class LaughDetector {
 
         // ZCR計算
         double zcr = calcZcr(pcm, len);
+        double zcrStableMax = 0.25;
+        double zcrStableMin = 0.04;
         boolean zcrOk = (zcr >= zcrStableMin && zcr <= zcrStableMax);
 
         if (debugLog && peak >= minPeakForBurst) {
@@ -1197,6 +1228,7 @@ class LaughDetector {
                 ", zcr=" + String.format("%.4f", zcr) +
                 ", peak=" + peak);
 
+        long cooldownMs = 1200;
         cooldownUntilMs = nowMs + cooldownMs;
         reset();
         return true;

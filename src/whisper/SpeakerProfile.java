@@ -2,15 +2,12 @@ package whisper;
 
 import java.io.*;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 /**
  * 話者照合プロファイル（Speaker Verification Profile）v3
- *
  * MFCCベースの話者照合。メル帯域にDCTを適用してケプストラム係数を算出し、
  * 平均＋標準偏差の26次元特徴量で話者を識別する。
- *
  * v2→v3変更点:
  *   - 20メル帯域 → 26メル帯域 + DCT → 13 MFCC
  *   - 特徴量: MFCC平均13 + MFCC標準偏差13 = 26次元（話者の声道構造＋動態を捉える）
@@ -261,7 +258,6 @@ public class SpeakerProfile {
     private double[] computeMelBands(double[] power) {
         double[] bands = new double[MEL_BANDS];
 
-        int nFft = FFT_SIZE;
         double nyquist = SAMPLE_RATE / 2.0;
 
         double melMin = hz2mel(100.0);
@@ -277,7 +273,7 @@ public class SpeakerProfile {
         int[] bin = new int[melPoints.length];
         for (int i = 0; i < melPoints.length; i++) {
             double hz = mel2hz(melPoints[i]);
-            bin[i] = (int) Math.floor(hz / nyquist * (nFft / 2));
+            bin[i] = (int) Math.floor(hz / nyquist * ((double) FFT_SIZE / 2));
             bin[i] = Math.max(0, Math.min(bin[i], power.length - 1));
         }
 

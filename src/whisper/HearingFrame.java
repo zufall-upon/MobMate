@@ -7,9 +7,8 @@ import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.BufferedReader;
 import java.io.File;
-import java.io.IOException;
 import java.io.InputStreamReader;
-import java.util.ArrayList;
+import java.nio.charset.StandardCharsets;
 import java.util.prefs.Preferences;
 import java.util.Base64;
 import java.awt.GraphicsEnvironment;
@@ -20,7 +19,6 @@ import java.awt.DisplayMode;
 public class HearingFrame extends JFrame {
 
     private final Preferences prefs;
-    private final Image icon;
     private final MobMateWhisp host;
 
     private JToggleButton toggle;
@@ -59,20 +57,24 @@ public class HearingFrame extends JFrame {
     // --- WASAPI loopback helper process ---
     private volatile Process loopProc;
     private volatile Thread loopProcThread;
+    private volatile boolean intentionalStop = false;
     // WASAPI ps1 process guard
     private final Object loopLock = new Object();
     private volatile Thread loopErrThread;
     private volatile boolean ignoreOutputEvent = false;
+    // ★WASAPI helper クラッシュ→再起動ループ抑止
+    private volatile int wasapiCrashCount = 0;
+    private volatile long wasapiFirstCrashMs = 0;
+    private static final int WASAPI_MAX_RETRIES = 5;
+    private static final long WASAPI_CRASH_WINDOW_MS = 15_000; // 15秒
 
     // PCMデバッグ用（1秒に1回だけログ）
-    private volatile long lastPcmDbgMs = 0;
     private Thread loopProcErrThread;
     private static final int HEARING_W = 380;
 
     public HearingFrame(Preferences prefs, Image icon, MobMateWhisp host) {
         super("MobMate Hearing (WIP)");
         this.prefs = prefs;
-        this.icon = icon;
         this.host = host;
 
         if (icon != null) setIconImage(icon);
@@ -102,6 +104,7 @@ public class HearingFrame extends JFrame {
 
     // ★JVM終了/メイン窓終了時に呼ぶ（Swing操作しない・プロセスだけ止める）
     public void shutdownForExit() {
+        try { intentionalStop = true; } catch (Throwable ignore) {}
         try { running = false; } catch (Throwable ignore) {}
         try { stopWasapiProc(); } catch (Throwable ignore) {}
 
@@ -465,7 +468,7 @@ public class HearingFrame extends JFrame {
 
             Process p = pb.start();
             try (java.io.BufferedReader br = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(p.getInputStream(), "UTF-8")
+                    new java.io.InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8)
             )) {
                 String line;
                 while ((line = br.readLine()) != null) {
@@ -642,6 +645,7 @@ public class HearingFrame extends JFrame {
     }
 
     private void startMonitor() {
+        wasapiCrashCount = 0;  // ★手動ON時にリトライカウンタリセット
         // ★二重起動防止：生きてたら再起動しない（必要なら stop→start に変える）
         synchronized (loopLock) {
             if (loopProc != null && loopProc.isAlive()) {
@@ -654,184 +658,13 @@ public class HearingFrame extends JFrame {
         final String deviceName = LOOPBACK_TOKEN; // ★常にループバック固定
 
         // ★Loopback は専用プロセスへ
-        if (LOOPBACK_TOKEN.equals(deviceName)) {
-            synchronized (loopLock) {
-                if (loopProc != null && loopProc.isAlive()) {
-                    Config.log("[Hearing][WASAPI] skip start: loopback process already running");
-                    return;
-                }
+        synchronized (loopLock) {
+            if (loopProc != null && loopProc.isAlive()) {
+                Config.log("[Hearing][WASAPI] skip start: loopback process already running");
+                return;
             }
-            startWasapiLoopbackProc();
-            return;
         }
-
-        String resolvedDevice = deviceName;
-        final String useDeviceName = resolvedDevice;
-        if (useDeviceName == null || useDeviceName.isEmpty() || useDeviceName.startsWith("(")) {
-            // ★Loopback選択で見つからない場合は理由を表示
-            if (LOOPBACK_TOKEN.equals(deviceName)) {
-                SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(
-                        this,
-                        "System Output (Loopback) を使うには、Windows側で「ステレオ ミキサー / Stereo Mix / What U Hear」等の録音デバイスを有効化する必要があります。\n"
-                                + "サウンド設定 → 録音 → 無効なデバイス表示 → ステレオミキサーを有効化 をお試しください。",
-                        "Hearing (Loopback)",
-                        JOptionPane.INFORMATION_MESSAGE
-                ));
-            }
-            SwingUtilities.invokeLater(() -> {
-                if (toggle != null) {
-                    ignoreToggleEvent = true;
-                    try {
-                        toggle.setSelected(false);
-                        toggle.setText("Hearing: OFF");
-                    } finally {
-                        ignoreToggleEvent = false;
-                    }
-                }
-            });
-            return;
-        }
-
-        running = true;
-
-        worker = new Thread(() -> {
-            TargetDataLine l = null;
-            try {
-                Mixer.Info picked = null;
-                for (Mixer.Info info : AudioSystem.getMixerInfo()) {
-                    if (useDeviceName.equals(info.getName())) { picked = info; break; }
-                }
-                if (picked == null) return;
-
-                Mixer mixer = AudioSystem.getMixer(picked);
-
-                AudioFormat[] tries = new AudioFormat[]{
-                        new AudioFormat(16000f, 16, 1, true, false),
-                        new AudioFormat(44100f, 16, 1, true, false),
-                        new AudioFormat(48000f, 16, 1, true, false),
-                        new AudioFormat(44100f, 16, 2, true, false),
-                };
-
-                Exception lastErr = null;
-                for (AudioFormat fmt : tries) {
-                    try {
-                        DataLine.Info li = new DataLine.Info(TargetDataLine.class, fmt);
-                        if (!mixer.isLineSupported(li)) continue; // ★選んだデバイスで判定
-                        l = (TargetDataLine) mixer.getLine(li);
-                        l.open(fmt); // ★余計な小細工しない方が安定
-                        break;
-                    } catch (Exception ex) {
-                        lastErr = ex;
-                        try { if (l != null) l.close(); } catch (Exception ignore) {}
-                        l = null;
-                    }
-                }
-                if (l == null) {
-                    if (lastErr != null) Config.logError("[Hearing] open failed: " + deviceName, lastErr);
-                    return;
-                }
-
-                line = l;
-                l.start();
-
-                byte[] buf = new byte[2048];
-                while (running) {
-                    int n = l.read(buf, 0, buf.length);
-                    if (n <= 0) continue;
-
-                    int peak = 0;
-                    for (int i = 0; i + 1 < n; i += 2) {
-                        int v = (short) ((buf[i + 1] << 8) | (buf[i] & 0xFF));
-                        int a = Math.abs(v);
-                        if (a > peak) peak = a;
-                    }
-                    int level = (int) Math.min(100, (peak / 32768.0) * 100.0);
-
-                    // ---- 波形データをメーターに渡す ----
-                    final byte[] bufCopy = new byte[n];
-                    System.arraycopy(buf, 0, bufCopy, 0, n);
-                    SwingUtilities.invokeLater(() -> {
-                        if (meter != null) {
-                            // GainMeterに波形データを渡すメソッドを仮定
-                            // meter.pushWaveform(bufCopy, n);
-                        }
-                    });
-
-                    // ---- Whisperへ投げるPCMを蓄積（できるだけ 16k/mono のときだけ）----
-                    if (line != null) {
-                        AudioFormat fmt = line.getFormat();
-                        boolean ok16kMono = (Math.abs(fmt.getSampleRate() - 16000f) < 1f) && (fmt.getChannels() == 1) && (fmt.getSampleSizeInBits() == 16);
-                        if (ok16kMono) {
-                            pcmAcc.write(buf, 0, n);
-
-                            // 1.2秒くらい溜まったら送る（雑に区切る：まず動かす用）
-                            int triggerBytes = (int)(16000 * 2 * 1.2);
-                            if (!transcribing && pcmAcc.size() >= triggerBytes) {
-                                transcribing = true;
-                                byte[] chunk = pcmAcc.toByteArray();
-                                pcmAcc.reset();
-
-                                new Thread(() -> {
-                                    try {
-//                                        host.transcribeHearingRaw(chunk);
-                                        submitHearingChunk(chunk, "MIC");
-                                    } finally {
-                                        transcribing = false;
-                                    }
-                                }, "hearing-whisper").start();
-                            }
-                        }
-                    }
-
-                    double db;
-                    if (peak <= 0) {
-                        db = -60.0;
-                    } else {
-                        db = 20.0 * Math.log10(peak / 32768.0);
-                        if (db < -60.0) db = -60.0;
-                        if (db > 0.0) db = 0.0;
-                    }
-
-                    final int lv = level;
-                    final double dbv = db;
-
-                    SwingUtilities.invokeLater(() -> {
-                        if (meter != null) {
-                            meter.setValue(lv, dbv, false, 1f, 1f, false);
-                        }
-                    });
-                }
-            } catch (Exception ex) {
-                Config.logError("[Hearing] monitor crashed", ex);
-            } finally {
-                try { if (l != null) { l.stop(); l.close(); } } catch (Exception ignore) {}
-                line = null;
-                running = false;
-                SwingUtilities.invokeLater(() -> {
-                    if (meter != null) {
-                        meter.setValue(0, -60.0, false, 1f, 1f, false);
-                    }
-                    pcmAcc.reset();
-
-                    transcribing = false;
-
-                    SwingUtilities.invokeLater(() -> {
-                        if (meter != null) {
-                            meter.setValue(0, -60.0, false, 1f, 1f, false);
-                        }
-                        pcmAcc.reset();
-                        transcribing = false;
-
-                        // ★勝手にOFFに戻さない（ユーザー操作と競合する）
-                        // hideOverlay(); // ←必要なら残してOK。まずは外して挙動確認おすすめ
-                    });
-                });
-
-            }
-        }, "hearing-monitor");
-
-        worker.setDaemon(true);
-        worker.start();
+        startWasapiLoopbackProc();
     }
 
     private void stopMonitor() {
@@ -839,6 +672,7 @@ public class HearingFrame extends JFrame {
     }
 
     private void stopMonitor(boolean updateToggleUi) {
+        intentionalStop = true;  // ★crash handler抑制
         running = false;
         stopWasapiProc(); // ★WASAPI ps1 を確実に止める
 
@@ -932,17 +766,17 @@ public class HearingFrame extends JFrame {
         if (partialHistory.isEmpty()) return "";
         StringBuilder sb = new StringBuilder(128);
         for (String t : partialHistory) {
-            if (sb.length() > 0) sb.append(" ... ");
+            if (!sb.isEmpty()) sb.append(" ... ");
             sb.append(t);
         }
         return sb.toString();
     }
-    private void submitHearingChunk(byte[] pcm16k16mono, String srcTag) {
+    private void submitHearingChunk(byte[] pcm16k16mono) {
 
         // ★メインがtranscribe中は、Hearing側でWhisperは叩かない（競合回避）
         // ただし字幕更新は止めない：メインの lastPartial を拾って overlay を更新する
         if (host.isTranscribing()) {
-            Config.logDebug("[Hearing][REC] main busy -> use main partial " + srcTag);
+            Config.logDebug("[Hearing][REC] main busy -> use main partial " + "LOOPBACK");
 
             String lp = MobMateWhisp.getLastPartial();
             if (lp != null && !lp.isEmpty()) {
@@ -956,7 +790,7 @@ public class HearingFrame extends JFrame {
         try {
             lastPartial = host.transcribeHearingRaw(pcm16k16mono);
         } catch (Exception ex) {
-            Config.log("[Hearing][REC] transcribeHearingRaw failed (" + srcTag + "): " + ex);
+            Config.log("[Hearing][REC] transcribeHearingRaw failed (" + "LOOPBACK" + "): " + ex);
             return;
         }
 
@@ -967,16 +801,15 @@ public class HearingFrame extends JFrame {
             setOverlayText(buildHistoryText() + " . ");
         } else {
             String lp = MobMateWhisp.getLastPartial();
-            if (lp != null && !lp.isEmpty()) {
+            if (lp != null && !lp.isEmpty()
+                    && !LocalWhisperCPP.isIgnoredStatic(lp)) {   // ★追加
                 pushPartialHistory(lp);
                 setOverlayText(buildHistoryText() + " . ");
-            } else {
-                // setOverlayText("Listening.");
             }
         }
 
         int len = (lastPartial == null) ? 0 : lastPartial.length();
-        Config.logDebug("[Hearing][REC] chunk ok (" + srcTag + ") partialLen=" + len);
+        Config.logDebug("[Hearing][REC] chunk ok (" + "LOOPBACK" + ") partialLen=" + len);
     }
 
 
@@ -1018,7 +851,7 @@ public class HearingFrame extends JFrame {
 
     private class HearingOverlayWindow extends JWindow {
         private final OutlineLabel label = new OutlineLabel();
-        private JPanel contentPanel;
+        private final JPanel contentPanel;
 
         HearingOverlayWindow() {
             super();
@@ -1041,13 +874,12 @@ public class HearingFrame extends JFrame {
         void updateSettings() {
             // 背景色
             String bgColor = prefs.get("hearing.overlay.bg_color", "green");
-            Color bg;
-            switch (bgColor) {
-                case "blue":  bg = new Color(30, 50, 90); break;
-                case "gray":  bg = new Color(40, 40, 40); break;
-                case "red":   bg = new Color(70, 30, 30); break;
-                default:      bg = new Color(30, 90, 50); break; // green
-            }
+            Color bg = switch (bgColor) {
+                case "blue" -> new Color(30, 50, 90);
+                case "gray" -> new Color(40, 40, 40);
+                case "red" -> new Color(70, 30, 30);
+                default -> new Color(30, 90, 50); // green
+            };
             contentPanel.setBackground(bg);
 
             // 透明度
@@ -1090,20 +922,20 @@ public class HearingFrame extends JFrame {
             int margin = 14;
             int x, y;
 
-            switch (position) {
-                case "bottom_right":
+            y = switch (position) {
+                case "bottom_right" -> {
                     x = screenBounds.x + screenBounds.width - getWidth() - margin;
-                    y = screenBounds.y + screenBounds.height - getHeight() - margin - 60;
-                    break;
-                case "top_center":
+                    yield screenBounds.y + screenBounds.height - getHeight() - margin - 60;
+                }
+                case "top_center" -> {
                     x = screenBounds.x + (screenBounds.width - getWidth()) / 2;
-                    y = screenBounds.y + margin;
-                    break;
-                default: // bottom_left
+                    yield screenBounds.y + margin;
+                }
+                default -> {
                     x = screenBounds.x + margin;
-                    y = screenBounds.y + screenBounds.height - getHeight() - margin - 60;
-                    break;
-            }
+                    yield screenBounds.y + screenBounds.height - getHeight() - margin - 60;
+                }
+            };
             setLocation(x, Math.max(screenBounds.y + margin, y));
         }
 
@@ -1258,6 +1090,7 @@ public class HearingFrame extends JFrame {
             return;
         }
 
+        intentionalStop = false;  // ★新規開始時にリセット
         running = true;
 
         // UIで選ばれてる表示名（LoopbackトークンでもOK）
@@ -1297,7 +1130,7 @@ public class HearingFrame extends JFrame {
 
             // stderr吸い上げ
             loopErrThread = new Thread(() -> {
-                try (BufferedReader br = new BufferedReader(new InputStreamReader(loopProc.getErrorStream(), "UTF-8"))) {
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(loopProc.getErrorStream(), StandardCharsets.UTF_8))) {
                     String l;
                     while ((l = br.readLine()) != null) {
                         Config.log("[Hearing][WASAPI] " + l);
@@ -1319,7 +1152,7 @@ public class HearingFrame extends JFrame {
             long lastPcmArrivedMs = 0;
             int lastPeak = 0;
 
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream(), "UTF-8"))) {
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
                 long lastDbgMs = 0;
 
@@ -1374,14 +1207,13 @@ public class HearingFrame extends JFrame {
                             byte[] chunk = pcmAcc.toByteArray();
                             pcmAcc.reset();
 
-                            final int peakAtSend = lastPeak;
-                            Config.logDebug("[Hearing][ASR] trigger: bytes=" + chunk.length + " peak=" + peakAtSend);
+                            Config.logDebug("[Hearing][ASR] trigger: bytes=" + chunk.length + " peak=" + lastPeak);
 
                             new Thread(() -> {
                                 long t0 = System.currentTimeMillis();
                                 try {
 //                                    host.transcribeHearingRaw(chunk);
-                                    submitHearingChunk(chunk, "LOOPBACK");
+                                    submitHearingChunk(chunk);
 
                                 } catch (Exception ex) {
                                     Config.logError("[Hearing][ASR] failed", ex);
@@ -1406,18 +1238,36 @@ public class HearingFrame extends JFrame {
                     }
                 }
             } catch (Exception ex) {
-                Config.logError("[Hearing] WASAPI helper crashed", ex);
-                Config.log("[Hearing][WASAPI] restarting helper in 500ms...");
-                new Thread(() -> {
-                    try { Thread.sleep(500); } catch (Exception ignore) {}
-                    try {
-                        if (running) startWasapiLoopbackProc(); // 既存の起動関数名に合わせる
-                    } catch (Exception ex2) {
-                        Config.logError("[Hearing][WASAPI] restart failed", ex2);
+                if (intentionalStop) {
+                    Config.log("[Hearing][WASAPI] loopback process stopped (intentional).");
+                } else {
+                    // ★crashカウンター（既存の5回リトライコードがあればそのまま活かす）
+                    long now = System.currentTimeMillis();
+                    if (now - wasapiFirstCrashMs > WASAPI_CRASH_WINDOW_MS) {
+                        wasapiCrashCount = 0;
+                        wasapiFirstCrashMs = now;
                     }
-                }).start();
+                    wasapiCrashCount++;
+
+                    if (wasapiCrashCount > WASAPI_MAX_RETRIES) {
+                        Config.logError("[Hearing] WASAPI helper crashed " + wasapiCrashCount
+                                + " times in " + (WASAPI_CRASH_WINDOW_MS/1000) + "s — giving up",ex);
+                    } else {
+                        Config.logError("[Hearing] WASAPI helper crashed ("
+                                + wasapiCrashCount + "/" + WASAPI_MAX_RETRIES + ")",ex);
+                        Config.log("[Hearing][WASAPI] restarting helper in 500ms...");
+                        new Thread(() -> {
+                            try { Thread.sleep(500); } catch (Exception ignore) {}
+                            try {
+                                if (running && !intentionalStop) startWasapiLoopbackProc();
+                            } catch (Exception ex2) {
+                                Config.logError("[Hearing][WASAPI] restart failed", ex2);
+                            }
+                        }, "hearing-wasapi-restart").start();
+                    }
+                }
             } finally {
-                running = false;
+                if (!intentionalStop) running = false;
                 try { if (p != null) p.destroyForcibly(); } catch (Exception ignore) {}
                 SwingUtilities.invokeLater(() -> {
                     if (meter != null) meter.setValue(0, -60.0, false, 1f, 1f, false);
@@ -1448,7 +1298,7 @@ public class HearingFrame extends JFrame {
             // 古いのを捨てて上限維持
             while (pcmBytes > PCM_MAX_BYTES && !pcmChunks.isEmpty()) {
                 byte[] old = pcmChunks.removeFirst();
-                pcmBytes -= (old != null ? old.length : 0);
+                pcmBytes -= old.length;
             }
         }
     }
