@@ -21,9 +21,15 @@ public class HistoryFrame extends JFrame implements ChangeListener {
             new java.util.concurrent.LinkedBlockingQueue<>();
     private volatile boolean radioSpeakWorkerStarted = false;
 
+
+    private void updateTitle() {
+        String mode = mobMateWhisp.getCpuGpuMode(); // "Vulkan MODE" or "CPU MODE"
+        String demo = SteamHelper.isDemoMode() ? " [TRIAL]" : "";
+        setTitle("History [" + ((mode.equals(""))? "CPU MODE": mode) + "]" + demo);
+    }
     public HistoryFrame(final MobMateWhisp mobMateWhisp) {
         this.mobMateWhisp = mobMateWhisp;
-        setTitle("MobMateWhispTalk - History");
+        updateTitle();
         setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
 
         // ===== History List =====

@@ -5,33 +5,39 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 話者照合プロファイル（Speaker Verification Profile）v3
- * MFCCベースの話者照合。メル帯域にDCTを適用してケプストラム係数を算出し、
- * 平均＋標準偏差の26次元特徴量で話者を識別する。
- * v2→v3変更点:
- *   - 20メル帯域 → 26メル帯域 + DCT → 13 MFCC
- *   - 特徴量: MFCC平均13 + MFCC標準偏差13 = 26次元（話者の声道構造＋動態を捉える）
- *   - profile.datフォーマット変更（v2プロファイルは自動再エンロール）
+ * 話者照合プロファイル v4
+ * v3→v4 変更点:
+ *   - c0（エネルギー）除去: c1-c12 の12係数を使用（声道構造のみ）
+ *   - デルタMFCC追加: フレーム間差分で発話ダイナミクスを捕捉
+ *   - 特徴量: static_mean(12)+static_std(12)+delta_mean(12)+delta_std(12) = 48次元
+ *   - L2正規化廃止 → ガウス距離スコアに変更（コサイン類似度では弁別不能だった問題の修正）
+ *   - エンロール分散（enrollSpread）でスコアを自動キャリブレーション
+ * なぜ効くか:
+ *   v3のコサイン類似度は「ベクトルの角度」だけ見る → 異なる話者でも0.85-0.95になり弁別不能。
+ *   v4のガウス距離スコアは「ユークリッド距離 / エンロール時の分散」で評価するため、
+ *   エンロール時の自分の声のバラツキを基準に「どれだけ離れているか」を正しく測れる。
  */
 public class SpeakerProfile {
 
     // ---- 定数 ----
-    private static final int FFT_SIZE = 512;           // 32ms @ 16kHz
-    private static final int HOP_SIZE = 256;            // 16ms hop
-    private static final int MEL_BANDS = 26;            // メル帯域数（DCT入力）
-    private static final int NUM_MFCC = 13;             // MFCC係数数（c0〜c12）
-    private static final int FEATURE_DIM = NUM_MFCC * 2; // 特徴量次元（mean + stddev）
+    private static final int FFT_SIZE = 512;
+    private static final int HOP_SIZE = 256;
+    private static final int MEL_BANDS = 26;
+    private static final int FULL_MFCC = 13;       // 算出するMFCC数（c0-c12）
+    private static final int USED_MFCC = 12;        // 使用するMFCC数（c1-c12、c0除去）
+    private static final int FEATURE_DIM = USED_MFCC * 4; // 48次元
     private static final float SAMPLE_RATE = 16000.0f;
 
     // ---- 状態 ----
-    private double[] avgFeature;        // 話者の平均特徴量 [FEATURE_DIM]
+    private double[] avgFeature;         // 話者の中心特徴量 [FEATURE_DIM]
+    private double enrollmentSpread;     // ★エンロール時の平均分散（スコア正規化用）
     private int enrollCount;
     private int requiredSamples;
     private double threshold;
     private double initialThreshold;
     private double targetThreshold;
     private int totalAccepted;
-    private int totalRejected;          // ★リジェクト数（ステータス表示用）
+    private int totalRejected;
 
     private final List<double[]> enrolledFeatures = new ArrayList<>();
 
@@ -44,6 +50,7 @@ public class SpeakerProfile {
         this.totalAccepted = 0;
         this.totalRejected = 0;
         this.avgFeature = null;
+        this.enrollmentSpread = 1.0;
     }
 
     public synchronized void updateSettings(int requiredSamples, double initialThreshold, double targetThreshold) {
@@ -68,7 +75,7 @@ public class SpeakerProfile {
         enrolledFeatures.add(feat);
         enrollCount++;
 
-        // 平均特徴量を再計算
+        // 中心特徴量を再計算
         avgFeature = new double[FEATURE_DIM];
         for (double[] f : enrolledFeatures) {
             for (int i = 0; i < FEATURE_DIM; i++) {
@@ -79,7 +86,18 @@ public class SpeakerProfile {
             avgFeature[i] /= enrolledFeatures.size();
         }
 
-        Config.logDebug("★Speaker enroll: sample #" + enrollCount + "/" + requiredSamples);
+        // ★エンロール分散を計算（中心からの平均ユークリッド距離）
+        if (enrolledFeatures.size() >= 2) {
+            double sumDist = 0;
+            for (double[] f : enrolledFeatures) {
+                sumDist += euclideanDistance(avgFeature, f);
+            }
+            enrollmentSpread = sumDist / enrolledFeatures.size();
+            if (enrollmentSpread < 2.0) enrollmentSpread = 2.0; // 最小値ガード（MFCC 48次元空間に合わせた値）
+        }
+
+        Config.logDebug(String.format("★Speaker enroll: #%d/%d spread=%.3f",
+                enrollCount, requiredSamples, enrollmentSpread));
     }
 
     public boolean isReady() {
@@ -104,30 +122,36 @@ public class SpeakerProfile {
         if (!isReady()) return true;
         if (pcm16le == null || pcm16le.length < FFT_SIZE * 2) return false;
 
-        double sim = similarity(pcm16le);
-        boolean match = sim >= threshold;
+        double score = similarity(pcm16le);
+        boolean match = score >= threshold;
 
-        if (match) {
-            // totalAcceptedはrefineSampleで増やすのでここでは増やさない
-        } else {
+        if (!match) {
             totalRejected++;
         }
 
-        Config.logDebug(String.format("★Speaker: sim=%.3f thr=%.3f %s (ok=%d ng=%d)",
-                sim, threshold, match ? "PASS" : "REJECT", totalAccepted, totalRejected));
+        Config.logDebug(String.format("★Speaker: score=%.3f thr=%.3f spread=%.3f %s (ok=%d ng=%d)",
+                score, threshold, enrollmentSpread, match ? "PASS" : "REJECT",
+                totalAccepted, totalRejected));
         return match;
     }
 
-    /** 類似度を返す（0.0〜1.0） */
+    /**
+     * ★ガウス距離スコア（0.0〜1.0）
+     * dist=0 → 1.0, dist=spread → ≈0.61, dist=2*spread → ≈0.14
+     */
     public synchronized double similarity(byte[] pcm16le) {
         if (avgFeature == null) return 1.0;
         double[] feat = computeFeatures(pcm16le);
         if (feat == null) return 0.0;
-        return cosineSimilarity(avgFeature, feat);
+
+        double dist = euclideanDistance(avgFeature, feat);
+        // ガウスカーネル: exp(-d²/(2σ²))
+        double sigma = Math.max(enrollmentSpread * 2.5, 2.0); // ★同話者の自然なバラツキ幅に合わせて広げる
+        return Math.exp(-(dist * dist) / (2.0 * sigma * sigma));
     }
 
     /**
-     * 運用中のプロファイル更新
+     * 運用中のプロファイル更新（EMA）
      * @return true = 保存推奨タイミング（10回ごと）
      */
     public synchronized boolean refineSample(byte[] pcm16le) {
@@ -156,16 +180,21 @@ public class SpeakerProfile {
         totalAccepted = 0;
         totalRejected = 0;
         threshold = initialThreshold;
+        enrollmentSpread = 1.0;
         enrolledFeatures.clear();
     }
 
     // ===================================================================
-    //  MFCC特徴量算出（核心部分）
+    //  MFCC + Delta 特徴量算出（核心部分）
     // ===================================================================
 
     /**
-     * PCM16LE → FFT → メル帯域 → DCT → MFCC
-     * @return [13 MFCC平均, 13 MFCC標準偏差] = 26次元、データ不足時はnull
+     * PCM16LE → MFCC(c1-c12) + Delta MFCC → 48次元特徴量
+     * 1. FFT → メル帯域 → log → DCT → MFCC c0-c12
+     * 2. c0を除去（エネルギー成分は話者非依存）
+     * 3. フレーム間差分（delta）を算出
+     * 4. static/delta それぞれの mean + stddev を連結
+     * 5. L2正規化しない（ガウス距離スコアで評価するため）
      */
     private double[] computeFeatures(byte[] pcm16le) {
         int numSamples = pcm16le.length / 2;
@@ -179,14 +208,13 @@ public class SpeakerProfile {
             samples[i] = (short) (lo | (hi << 8));
         }
 
-        // フレームごとにMFCCを算出して蓄積
-        List<double[]> frameMfccs = new ArrayList<>();
+        // フレームごとにMFCC算出（c0-c12）
+        List<double[]> allMfcc = new ArrayList<>();
 
         for (int offset = 0; offset + FFT_SIZE <= numSamples; offset += HOP_SIZE) {
             double[] real = new double[FFT_SIZE];
             double[] imag = new double[FFT_SIZE];
 
-            // Hann窓適用
             for (int i = 0; i < FFT_SIZE; i++) {
                 double hann = 0.5 * (1.0 - Math.cos(2.0 * Math.PI * i / (FFT_SIZE - 1)));
                 real[i] = samples[offset + i] * hann;
@@ -194,82 +222,101 @@ public class SpeakerProfile {
 
             fft(real, imag);
 
-            // パワースペクトル
             double[] power = new double[FFT_SIZE / 2];
             for (int i = 0; i < FFT_SIZE / 2; i++) {
                 power[i] = real[i] * real[i] + imag[i] * imag[i];
             }
 
-            // メル帯域エネルギー
             double[] melEnergy = computeMelBands(power);
 
-            // log → DCT → MFCC
             double[] logMel = new double[MEL_BANDS];
             for (int i = 0; i < MEL_BANDS; i++) {
                 logMel[i] = Math.log(Math.max(1e-10, melEnergy[i]));
             }
-            double[] mfcc = applyDCT(logMel, NUM_MFCC);
+            double[] fullMfcc = applyDCT(logMel, FULL_MFCC);
 
-            frameMfccs.add(mfcc);
+            // ★c0除去: c1-c12を取り出す
+            double[] usedMfcc = new double[USED_MFCC];
+            System.arraycopy(fullMfcc, 1, usedMfcc, 0, USED_MFCC);
+
+            allMfcc.add(usedMfcc);
         }
 
-        if (frameMfccs.size() < 3) return null; // 最低3フレーム必要
+        int nFrames = allMfcc.size();
+        if (nFrames < 5) return null; // ★最低5フレーム（v3の3から引き上げ）
 
-        // MFCC平均と標準偏差を算出
-        double[] mean = new double[NUM_MFCC];
-        double[] variance = new double[NUM_MFCC];
-        int n = frameMfccs.size();
-
-        for (double[] mfcc : frameMfccs) {
-            for (int i = 0; i < NUM_MFCC; i++) {
-                mean[i] += mfcc[i];
+        // ★デルタMFCC算出（フレーム間差分）
+        List<double[]> allDelta = new ArrayList<>();
+        for (int t = 1; t < nFrames; t++) {
+            double[] prev = allMfcc.get(t - 1);
+            double[] curr = allMfcc.get(t);
+            double[] delta = new double[USED_MFCC];
+            for (int i = 0; i < USED_MFCC; i++) {
+                delta[i] = curr[i] - prev[i];
             }
-        }
-        for (int i = 0; i < NUM_MFCC; i++) {
-            mean[i] /= n;
+            allDelta.add(delta);
         }
 
-        for (double[] mfcc : frameMfccs) {
-            for (int i = 0; i < NUM_MFCC; i++) {
-                double diff = mfcc[i] - mean[i];
-                variance[i] += diff * diff;
-            }
-        }
+        // static MFCC の mean + stddev
+        double[] sMean = computeMean(allMfcc);
+        double[] sStd = computeStddev(allMfcc, sMean);
 
-        // 特徴ベクトル: [mean_mfcc(13), stddev_mfcc(13)]
+        // delta MFCC の mean + stddev
+        double[] dMean = computeMean(allDelta);
+        double[] dStd = computeStddev(allDelta, dMean);
+
+        // ★連結: [sMean(12), sStd(12), dMean(12), dStd(12)] = 48次元
+        // ★L2正規化しない（ガウス距離で評価）
         double[] feature = new double[FEATURE_DIM];
-        for (int i = 0; i < NUM_MFCC; i++) {
-            feature[i] = mean[i];
-            feature[NUM_MFCC + i] = Math.sqrt(variance[i] / n);
-        }
-
-        // L2正規化
-        double norm = 0;
-        for (double v : feature) norm += v * v;
-        norm = Math.sqrt(norm);
-        if (norm > 1e-9) {
-            for (int i = 0; i < feature.length; i++) feature[i] /= norm;
-        }
+        System.arraycopy(sMean, 0, feature, 0, USED_MFCC);
+        System.arraycopy(sStd, 0, feature, USED_MFCC, USED_MFCC);
+        System.arraycopy(dMean, 0, feature, USED_MFCC * 2, USED_MFCC);
+        System.arraycopy(dStd, 0, feature, USED_MFCC * 3, USED_MFCC);
 
         return feature;
     }
 
-    /** パワースペクトルからメル帯域エネルギーを算出（三角フィルタ） */
+    private double[] computeMean(List<double[]> frames) {
+        int dim = frames.getFirst().length;
+        double[] mean = new double[dim];
+        for (double[] f : frames) {
+            for (int i = 0; i < dim; i++) mean[i] += f[i];
+        }
+        for (int i = 0; i < dim; i++) mean[i] /= frames.size();
+        return mean;
+    }
+
+    private double[] computeStddev(List<double[]> frames, double[] mean) {
+        int dim = mean.length;
+        double[] var = new double[dim];
+        for (double[] f : frames) {
+            for (int i = 0; i < dim; i++) {
+                double d = f[i] - mean[i];
+                var[i] += d * d;
+            }
+        }
+        double[] std = new double[dim];
+        for (int i = 0; i < dim; i++) {
+            std[i] = Math.sqrt(var[i] / frames.size());
+        }
+        return std;
+    }
+
+    // ===================================================================
+    //  メルフィルタバンク（三角フィルタ）
+    // ===================================================================
+
     private double[] computeMelBands(double[] power) {
         double[] bands = new double[MEL_BANDS];
-
         double nyquist = SAMPLE_RATE / 2.0;
-
         double melMin = hz2mel(100.0);
         double melMax = hz2mel(nyquist);
 
-        // メル境界（MEL_BANDS + 2）
         double[] melPoints = new double[MEL_BANDS + 2];
         for (int i = 0; i < melPoints.length; i++) {
             melPoints[i] = melMin + (melMax - melMin) * i / (MEL_BANDS + 1);
         }
 
-        // Hz → FFT bin
         int[] bin = new int[melPoints.length];
         for (int i = 0; i < melPoints.length; i++) {
             double hz = mel2hz(melPoints[i]);
@@ -277,14 +324,9 @@ public class SpeakerProfile {
             bin[i] = Math.max(0, Math.min(bin[i], power.length - 1));
         }
 
-        // 三角フィルタ適用
         for (int m = 0; m < MEL_BANDS; m++) {
-            int left = bin[m];
-            int center = bin[m + 1];
-            int right = bin[m + 2];
-
+            int left = bin[m], center = bin[m + 1], right = bin[m + 2];
             double sum = 0.0;
-
             for (int i = left; i < center; i++) {
                 double w = (i - left) / (double) (center - left + 1e-9);
                 sum += power[i] * w;
@@ -293,20 +335,15 @@ public class SpeakerProfile {
                 double w = (right - i) / (double) (right - center + 1e-9);
                 sum += power[i] * w;
             }
-
             bands[m] = sum;
         }
-
         return bands;
     }
 
+    // ===================================================================
+    //  DCT-II
+    // ===================================================================
 
-    /**
-     * DCT-II（離散コサイン変換）でMFCCを算出
-     * @param logMel log メルスペクトル [MEL_BANDS]
-     * @param numCoeff 取得するMFCC係数数
-     * @return MFCC [numCoeff]
-     */
     private static double[] applyDCT(double[] logMel, int numCoeff) {
         int N = logMel.length;
         double[] mfcc = new double[numCoeff];
@@ -343,7 +380,6 @@ public class SpeakerProfile {
             double angle = -2.0 * Math.PI / size;
             double wR = Math.cos(angle);
             double wI = Math.sin(angle);
-
             for (int start = 0; start < n; start += size) {
                 double curR = 1.0, curI = 0.0;
                 for (int k = 0; k < half; k++) {
@@ -375,16 +411,14 @@ public class SpeakerProfile {
         return 700.0 * (Math.pow(10.0, mel / 2595.0) - 1.0);
     }
 
-    private static double cosineSimilarity(double[] a, double[] b) {
-        if (a.length != b.length) return 0;
-        double dot = 0, na = 0, nb = 0;
+    /** ユークリッド距離 */
+    private static double euclideanDistance(double[] a, double[] b) {
+        double sum = 0;
         for (int i = 0; i < a.length; i++) {
-            dot += a[i] * b[i];
-            na += a[i] * a[i];
-            nb += b[i] * b[i];
+            double d = a[i] - b[i];
+            sum += d * d;
         }
-        double denom = Math.sqrt(na) * Math.sqrt(nb);
-        return denom > 1e-9 ? dot / denom : 0;
+        return Math.sqrt(sum);
     }
 
     // ===================================================================
@@ -394,21 +428,21 @@ public class SpeakerProfile {
     public synchronized void saveToFile(File file) {
         if (avgFeature == null) return;
         try (DataOutputStream dos = new DataOutputStream(new FileOutputStream(file))) {
-            dos.writeInt(FEATURE_DIM);       // ★v2の20とは違う値→自動再エンロール
+            dos.writeInt(FEATURE_DIM);
             dos.writeInt(enrollCount);
             dos.writeInt(totalAccepted);
             dos.writeInt(totalRejected);
             dos.writeDouble(threshold);
             dos.writeDouble(initialThreshold);
             dos.writeDouble(targetThreshold);
+            dos.writeDouble(enrollmentSpread);   // ★v4追加
             for (double v : avgFeature) {
                 dos.writeDouble(v);
             }
-            Config.logDebug("★Speaker profile saved: accepted=" + totalAccepted
-                    + " rejected=" + totalRejected
-                    + " threshold=" + String.format("%.3f", threshold));
+            Config.logDebug(String.format("★Speaker saved: ok=%d ng=%d thr=%.3f spread=%.3f",
+                    totalAccepted, totalRejected, threshold, enrollmentSpread));
         } catch (Exception e) {
-            Config.logDebug("★Speaker profile save failed: " + e.getMessage());
+            Config.logDebug("★Speaker save failed: " + e.getMessage());
         }
     }
 
@@ -419,7 +453,7 @@ public class SpeakerProfile {
             if (dim != FEATURE_DIM) {
                 Config.log("★Speaker profile version mismatch (dim=" + dim
                         + " expected=" + FEATURE_DIM + ") → re-enroll needed");
-                return false; // v2(20dim)プロファイルは読み込まない→再エンロール
+                return false;
             }
             enrollCount = dis.readInt();
             totalAccepted = dis.readInt();
@@ -427,16 +461,16 @@ public class SpeakerProfile {
             threshold = dis.readDouble();
             initialThreshold = dis.readDouble();
             targetThreshold = dis.readDouble();
+            enrollmentSpread = dis.readDouble();  // ★v4追加
             avgFeature = new double[FEATURE_DIM];
             for (int i = 0; i < FEATURE_DIM; i++) {
                 avgFeature[i] = dis.readDouble();
             }
-            Config.logDebug("★Speaker profile loaded: enroll=" + enrollCount
-                    + " accepted=" + totalAccepted
-                    + " threshold=" + String.format("%.3f", threshold));
+            Config.logDebug(String.format("★Speaker loaded: enroll=%d ok=%d thr=%.3f spread=%.3f",
+                    enrollCount, totalAccepted, threshold, enrollmentSpread));
             return true;
         } catch (Exception e) {
-            Config.logDebug("★Speaker profile load failed: " + e.getMessage());
+            Config.logDebug("★Speaker load failed: " + e.getMessage());
             return false;
         }
     }

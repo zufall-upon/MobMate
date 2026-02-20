@@ -49,6 +49,9 @@ import org.json.JSONObject;
 import static whisper.VoicegerManager.httpOk;
 
 public class MobMateWhisp implements NativeKeyListener {
+
+//    public static final boolean IS_DEMO = true; //TODO ← 製品版はfalseにするかビルドフラグで制御
+
     private static final String PREF_WIN_X = "ui.window.x";
     private static final String PREF_WIN_Y = "ui.window.y";
     private static final String PREF_WIN_W = "ui.window.w";
@@ -57,12 +60,15 @@ public class MobMateWhisp implements NativeKeyListener {
     public static Preferences prefs;
     private String lastOutput = null;
     private String cpugpumode = "";
+    public String getCpuGpuMode() {
+        return cpugpumode != null ? cpugpumode : "CPU MODE";
+    }
     private final Random rnd = new Random();
     private String[] laughOptions;
     private HistoryFrame historyFrame;
 
     // Whisper
-    LocalWhisperCPP w;
+    volatile LocalWhisperCPP w;
     private volatile LocalWhisperCPP wHearing;
     private final Object hearingWhisperLock = new Object();
     private String model;
@@ -114,7 +120,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private JLabel vgStatusLabel;      // Voiceger接続状態（★追加）
     private JLabel durationLabel;      // 録音時間
     private JLabel memLabel;           // メモリ使用量
-    private JLabel gpuMemLabel;        // ★GPU VRAM使用量
+//    private JLabel gpuMemLabel;        // ★GPU VRAM使用量
     private volatile long gpuVramTotalBytes = -1;
     private JLabel modelLabel;         // 利用モデル（★追加）
     private JLabel speakerStatusLabel; // ★話者照合ステータス
@@ -234,6 +240,37 @@ public class MobMateWhisp implements NativeKeyListener {
         // autoGainMultiplierの安全域（保存値が壊れてても復旧）
         if (autoGainMultiplier < 0.25f) autoGainMultiplier = 0.25f;
         if (autoGainMultiplier > 9.0f)  autoGainMultiplier = 9.0f;
+    }
+
+    // ★ デモモードアナウンス（体験版のみ有効にする制御はお好みで）
+    private void startDemoAnnounceTimer() {
+        if (!Version.IS_DEMO) return;
+
+        // デモメッセージ（5言語）
+        Map<String, String> demoMsg = new java.util.LinkedHashMap<>();
+        demoMsg.put("ja", "これは体験版です。製品版をご購入いただくと、このアナウンスは停止します。");
+        demoMsg.put("en", "This is a trial version. Purchase the full version to remove this announcement.");
+        demoMsg.put("zh", "这是试用版。购买完整版后，此提示将停止播放。");
+        demoMsg.put("ko", "이것은 체험판입니다. 정식 버전을 구매하시면 이 안내가 사라집니다。");
+        demoMsg.put("zh-TW", "這是體驗版。購買完整版後，此提示將停止播放。");
+
+        java.util.Timer demoTimer = new java.util.Timer("demo-announce", true);
+        demoTimer.scheduleAtFixedRate(new java.util.TimerTask() {
+            @Override
+            public void run() {
+                try {
+                    String uiLang = prefs.get("ui.language", "en");
+                    // ui.languageに近い言語を選ぶ
+                    String msg = demoMsg.getOrDefault(uiLang,
+                            demoMsg.getOrDefault(
+                                    uiLang.startsWith("zh") ? "zh" : "en",
+                                    demoMsg.get("en")));
+                    speak(msg);
+                } catch (Exception e) {
+                    Config.log("[Demo] announce error: " + e.getMessage());
+                }
+            }
+        }, 3 * 60 * 1000L, 3 * 60 * 1000L); // 3分ごと
     }
     public MobMateWhisp(String remoteUrl) throws FileNotFoundException, NativeHookException {
         Shell32.INSTANCE.SetCurrentProcessExplicitAppUserModelID(
@@ -999,7 +1036,7 @@ public class MobMateWhisp implements NativeKeyListener {
         float currentInitTh = prefs.getFloat("speaker.threshold_initial", 0.55f);
         List<CheckboxMenuItem> sensItems = new ArrayList<>();
         for (float[] opt : new float[][]{
-                {0.45f}, {0.55f}, {0.60f}, {0.70f}}) {
+                {0.1f},{0.25f},{0.45f}, {0.55f}, {0.60f}, {0.70f}, {0.80f}}) {
             float th = opt[0];
             String label = String.format("%.0f%%", th * 100)
                     + (th == 0.60f ? " (default)" : "")
@@ -1702,6 +1739,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 prefs.getInt("ui.font.size", 12));
         applyAwtFontRecursive(popup, awtFont);
 
+        startDemoAnnounceTimer();
         Config.log("[TRAY] popup: end");
         return popup;
     }
@@ -3227,13 +3265,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                         ? ((ImprovedVAD) vad).isSpeech(pcm, n, buffer.size())
                                         : vad.isSpeech(pcm, n);
 
-                                // ===== 話者照合（VAD後・transient前）=====
-                                if (speech && speakerProfile != null && speakerProfile.isReady()) {
-                                    double sim = speakerProfile.similarity(pcm);
-                                    if (sim < speakerProfile.getThreshold()) {
-                                        continue;
-                                    }
-                                }
+                                // ===== 話者照合はfinalChunkレベルで実施（フレーム単位は精度不足）=====
 
                                 // ===== [ADD] strong signal but speech=false guard =====
                                 if (vad instanceof ImprovedVAD) {
@@ -3558,9 +3590,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                                             && speakerProfile.isReady()) {
                                                         speakerOk = speakerProfile.isMatchingSpeaker(finalChunk);
                                                         if (!speakerOk) {
-                                                            Config.logDebug("★Speaker REJECTED: sim="
-                                                                    + String.format("%.3f", speakerProfile.similarity(finalChunk))
-                                                                    + " bytes=" + finalChunk.length);
+                                                            Config.logDebug("★Speaker REJECTED bytes=" + finalChunk.length);
                                                         }
                                                         updateSpeakerStatus();
                                                     }
@@ -4167,6 +4197,11 @@ public class MobMateWhisp implements NativeKeyListener {
         int bytes = (audioData == null) ? 0 : audioData.length;
         double sec = bytes / (16000.0 * 2.0);
         Config.logDebug("★TRANSCRIBE REQ end=" + isEndOfCapture + " bytes=" + bytes + " sec=" + String.format(java.util.Locale.ROOT, "%.3f", sec));
+        // ★softRestart中は w=null → 安全にスキップ
+        if (w == null) {
+            Config.logDebug("★TRANSCRIBE SKIP: whisper not available (restarting?)");
+            return "";
+        }
         if (MobMateWhisp.this.remoteUrl == null) {
 
             // ★busy時の扱い：
@@ -4514,8 +4549,10 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
     public static void main(String[] args) {
+        SteamHelper.init();
         System.setProperty("jna.encoding", "UTF-8");
         ensureInitialConfig();
+
         Thread keepAlive = new Thread(() -> {
             try {
                 Thread.sleep(Long.MAX_VALUE);
@@ -4586,6 +4623,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     // ★Whisperネイティブメモリ解放（large-v3-q8_0で3GB+のリーク防止）
 //                    try { LocalWhisperCPP.freeAllContexts(); } catch (Throwable ignore) {}
                 }, "voiceger-shutdown"));
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> SteamHelper.shutdown()));
 
 
 
@@ -5031,10 +5069,10 @@ public class MobMateWhisp implements NativeKeyListener {
         memLabel.setToolTipText("Memory Usage");
 
         // ★GPU VRAM表示
-        gpuMemLabel = new JLabel("GPU: ...");
-        gpuMemLabel.setFont(gpuMemLabel.getFont().deriveFont(11f));
-        gpuMemLabel.setForeground(Color.GRAY);
-        gpuMemLabel.setToolTipText("GPU VRAM (estimated model usage / total)");
+//        gpuMemLabel = new JLabel("GPU: ...");
+//        gpuMemLabel.setFont(gpuMemLabel.getFont().deriveFont(11f));
+//        gpuMemLabel.setForeground(Color.GRAY);
+//        gpuMemLabel.setToolTipText("GPU VRAM (estimated model usage / total)");
 
         // バージョン
         versionLabel = new JLabel("v" + Version.APP_VERSION);
@@ -5079,9 +5117,9 @@ public class MobMateWhisp implements NativeKeyListener {
         statusBar.add(sep4);
         statusBar.add(memLabel);
         // ★GPU VRAMラベル追加
-        statusBar.add(gpuMemLabel);
-        JSeparator sepGpu = new JSeparator(SwingConstants.VERTICAL);
-        sepGpu.setPreferredSize(new Dimension(1, 12));
+//        statusBar.add(gpuMemLabel);
+//        JSeparator sepGpu = new JSeparator(SwingConstants.VERTICAL);
+//        sepGpu.setPreferredSize(new Dimension(1, 12));
         statusBar.add(sep8);
         statusBar.add(versionLabel);
 
@@ -5162,43 +5200,43 @@ public class MobMateWhisp implements NativeKeyListener {
                 memLabel.setText("Mem: " + usedMB + "MB");
             }
             // ★GPU VRAM推定使用量を更新
-            if (gpuMemLabel != null) {
-                boolean isVulkan = cpugpumode != null && cpugpumode.contains("Vulkan");
-                if (isVulkan && gpuVramTotalBytes > 0) {
-                    File mf = new File(model_dir, model);
-                    long modelBytes = mf.exists() ? mf.length() : 0;
-                    // モデル + KVキャッシュ + 推論バッファで約1.2倍
-                    long estMB = (long)(modelBytes * 1.2 / 1024 / 1024);
-                    long totalMB = gpuVramTotalBytes / 1024 / 1024;
-
-                    String est = (estMB >= 1024)
-                            ? String.format("%.1fG", estMB / 1024.0)
-                            : estMB + "M";
-                    String tot = (totalMB >= 1024)
-                            ? String.format("%.0fG", totalMB / 1024.0)
-                            : totalMB + "M";
-
-                    gpuMemLabel.setText("GPU: " + est + "/" + tot);
-
-                    double ratio = (double) estMB / totalMB;
-                    if (ratio > 0.90) {
-                        gpuMemLabel.setForeground(new Color(244, 67, 54));   // 赤：VRAM不足
-                    } else if (ratio > 0.70) {
-                        gpuMemLabel.setForeground(new Color(255, 152, 0));   // オレンジ：余裕少ない
-                    } else {
-                        gpuMemLabel.setForeground(new Color(76, 175, 80));   // 緑：十分
-                    }
-
-                    gpuMemLabel.setToolTipText(String.format(
-                            "Estimated VRAM: %dMB / %dMB (%.0f%%)",
-                            estMB, totalMB, ratio * 100));
-                } else if (!isVulkan) {
-                    gpuMemLabel.setText("GPU: --");
-                    gpuMemLabel.setForeground(Color.GRAY);
-                    gpuMemLabel.setToolTipText("CPU mode (no GPU)");
-                }
-                // else: Vulkanだけどまだクエリ中 → "GPU: ..." のまま
-            }
+//            if (gpuMemLabel != null) {
+//                boolean isVulkan = cpugpumode != null && cpugpumode.contains("Vulkan");
+//                if (isVulkan && gpuVramTotalBytes > 0) {
+//                    File mf = new File(model_dir, model);
+//                    long modelBytes = mf.exists() ? mf.length() : 0;
+//                    // モデル + KVキャッシュ + 推論バッファで約1.2倍
+//                    long estMB = (long)(modelBytes * 1.2 / 1024 / 1024);
+//                    long totalMB = gpuVramTotalBytes / 1024 / 1024;
+//
+//                    String est = (estMB >= 1024)
+//                            ? String.format("%.1fG", estMB / 1024.0)
+//                            : estMB + "M";
+//                    String tot = (totalMB >= 1024)
+//                            ? String.format("%.0fG", totalMB / 1024.0)
+//                            : totalMB + "M";
+//
+//                    gpuMemLabel.setText("GPU: " + est + "/" + tot);
+//
+//                    double ratio = (double) estMB / totalMB;
+//                    if (ratio > 0.90) {
+//                        gpuMemLabel.setForeground(new Color(244, 67, 54));   // 赤：VRAM不足
+//                    } else if (ratio > 0.70) {
+//                        gpuMemLabel.setForeground(new Color(255, 152, 0));   // オレンジ：余裕少ない
+//                    } else {
+//                        gpuMemLabel.setForeground(new Color(76, 175, 80));   // 緑：十分
+//                    }
+//
+//                    gpuMemLabel.setToolTipText(String.format(
+//                            "Estimated VRAM: %dMB / %dMB (%.0f%%)",
+//                            estMB, totalMB, ratio * 100));
+//                } else if (!isVulkan) {
+//                    gpuMemLabel.setText("GPU: --");
+//                    gpuMemLabel.setForeground(Color.GRAY);
+//                    gpuMemLabel.setToolTipText("CPU mode (no GPU)");
+//                }
+//                // else: Vulkanだけどまだクエリ中 → "GPU: ..." のまま
+//            }
         });
     }
     /**
@@ -6802,6 +6840,10 @@ public class MobMateWhisp implements NativeKeyListener {
             System.clearProperty("GGML_VULKAN_DEVICE");
             Config.log("Using Vulkan GPU auto selection");
         }
+
+        boolean vulkanDlcOwned = SteamHelper.hasVulkanDlc();
+        Config.log("[Steam] Vulkan DLC owned: " + vulkanDlcOwned);
+
         for (Backend b : backends) {
             Config.log("Checking backend: " + b.name + " in " + b.dir);
             // ★ADD: Vulkan loaderは同梱ではなくシステム側を確認する
@@ -6809,6 +6851,13 @@ public class MobMateWhisp implements NativeKeyListener {
                 Config.log(" → vulkan-1.dll not found in System32. Skip Vulkan backend.");
                 continue;
             }
+
+            // ★ DLCチェック追加（ここだけ追加）
+            if ("Vulkan".equals(b.name) && !vulkanDlcOwned) {
+                Config.log(" → Vulkan DLC not owned. Falling back to CPU.");
+                continue;
+            }
+
             // ★ADD: backendファイル欠けの見える化（DLC未導入/破損/AV隔離の切り分け）
             java.util.List<String> missing = new java.util.ArrayList<>();
             for (String dep : b.deps) {
@@ -7102,12 +7151,41 @@ public class MobMateWhisp implements NativeKeyListener {
         // ★推論スレッドの完了を待ってからネイティブコンテキスト解放
         // （推論中にwhisper_free()するとSEGFAULT→OSクラッシュ）
         Config.log("[SOFT_RESTART] waiting for inference threads to drain...");
-        for (int i = 0; i < 30; i++) {  // 最大2秒待機
-            if (!transcribeBusy.get() && !isProcessingFinal.get() && !isProcessingPartial.get()) break;
+        boolean drained = false;
+        for (int i = 0; i < 80; i++) {  // ★最大8秒待機（旧2秒では足りない場合あり）
+            if (!transcribeBusy.get() && !isProcessingFinal.get() && !isProcessingPartial.get()) {
+                drained = true;
+                break;
+            }
             try { Thread.sleep(100); } catch (InterruptedException ignore) {}
         }
-        Config.log("[SOFT_RESTART] inference drained, freeing native contexts");
-//        try { LocalWhisperCPP.freeAllContexts(); } catch (Throwable ignore) {}
+        if (!drained) {
+            Config.logError("[SOFT_RESTART] inference threads did NOT drain in 8s!"
+                    + " busy=" + transcribeBusy.get()
+                    + " final=" + isProcessingFinal.get()
+                    + " partial=" + isProcessingPartial.get(), null);
+            // フラグを強制リセット（スレッドはもう応答しない前提）
+            transcribeBusy.set(false);
+            isProcessingFinal.set(false);
+            isProcessingPartial.set(false);
+        }
+        // ★Phase 1 では native free しない（背景executorがまだアクセスする可能性あり）
+        // 代わりに w=null でstaleスレッドをNPEで安全に殺す
+        // native free は Phase 2 の LocalWhisperCPP コンストラクタ内 close() に任せる
+        Config.log("[SOFT_RESTART] inference drained=" + drained + ", nulling whisper refs");
+        LocalWhisperCPP old = this.w;
+        this.w = null;
+        try {
+            if (old != null) {
+//                LocalWhisperCPP.freeAllContexts();
+            }
+        } catch (Exception e) {
+            Config.log("[SOFT_RESTART] close error: " + e.getMessage());
+        }
+        System.gc();
+        try {
+            Thread.sleep(1000); // 200〜500msでOK
+        } catch (InterruptedException ignored) {}
 
         // (6) HistoryFrame閉じる
         if (historyFrame != null) {
@@ -7190,14 +7268,22 @@ public class MobMateWhisp implements NativeKeyListener {
         applyUIFont(fontSize);                              // ★ユーザーサイズで上書き
 
         // (4) Whisperモデル再読み込み（DLLは既ロードなのでスキップ）
+
+        if (isRecording()) {
+            stopRecording();
+        }
+        // Apply model
         try {
             File dir = new File(model_dir);
+            MobMateWhisp.this.model = prefs.get("model", model);
             model = prefs.get("model", model);
             File modelFile = new File(dir, model);
-            if (modelFile.exists()) {
-                this.w = new LocalWhisperCPP(modelFile, "");
+            setModelPref(MobMateWhisp.this.model);
+            Config.log("[SOFT_RESTART] Model : " + model);
+            try {
+                MobMateWhisp.this.w = new LocalWhisperCPP(modelFile,"");
                 Config.log("[SOFT_RESTART] Whisper model reloaded: " + model);
-            } else {
+            } catch (FileNotFoundException e1) {
                 Config.logError("[SOFT_RESTART] Model not found: " + modelFile, null);
             }
         } catch (Throwable t) {
