@@ -48,14 +48,15 @@ public class FirstLaunchWizard extends JDialog {
     private JTabbedPane controlTabs;
     private int lastStepForTabs = STEP_INPUT; // onStepExit/onStepEnter 用
 
-    private static final int STEP_INPUT  = 0;
-    private static final int STEP_OUTPUT = 1;
-    private static final int STEP_VOICEVOX = 2;
-    private static final int STEP_XTTS     = 3;
-    private static final int STEP_VOICEGER = 4;
-    private static final int STEP_COUNT = 5;
+    private static final int STEP_ENGINE   = 0;  // ★v1.5.0: 認識エンジン選択
+    private static final int STEP_INPUT    = 1;
+    private static final int STEP_OUTPUT   = 2;
+    private static final int STEP_VOICEVOX = 3;
+    private static final int STEP_XTTS     = 4;
+    private static final int STEP_VOICEGER = 5;
+    private static final int STEP_COUNT    = 6;
 
-    private int step = STEP_INPUT;
+    private int step = STEP_ENGINE;
 
     // --- Step1 mic monitor ---
     private TargetDataLine monitorLine;
@@ -95,7 +96,7 @@ public class FirstLaunchWizard extends JDialog {
         boolean never = prefs.getBoolean("wizard.never", false);
         if (completed || never) controlCenterMode = true;
 
-        setSize(760, 640);
+        setSize(760, 760);
         setLocationRelativeTo(owner);
         setDefaultCloseOperation(DISPOSE_ON_CLOSE);
 
@@ -105,6 +106,7 @@ public class FirstLaunchWizard extends JDialog {
             add(controlCenterBottomBar(), BorderLayout.SOUTH);
         } else {
             // ===== legacy wizard (CardLayout) =====
+            cardPanel.add(stepRecogEngine(), "step0");  // ★v1.5.0
             cardPanel.add(stepInputDevice(), "step1");
             cardPanel.add(stepOutputDevice(), "step2");
             cardPanel.add(stepVoiceVox(), "step3");
@@ -214,6 +216,281 @@ public class FirstLaunchWizard extends JDialog {
         if (s == STEP_VOICEGER) {
             // 何もしなくてOK（止めたいなら stopVoicegerApi(); を呼ぶ）
         }
+    }
+
+
+    /* =========================
+       Step 0: Recognition Engine (v1.5.0)
+     ========================= */
+
+    private JPanel stepRecogEngine() {
+        JPanel p = basePanel();
+
+        p.add(title("wizard.engine.title"));
+        p.add(text("wizard.engine.desc"));
+
+        // ════════ エンジン選択 ════════
+        String currentEngine = prefs.get("recog.engine", "whisper");
+        boolean hasDlc = SteamHelper.hasVulkanDlc();
+
+        JRadioButton rbMoonshine = new JRadioButton();
+        JRadioButton rbWhisper   = new JRadioButton();
+        ButtonGroup engineGroup = new ButtonGroup();
+        engineGroup.add(rbMoonshine);
+        engineGroup.add(rbWhisper);
+
+        // --- Moonshine カード ---
+        JPanel moonCard = new JPanel();
+        moonCard.setLayout(new BoxLayout(moonCard, BoxLayout.Y_AXIS));
+        moonCard.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(new Color(76, 175, 80), 2),
+                BorderFactory.createEmptyBorder(10, 12, 10, 12)));
+
+        rbMoonshine.setText("Moonshine (CPU) — " + UiText.t("wizard.engine.moon.tag"));
+        rbMoonshine.setFont(rbMoonshine.getFont().deriveFont(Font.BOLD, 14f));
+        moonCard.add(rbMoonshine);
+
+        JTextArea moonDesc = new JTextArea(UiText.t("wizard.engine.moon.pros"));
+        moonDesc.setEditable(false);
+        moonDesc.setOpaque(false);
+        moonDesc.setLineWrap(true);
+        moonDesc.setWrapStyleWord(true);
+        moonDesc.setFont(moonDesc.getFont().deriveFont(12f));
+        moonDesc.setBorder(BorderFactory.createEmptyBorder(4, 24, 4, 0));
+        moonCard.add(moonDesc);
+
+        p.add(moonCard);
+        p.add(Box.createVerticalStrut(8));
+
+        // --- Whisper カード ---
+        JPanel whisperCard = new JPanel();
+        whisperCard.setLayout(new BoxLayout(whisperCard, BoxLayout.Y_AXIS));
+        whisperCard.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(new Color(100, 149, 237), 2),
+                BorderFactory.createEmptyBorder(10, 12, 10, 12)));
+
+        String whisperTag = hasDlc
+                ? UiText.t("wizard.engine.whi.tag.dlc")
+                : UiText.t("wizard.engine.whi.tag.nodlc");
+        rbWhisper.setText("Whisper (GPU) — " + whisperTag);
+        rbWhisper.setFont(rbWhisper.getFont().deriveFont(Font.BOLD, 14f));
+        if (!hasDlc) {
+            rbWhisper.setForeground(Color.GRAY);
+        }
+        whisperCard.add(rbWhisper);
+
+        JTextArea whisperDesc = new JTextArea(
+                hasDlc ? UiText.t("wizard.engine.whi.pros")
+                        : UiText.t("wizard.engine.whi.nodlc"));
+        whisperDesc.setEditable(false);
+        whisperDesc.setOpaque(false);
+        whisperDesc.setLineWrap(true);
+        whisperDesc.setWrapStyleWord(true);
+        whisperDesc.setFont(whisperDesc.getFont().deriveFont(12f));
+        whisperDesc.setBorder(BorderFactory.createEmptyBorder(4, 24, 4, 0));
+        whisperCard.add(whisperDesc);
+
+        p.add(whisperCard);
+        p.add(Box.createVerticalStrut(12));
+
+        // ════════ Moonshine モデル言語選択 ════════
+        JPanel modelPanel = new JPanel();
+        modelPanel.setLayout(new BoxLayout(modelPanel, BoxLayout.Y_AXIS));
+        modelPanel.setBorder(BorderFactory.createTitledBorder(
+                UiText.t("wizard.engine.model.title")));
+
+        // exe直下の moonshine_model/ をスキャンして言語フォルダを列挙
+        JComboBox<String> langCombo = new JComboBox<>();
+        File moonBaseDir = new File(mobmatewhisp.getExeDir(), "moonshine_model");
+        File[] langDirs = moonBaseDir.isDirectory()
+                ? moonBaseDir.listFiles(File::isDirectory) : null;
+
+        JLabel pathLabel = new JLabel(" ");
+        pathLabel.setFont(pathLabel.getFont().deriveFont(11f));
+        pathLabel.setForeground(Color.GRAY);
+
+        if (langDirs != null && langDirs.length > 0) {
+            Arrays.sort(langDirs, Comparator.comparing(File::getName));
+            for (File d : langDirs) {
+                langCombo.addItem(d.getName());
+            }
+            // 既存設定があればそれを選択
+            String savedPath = prefs.get("moonshine.model_path", "");
+            if (!savedPath.isEmpty()) {
+                // パスから言語名を逆引き
+                for (int i = 0; i < langCombo.getItemCount(); i++) {
+                    if (savedPath.contains(langCombo.getItemAt(i))) {
+                        langCombo.setSelectedIndex(i);
+                        break;
+                    }
+                }
+            }
+            // 選択中のモデルパスを表示
+            updateMoonModelPath(langCombo, moonBaseDir, pathLabel);
+
+            langCombo.addActionListener(e -> {
+                updateMoonModelPath(langCombo, moonBaseDir, pathLabel);
+            });
+        } else {
+            langCombo.addItem(UiText.t("wizard.engine.model.notfound"));
+            langCombo.setEnabled(false);
+            pathLabel.setText(UiText.t("wizard.engine.model.notfound.hint"));
+        }
+
+        JPanel langRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        langRow.add(new JLabel(UiText.t("wizard.engine.model.lang")));
+        langRow.add(langCombo);
+        modelPanel.add(langRow);
+        modelPanel.add(pathLabel);
+
+        // 「フォルダを開く」ボタン
+        JPanel btnRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JButton openFolder = new JButton(UiText.t("wizard.engine.model.open"));
+        openFolder.addActionListener(e -> {
+            try {
+                if (moonBaseDir.isDirectory()) {
+                    Desktop.getDesktop().open(moonBaseDir);
+                } else {
+                    // フォルダがなければ作る
+                    moonBaseDir.mkdirs();
+                    Desktop.getDesktop().open(moonBaseDir);
+                }
+            } catch (Exception ex) {
+                Config.logError("Failed to open moonshine_model dir", ex);
+            }
+        });
+        btnRow.add(openFolder);
+
+        // 「他の言語モデルをダウンロード」リンク
+        JButton dlLink = new JButton(UiText.t("wizard.engine.model.download"));
+        dlLink.setBorderPainted(false);
+        dlLink.setContentAreaFilled(false);
+        dlLink.setForeground(new Color(70, 130, 230));
+        dlLink.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+        dlLink.addActionListener(e -> {
+            try {
+                Desktop.getDesktop().browse(
+                        new URI("https://github.com/usefulsensors/moonshine"));
+            } catch (Exception ex) {
+                Config.logError("Failed to open Moonshine URL", ex);
+            }
+        });
+        btnRow.add(dlLink);
+        modelPanel.add(btnRow);
+
+        // ライセンス表記
+        JLabel licenseLabel = new JLabel(
+                "Moonshine © Useful Sensors, Inc. — MIT License");
+        licenseLabel.setFont(licenseLabel.getFont().deriveFont(10f));
+        licenseLabel.setForeground(Color.GRAY);
+        licenseLabel.setBorder(BorderFactory.createEmptyBorder(4, 4, 0, 0));
+        modelPanel.add(licenseLabel);
+
+        p.add(modelPanel);
+
+        // ════════ エンジン選択の反映 ════════
+        // 初回自動推薦: DLC無し→Moonshine, DLC有り→Whisper
+        if ("moonshine".equalsIgnoreCase(currentEngine)) {
+            rbMoonshine.setSelected(true);
+        } else if ("whisper".equalsIgnoreCase(currentEngine)) {
+            rbWhisper.setSelected(true);
+        } else {
+            // 未設定時の自動推薦
+            if (hasDlc) {
+                rbWhisper.setSelected(true);
+            } else {
+                rbMoonshine.setSelected(true);
+            }
+        }
+
+        // モデルパネルの表示制御
+        modelPanel.setVisible(rbMoonshine.isSelected());
+
+        rbMoonshine.addActionListener(e -> {
+            prefs.put("recog.engine", "moonshine");
+            try { prefs.flush(); } catch (Exception ignore) {}
+            modelPanel.setVisible(true);
+            Config.log("[Wizard] Engine → Moonshine");
+        });
+        rbWhisper.addActionListener(e -> {
+            if (!hasDlc) {
+                // DLC無しの場合は警告
+                int confirm = JOptionPane.showConfirmDialog(this,
+                        UiText.t("wizard.engine.whi.nodlc.confirm"),
+                        "MobMate", JOptionPane.YES_NO_OPTION,
+                        JOptionPane.WARNING_MESSAGE);
+                if (confirm != JOptionPane.YES_OPTION) {
+                    rbMoonshine.setSelected(true);
+                    return;
+                }
+            }
+            prefs.put("recog.engine", "whisper");
+            try { prefs.flush(); } catch (Exception ignore) {}
+            modelPanel.setVisible(false);
+            Config.log("[Wizard] Engine → Whisper");
+        });
+
+        return p;
+    }
+
+    /** Moonshineモデルパスを解決してprefsに保存＋ラベル更新 */
+    private void updateMoonModelPath(JComboBox<String> combo, File baseDir, JLabel label) {
+        String langName = (String) combo.getSelectedItem();
+        if (langName == null || langName.isEmpty()) return;
+
+        File langDir = new File(baseDir, langName);
+        if (!langDir.isDirectory()) {
+            label.setText("⚠ " + langDir.getAbsolutePath() + " not found");
+            return;
+        }
+
+        // 言語ディレクトリ内でモデルを探す
+        // 構造例: moonshine_model/ja/quantized/base-ja/
+        // または: moonshine_model/ja/  (直接モデルファイルが入っている)
+        File modelDir = findDeepestModelDir(langDir);
+        String modelPath = modelDir.getAbsolutePath();
+
+        prefs.put("moonshine.model_path", modelPath);
+        try { prefs.flush(); } catch (Exception ignore) {}
+
+        // パスが長い場合は末尾を表示
+        String display = modelPath;
+        if (display.length() > 60) {
+            display = "..." + display.substring(display.length() - 57);
+        }
+        label.setText("→ " + display);
+        Config.log("[Wizard] Moonshine model path: " + modelPath);
+    }
+
+    /** モデルディレクトリを再帰探索（.onnx ファイルがある最深ディレクトリを返す）*/
+    private File findDeepestModelDir(File dir) {
+        // このディレクトリに.onnxファイルがあればここがモデルディレクトリ
+        File[] onnxFiles = dir.listFiles((d, name) ->
+                name.endsWith(".onnx") || name.endsWith(".bin"));
+        if (onnxFiles != null && onnxFiles.length > 0) {
+            return dir;
+        }
+        // サブディレクトリを再帰探索
+        File[] subDirs = dir.listFiles(File::isDirectory);
+        if (subDirs != null) {
+            for (File sub : subDirs) {
+                File found = findDeepestModelDir(sub);
+                if (found != sub || found == sub) {
+                    // 再帰で見つかったらそれを返す
+                    File[] check = found.listFiles((d, name) ->
+                            name.endsWith(".onnx") || name.endsWith(".bin"));
+                    if (check != null && check.length > 0) {
+                        return found;
+                    }
+                }
+            }
+            // .onnxが見つからなかった場合、最初のサブディレクトリを再帰
+            if (subDirs.length > 0) {
+                return findDeepestModelDir(subDirs[0]);
+            }
+        }
+        // 見つからなければ元のディレクトリを返す
+        return dir;
     }
 
     /* =========================
@@ -1472,6 +1749,7 @@ public class FirstLaunchWizard extends JDialog {
 
         // 0=QuickStart, 1=Input, 2=Output, 3=VOICEVOX, 4=XTTS, 5=Voiceger, 6=Diagnostics
 //        tabs.addTab(UiText.t("wizard.tab.quick"), quickStartPanel(tabs));
+        tabs.addTab("Engine", stepRecogEngine());  // ★v1.5.0
         tabs.addTab("InputDevice", stepInputDevice());
         tabs.addTab("OutputDevice", stepOutputDevice());
         tabs.addTab("VOICEVOX", stepVoiceVox());
@@ -1500,6 +1778,7 @@ public class FirstLaunchWizard extends JDialog {
 
     private int tabIndexToStep(int tabIndex) {
         switch (tabIndex) {
+            case 0: return STEP_ENGINE;
             case 1: return STEP_INPUT;
             case 2: return STEP_OUTPUT;
             case 3: return STEP_VOICEVOX;

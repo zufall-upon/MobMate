@@ -4,7 +4,6 @@ import java.io.*;
 import java.util.*;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
-
 import io.github.ggerganov.whispercpp.WhisperCpp;
 import io.github.ggerganov.whispercpp.params.CBool;
 import io.github.ggerganov.whispercpp.params.WhisperFullParams;
@@ -36,6 +35,7 @@ public class LocalWhisperCPP {
     private boolean isHearingMode = false; // ★Hearingモードかどうかのフラグ
     private volatile boolean lowGainMic = false;
     private volatile boolean hearingTranslateToEn = false;
+    public volatile boolean finalPriorityMode = false;
 
 
     public synchronized void setHearingTranslateToEn(boolean v) {
@@ -69,7 +69,26 @@ public class LocalWhisperCPP {
         }
         // ★既存コンテキストを解放してからロード（ネイティブメモリリーク防止）
 //        try { whisper.close(); } catch (Throwable ignore) {}
-        whisper.initContext(model);
+
+        // ★ gpu_device を WhisperContextParams に設定して渡す（クラスローダー競合をリフレクションで回避）
+        {
+            int gpuIdx = prefs.getInt("vulkan.gpu.index", -1);
+            try {
+                Object ctxParams = whisper.getContextDefaultParams();
+                java.lang.reflect.Field fGpu = ctxParams.getClass().getField("gpu_device");
+                fGpu.set(ctxParams, gpuIdx >= 0 ? gpuIdx : 0);
+                java.lang.reflect.Field fUseGpu = ctxParams.getClass().getField("use_gpu");
+                fUseGpu.set(ctxParams, (byte) 1);
+                ctxParams.getClass().getMethod("write").invoke(ctxParams);
+                Config.log("★initContext gpu_device=" + (gpuIdx >= 0 ? gpuIdx : 0));
+                whisper.getClass()
+                        .getMethod("initContext", String.class, ctxParams.getClass())
+                        .invoke(whisper, model.getAbsolutePath(), ctxParams);
+            } catch (Throwable ex) {
+                Config.log("★initContext reflection failed, fallback: " + ex.getMessage());
+                whisper.initContext(model);
+            }
+        }
 
         // ★Hearingモードは言語自動検出、プロンプトなし
         if (isHearingMode) {
@@ -95,9 +114,9 @@ public class LocalWhisperCPP {
         baseParamsGreedy.max_len = 0;
         baseParamsGreedy.n_threads =
                 (!MobMateWhisp.lowGpuMode) ? Math.min(
-                        12, // 上限
-                        Math.max(4, Runtime.getRuntime().availableProcessors() / 3) // 下限4
-                ) : 1;
+                        Math.max(8, Runtime.getRuntime().availableProcessors() / 2),  // /3→/2、下限4→8
+                        Config.getInt("whisper.n_threads", Runtime.getRuntime().availableProcessors() / 2)
+                ) : Math.max(2, Runtime.getRuntime().availableProcessors() / 4);  // lowGpuMode: 1→最低2
         baseParamsGreedy.language = this.language;
         baseParamsGreedy.initial_prompt = this.initialPrompt;
         baseParamsGreedy.write();
@@ -110,9 +129,9 @@ public class LocalWhisperCPP {
         baseParamsBeam.detect_language = CBool.FALSE;
         baseParamsBeam.n_threads =
                 (!MobMateWhisp.lowGpuMode) ? Math.min(
-                        12, // 上限
-                        Math.max(4, Runtime.getRuntime().availableProcessors() / 3) // 下限4
-                ) : 1;
+                        Math.max(8, Runtime.getRuntime().availableProcessors() / 2),  // /3→/2、下限4→8
+                        Config.getInt("whisper.n_threads", Runtime.getRuntime().availableProcessors() / 2)
+                ) : Math.max(2, Runtime.getRuntime().availableProcessors() / 4);  // lowGpuMode: 1→最低2
         baseParamsBeam.language = this.language;
         baseParamsBeam.initial_prompt = this.initialPrompt;
         baseParamsBeam.write();
@@ -134,9 +153,9 @@ public class LocalWhisperCPP {
         p.detect_language = CBool.FALSE;
         p.n_threads =
                 (!MobMateWhisp.lowGpuMode) ? Math.min(
-                        12,
-                        Math.max(4, Runtime.getRuntime().availableProcessors() / 3)
-                ) : 1;
+                        Math.max(8, Runtime.getRuntime().availableProcessors() / 2),  // /3→/2、下限4→8
+                        Config.getInt("whisper.n_threads", Runtime.getRuntime().availableProcessors() / 2)
+                ) : Math.max(2, Runtime.getRuntime().availableProcessors() / 4);  // lowGpuMode: 1→最低2
         p.initial_prompt = buildInitialPrompt();
         p.write();
         return p;
@@ -159,9 +178,9 @@ public class LocalWhisperCPP {
         }
         p.n_threads =
                 (!MobMateWhisp.lowGpuMode) ? Math.min(
-                        12,
-                        Math.max(4, Runtime.getRuntime().availableProcessors() / 3)
-                ) : 1;
+                        Math.max(8, Runtime.getRuntime().availableProcessors() / 2),  // /3→/2、下限4→8
+                        Config.getInt("whisper.n_threads", Runtime.getRuntime().availableProcessors() / 2)
+                ) : Math.max(2, Runtime.getRuntime().availableProcessors() / 4);  // lowGpuMode: 1→最低2
         p.language = this.language;
         p.initial_prompt = buildInitialPrompt();
         applyTranslatePref(p);
@@ -185,9 +204,9 @@ public class LocalWhisperCPP {
         }
         p.n_threads =
                 (!MobMateWhisp.lowGpuMode) ? Math.min(
-                        12,
-                        Math.max(4, Runtime.getRuntime().availableProcessors() / 3)
-                ) : 1;
+                        Math.max(8, Runtime.getRuntime().availableProcessors() / 2),  // /3→/2、下限4→8
+                        Config.getInt("whisper.n_threads", Runtime.getRuntime().availableProcessors() / 2)
+                ) : Math.max(2, Runtime.getRuntime().availableProcessors() / 4);  // lowGpuMode: 1→最低2
 
         // ★言語と自動検出は「autoのときだけ検出」
         //   翻訳ON/OFFに関係なく、このルールが一番安定するっす
@@ -450,60 +469,68 @@ public class LocalWhisperCPP {
             floats[i] = shorts[i] / 32768.0f;
         }
 
-        int longSec = Config.getInt("whisper.long_mode_sec", 3); // 例:秒以上は長文扱い
-        boolean longMode = numSamples >= (SAMPLE_RATE_HZ * longSec);
-        WhisperFullParams params = createGreedyParams(longMode);
-        String raw = whisper.fullTranscribe(params, floats);
-
-        // ★BGM判定を最優先
-//        String lowerRaw = raw.toLowerCase();
-//        if ((lowerRaw.startsWith("bgm") || lowerRaw.equals("bgm、") || lowerRaw.equals("bgm,"))) {
-//            Config.logDebug("★BGM detected in transcribeRaw, returning empty");
-//            MobMateWhisp.setLastPartial("");
-//            return "";
-//        }
-
-        // ★Ignore判定
-        if (isIgnored(raw)) {
-            Config.logDebug("★Ignored text: " + raw);
-            MobMateWhisp.setLastPartial("");
-            return "";
-        }
-
-        if (raw != null && !raw.trim().isEmpty()) {
-            if (isIgnored(raw)) {
-                MobMateWhisp.setLastPartial("");
-            }
-            // ★Partial暴走対策
-            if (isGarbagePartial(raw)) {
-                Config.logDebug("★Partial dropped (garbage): len=" + raw.length());
-                raw = ""; // lastPartial/overlay/speak に流さない
-            }
-            // UI/ログ用は長さ制限（詰まり防止）
-            raw = clampForUi(raw, 100);
-            MobMateWhisp.setLastPartial(raw.trim());
-            Config.logDebug("★Partial: " + MobMateWhisp.getLastPartial());
-        } else {
-            return "";
-        }
-        int INSTANT_FINAL_MAX_CHARS = (MobMateWhisp.isSilenceAlternate() && !lowGainMic) ? 12 : 10;
-        int len = raw.codePointCount(0, raw.length());
-        if (len <= INSTANT_FINAL_MAX_CHARS) {
-            String fin = raw.trim();
-            if (isEndOfCapture) {
-                // ★Final経路: 即確定OK
-                Config.logDebug("★Instant FINAL (short utterance): " + fin);
-                mobMateWhisp.instantFinalFromWhisper(fin, action);
+        synchronized (whisper) {
+            // partial処理中にfinalが来てたらスキップ（finalに道を譲る）
+            if (!isEndOfCapture && finalPriorityMode) {
+                Config.logDebug("★Partial transcribe skipped (finalPriority)");
                 return "";
-            } else {
-                // ★Partial経路: キャッシュだけして即確定しない（暴発防止）
-                // → finalが来ればそちらが正しい結果を出す / finalが空ならrescueが拾う
-                Config.logDebug("★Partial short, skip instant FINAL (awaiting real final): " + fin);
-                return raw.trim();
             }
-        }
 
-        return raw.trim();
+            int longSec = Config.getInt("whisper.long_mode_sec", 3);
+            boolean longMode = numSamples >= (SAMPLE_RATE_HZ * longSec);
+            WhisperFullParams params = createGreedyParams(longMode);
+            String raw = whisper.fullTranscribe(params, floats);
+
+            // ★BGM判定を最優先
+            //        String lowerRaw = raw.toLowerCase();
+            //        if ((lowerRaw.startsWith("bgm") || lowerRaw.equals("bgm、") || lowerRaw.equals("bgm,"))) {
+            //            Config.logDebug("★BGM detected in transcribeRaw, returning empty");
+            //            MobMateWhisp.setLastPartial("");
+            //            return "";
+            //        }
+
+            // ★Ignore判定
+            if (isIgnored(raw)) {
+                Config.logDebug("★Ignored text: " + raw);
+                MobMateWhisp.setLastPartial("");
+                return "";
+            }
+
+            if (raw != null && !raw.trim().isEmpty()) {
+                if (isIgnored(raw)) {
+                    MobMateWhisp.setLastPartial("");
+                }
+                // ★Partial暴走対策
+                if (isGarbagePartial(raw)) {
+                    Config.logDebug("★Partial dropped (garbage): len=" + raw.length());
+                    raw = ""; // lastPartial/overlay/speak に流さない
+                }
+                // UI/ログ用は長さ制限（詰まり防止）
+                raw = clampForUi(raw, 100);
+                MobMateWhisp.setLastPartial(raw.trim());
+                Config.logDebug("★Partial: " + MobMateWhisp.getLastPartial());
+            } else {
+                return "";
+            }
+            int INSTANT_FINAL_MAX_CHARS = (MobMateWhisp.isSilenceAlternate() && !lowGainMic) ? 12 : 10;
+            int len = raw.codePointCount(0, raw.length());
+            if (len <= INSTANT_FINAL_MAX_CHARS) {
+                String fin = raw.trim();
+                if (isEndOfCapture) {
+                    // ★Final経路: 即確定OK
+                    Config.logDebug("★Instant FINAL (short utterance): " + fin);
+                    mobMateWhisp.instantFinalFromWhisper(fin, action);
+                    return "";
+                } else {
+                    // ★Partial経路: キャッシュだけして即確定しない（暴発防止）
+                    // → finalが来ればそちらが正しい結果を出す / finalが空ならrescueが拾う
+                    Config.logDebug("★Partial short, skip instant FINAL (awaiting real final): " + fin);
+                    return raw.trim();
+                }
+            }
+
+            return raw.trim();
+        }
     }
     public static void main(String[] args) throws Exception {
         Config.logDebug("-1");

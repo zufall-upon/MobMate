@@ -1,0 +1,9 @@
+MobMateWhispTalk incorporates the Moonshine AI speech-to-text models.
+
+Moonshine AI Core Library:
+Copyright (c) 2024-2025 Moonshine AI.
+Licensed under the MIT License.
+
+Moonshine AI Non-English Models (e.g., base-ja):
+Copyright (c) 2024-2025 Moonshine AI.
+Licensed under the Moonshine AI Community License.

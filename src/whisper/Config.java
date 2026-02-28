@@ -593,59 +593,55 @@ class VulkanGpuUtil {
 
     private static synchronized void ensureLoaded() {
         if (cachedNames != null) return;
-
         cachedNames = new ArrayList<>();
 
-        try {
-            Process p = new ProcessBuilder(
-                    "vulkaninfo",
-                    "--summary"
-            )
-                    .redirectErrorStream(true)
-                    .start();
+        // vulkaninfo の候補パス（PATH優先、SDK入れてない環境でも対処）
+        String[] candidates = {
+                "vulkaninfo",
+                "C:\\Program Files (x86)\\Vulkan SDK\\Bin\\vulkaninfo.exe",
+                "C:\\VulkanSDK\\Bin\\vulkaninfo.exe"
+        };
+        Process p = null;
+        for (String cmd : candidates) {
+            try {
+                p = new ProcessBuilder(cmd, "--summary")
+                        .redirectErrorStream(true)
+                        .start();
+                break;
+            } catch (Exception ignore) {}
+        }
+        if (p == null) {
+            cachedNames.add("Vulkan GPU (unknown)");
+            return;
+        }
 
-            String pendingName = null;
-
-            try (BufferedReader r = new BufferedReader(
-                    new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
-
-                String line;
-                while ((line = r.readLine()) != null) {
-                    line = line.trim();
-
-
-
-                    if (line.startsWith("GPU id")) {
-                        int l = line.indexOf('(');
-                        int rIdx = line.lastIndexOf(')');
-                        if (l >= 0 && rIdx > l) {
-                            pendingName = line.substring(l + 1, rIdx).trim();
-                            cachedNames.add(pendingName);
-                            pendingName = null;
-                        }
-                    }
-
-
-
-                    if (line.startsWith("deviceName")) {
-                        int eq = line.indexOf('=');
-                        if (eq > 0) {
-                            String name = line.substring(eq + 1).trim();
-                            cachedNames.add(name);
-                        }
+        try (BufferedReader r = new BufferedReader(
+                new InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            boolean inGpuBlock = false;
+            while ((line = r.readLine()) != null) {
+                String trimmed = line.trim();
+                // GPU0: / GPU1: などの行を検出
+                if (trimmed.matches("GPU\\d+:")) {
+                    cachedNames.add("Vulkan GPU"); // deviceNameで上書き
+                    inGpuBlock = true;
+                } else if (inGpuBlock && trimmed.startsWith("deviceName")) {
+                    int eq = trimmed.indexOf('=');
+                    if (eq > 0) {
+                        String name = trimmed.substring(eq + 1).trim();
+                        cachedNames.set(cachedNames.size() - 1, name);
+                        inGpuBlock = false;
                     }
                 }
             }
+        } catch (Exception ignore) {}
 
-            p.waitFor();
-
-        } catch (Exception e) {
-            cachedNames.clear();
-        }
+        try { p.waitFor(); } catch (Exception ignore) {}
 
         if (cachedNames.isEmpty()) {
             cachedNames.add("Vulkan GPU (unknown)");
         }
+        Config.log("[VulkanGpuUtil] found " + cachedNames.size() + " GPU(s): " + cachedNames);
     }
 }
 

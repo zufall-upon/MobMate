@@ -1,0 +1,12 @@
+Moonshine AI Community License Notice
+
+This application distributes and utilizes the Moonshine AI non-English speech-to-text models (e.g., Japanese models). 
+These specific model weights are provided under the Moonshine AI Community License.
+
+The Moonshine AI Community License permits free commercial use and redistribution, provided that the total annual gross revenue of the distributing entity does not exceed $1,000,000 USD. 
+
+By using this software, you acknowledge the inclusion of these models. For the full terms of the Moonshine AI Community License, or to inquire about Enterprise licensing for revenues exceeding the threshold, please visit:
+https://www.moonshine.ai/community-license
+
+---
+Note: The underlying Moonshine C++ core framework and English models are released separately under the permissive MIT License.

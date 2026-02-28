@@ -30,6 +30,8 @@ public class SpeakerProfile {
 
     // ---- 状態 ----
     private double[] avgFeature;         // 話者の中心特徴量 [FEATURE_DIM]
+    // マルチセントロイド（enroll時の全サンプルを保持）
+    private List<double[]> centroids = new ArrayList<>();
     private double enrollmentSpread;     // ★エンロール時の平均分散（スコア正規化用）
     private int enrollCount;
     private int requiredSamples;
@@ -38,6 +40,10 @@ public class SpeakerProfile {
     private double targetThreshold;
     private int totalAccepted;
     private int totalRejected;
+    // ★ADD: 連続REJECT救済カウンタ
+    private int consecutiveRejects = 0;
+    private static final int RESCUE_REJECT_THRESHOLD = 15; // 15連続REJECTで救済発動
+    private static final double RESCUE_SCORE_MIN = 0.35;   // この以上なら「近い声」とみなす
 
     private final List<double[]> enrolledFeatures = new ArrayList<>();
 
@@ -73,6 +79,7 @@ public class SpeakerProfile {
         if (feat == null) return;
 
         enrolledFeatures.add(feat);
+        centroids.add(feat);
         enrollCount++;
 
         // 中心特徴量を再計算
@@ -118,21 +125,84 @@ public class SpeakerProfile {
      * 話者判定
      * @return true = 話者一致（またはプロファイル未完成）
      */
+    // ★最小RMS閾値（16bit PCM基準: 正常な音声は1500以上が目安）
+    private static final double MIN_RMS_FOR_SPEAKER_CHECK = 800.0;
+
     public synchronized boolean isMatchingSpeaker(byte[] pcm16le) {
         if (!isReady()) return true;
         if (pcm16le == null || pcm16le.length < FFT_SIZE * 2) return false;
 
-        double score = similarity(pcm16le);
+        // ★エネルギーゲート: 静寂・環境ノイズを早期リジェクト
+        double rms = computeRms(pcm16le);
+        if (rms < MIN_RMS_FOR_SPEAKER_CHECK) {
+            Config.logDebug(String.format("★Speaker: ENERGY_REJECT rms=%.1f < %.1f",
+                    rms, MIN_RMS_FOR_SPEAKER_CHECK));
+            totalRejected++;
+            return false;
+        }
+
+        double score = similarity(trimSilentTail(pcm16le));
         boolean match = score >= threshold;
 
         if (!match) {
             totalRejected++;
         }
 
-        Config.logDebug(String.format("★Speaker: score=%.3f thr=%.3f spread=%.3f %s (ok=%d ng=%d)",
-                score, threshold, enrollmentSpread, match ? "PASS" : "REJECT",
+        if (match) {
+            consecutiveRejects = 0;
+        } else {
+            consecutiveRejects++;
+            // ★ADD: 長期デッドロック救済 — 連続REJECTが続き、かつスコアが「近い」なら強制PASS
+            if (consecutiveRejects >= RESCUE_REJECT_THRESHOLD && score >= RESCUE_SCORE_MIN) {
+                match = true;
+                consecutiveRejects = 0;
+                Config.logDebug(String.format("★Speaker: RESCUE PASS (consec=%d score=%.3f)",
+                        RESCUE_REJECT_THRESHOLD, score));
+            }
+        }
+
+        Config.logDebug(String.format("★Speaker: score=%.3f thr=%.3f spread=%.3f rms=%.1f %s (ok=%d ng=%d)",
+                score, threshold, enrollmentSpread, rms, match ? "PASS" : "REJECT",
                 totalAccepted, totalRejected));
         return match;
+    }
+    /** ★ADD: PCMバッファ末尾の無音（RMS < 300）をトリムする */
+    private static byte[] trimSilentTail(byte[] pcm16le) {
+        int frameSize = 800; // 50ms @ 16kHz
+        int numSamples = pcm16le.length / 2;
+        int lastVoicedSample = frameSize; // 最低50msは残す
+        for (int i = numSamples / frameSize - 1; i >= 1; i--) {
+            double sum = 0;
+            for (int j = i * frameSize; j < (i + 1) * frameSize; j++) {
+                int lo = pcm16le[j * 2] & 0xFF;
+                int hi = pcm16le[j * 2 + 1];
+                double s = (short) (lo | (hi << 8));
+                sum += s * s;
+            }
+            double rms = Math.sqrt(sum / frameSize);
+            if (rms > 300) {
+                lastVoicedSample = (i + 1) * frameSize;
+                break;
+            }
+        }
+        int trimLen = Math.min(lastVoicedSample * 2, pcm16le.length);
+        if (trimLen >= pcm16le.length) return pcm16le; // トリム不要
+        byte[] trimmed = new byte[trimLen];
+        System.arraycopy(pcm16le, 0, trimmed, 0, trimLen);
+        return trimmed;
+    }
+
+    // ★追加メソッド（クラス末尾のユーティリティ欄に追加）
+    private static double computeRms(byte[] pcm16le) {
+        int numSamples = pcm16le.length / 2;
+        double sum = 0;
+        for (int i = 0; i < numSamples; i++) {
+            int lo = pcm16le[i * 2] & 0xFF;
+            int hi = pcm16le[i * 2 + 1];
+            double s = (short) (lo | (hi << 8));
+            sum += s * s;
+        }
+        return Math.sqrt(sum / numSamples);
     }
 
     /**
@@ -144,10 +214,26 @@ public class SpeakerProfile {
         double[] feat = computeFeatures(pcm16le);
         if (feat == null) return 0.0;
 
-        double dist = euclideanDistance(avgFeature, feat);
-        // ガウスカーネル: exp(-d²/(2σ²))
-        double sigma = Math.max(enrollmentSpread * 2.5, 2.0); // ★同話者の自然なバラツキ幅に合わせて広げる
-        return Math.exp(-(dist * dist) / (2.0 * sigma * sigma));
+        double sigma = Math.max(enrollmentSpread * 1.2, 2.0);
+
+        // ★マルチセントロイド: 全enrollサンプルとのスコアのmax（口調変化に対応）
+        double bestScore = 0.0;
+        if (!centroids.isEmpty()) {
+            for (double[] c : centroids) {
+                double dist = euclideanDistance(c, feat);
+                double s = Math.exp(-(dist * dist) / (2.0 * sigma * sigma));
+                if (s > bestScore) bestScore = s;
+            }
+        } else {
+            // フォールバック: 旧来の単一セントロイド
+            double dist = euclideanDistance(avgFeature, feat);
+            bestScore = Math.exp(-(dist * dist) / (2.0 * sigma * sigma));
+        }
+
+        // ★avgとのブレンド（完全にmaxだけにするとノイズに弱いので7:3）
+        double avgDist = euclideanDistance(avgFeature, feat);
+        double avgScore = Math.exp(-(avgDist * avgDist) / (2.0 * sigma * sigma));
+        return bestScore * 0.7 + avgScore * 0.3;
     }
 
     /**
@@ -157,6 +243,10 @@ public class SpeakerProfile {
     public synchronized boolean refineSample(byte[] pcm16le) {
         if (!isReady()) return false;
         if (pcm16le == null || pcm16le.length < FFT_SIZE * 2) return false;
+
+        // ★ADD: 末尾の無音をトリムして特徴量の希釈を防ぐ
+        byte[] trimmed = trimSilentTail(pcm16le);
+        if (trimmed.length < FFT_SIZE * 2) return false;
 
         double[] feat = computeFeatures(pcm16le);
         if (feat == null) return false;
@@ -439,6 +529,11 @@ public class SpeakerProfile {
             for (double v : avgFeature) {
                 dos.writeDouble(v);
             }
+            // ★ADD: セントロイド保存
+            dos.writeInt(centroids.size());
+            for (double[] c : centroids) {
+                for (double v : c) dos.writeDouble(v);
+            }
             Config.logDebug(String.format("★Speaker saved: ok=%d ng=%d thr=%.3f spread=%.3f",
                     totalAccepted, totalRejected, threshold, enrollmentSpread));
         } catch (Exception e) {
@@ -465,6 +560,14 @@ public class SpeakerProfile {
             avgFeature = new double[FEATURE_DIM];
             for (int i = 0; i < FEATURE_DIM; i++) {
                 avgFeature[i] = dis.readDouble();
+            }
+            // ★ADD: セントロイド読み込み
+            centroids.clear();
+            int nCentroids = dis.readInt();
+            for (int i = 0; i < nCentroids; i++) {
+                double[] c = new double[FEATURE_DIM];
+                for (int j = 0; j < FEATURE_DIM; j++) c[j] = dis.readDouble();
+                centroids.add(c);
             }
             Config.logDebug(String.format("★Speaker loaded: enroll=%d ok=%d thr=%.3f spread=%.3f",
                     enrollCount, totalAccepted, threshold, enrollmentSpread));

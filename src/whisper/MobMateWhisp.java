@@ -28,7 +28,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.prefs.BackingStoreException;
 import java.util.prefs.Preferences;
 import java.nio.charset.StandardCharsets;
-import javax.sound.sampled.*;
 import java.net.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -50,8 +49,6 @@ import static whisper.VoicegerManager.httpOk;
 
 public class MobMateWhisp implements NativeKeyListener {
 
-//    public static final boolean IS_DEMO = true; //TODO ← 製品版はfalseにするかビルドフラグで制御
-
     private static final String PREF_WIN_X = "ui.window.x";
     private static final String PREF_WIN_Y = "ui.window.y";
     private static final String PREF_WIN_W = "ui.window.w";
@@ -67,6 +64,8 @@ public class MobMateWhisp implements NativeKeyListener {
     private String[] laughOptions;
     private HistoryFrame historyFrame;
 
+    // Moonshine
+    private static LocalMoonshineSTT moonshine;
     // Whisper
     volatile LocalWhisperCPP w;
     private volatile LocalWhisperCPP wHearing;
@@ -81,8 +80,16 @@ public class MobMateWhisp implements NativeKeyListener {
     private Image imageInactive;
 
     // Execution services
-    private final ExecutorService executorService = Executors.newFixedThreadPool(3);
-    private final ExecutorService audioService = Executors.newFixedThreadPool(2);
+    private static final ExecutorService executorService = Executors.newFixedThreadPool(3, r -> {
+        Thread t = new Thread(r, "whisper-executor");
+        t.setDaemon(true);
+        return t;
+    });
+    private static final ExecutorService audioService = Executors.newFixedThreadPool(2, r -> {
+        Thread t = new Thread(r, "audio-executor");
+        t.setDaemon(true);
+        return t;
+    });
 
     // Add calibration status tracking field
     private volatile boolean isCalibrationComplete = false;
@@ -175,6 +182,8 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile boolean voiceVoxAlive = false;
     private volatile long lastVoiceVoxCheckMs = 0;
     private static final long VOICEVOX_CHECK_INTERVAL_MS = 1000 * 5; // 5秒に1回
+    private volatile boolean isTtsSpeaking = false;  // TTS再生中フラグ（VADループバック防止
+    private volatile boolean moonshineLastGateOk = true;
 
     private volatile String pendingLaughText = null;
     private final Object laughLock = new Object();
@@ -399,10 +408,19 @@ public class MobMateWhisp implements NativeKeyListener {
                     }
                 }
             }
-            this.w = new LocalWhisperCPP(new File(dir, this.model),"");
-            Config.log("MobMateWhispTalk using WhisperCPP with " + this.model);
             this.model_dir = dir.getPath();
             prefs.put("model_dir", model_dir);
+
+            // ★v1.5.0: エンジン選択に応じて初期化を分岐
+            if (isEngineMoonshine()) {
+                Config.log("★RecogEngine = Moonshine (Whisper skip)");
+                this.w = null;  // Whisperは使わない
+                initMoonshine();
+            } else {
+                Config.log("★RecogEngine = Whisper (Moonshine skip)");
+                this.w = new LocalWhisperCPP(new File(dir, this.model), "");
+                Config.log("MobMateWhispTalk using WhisperCPP with " + this.model);
+            }
         } else {
             Config.log("MobMateWhispTalk using remote speech to text service : " + remoteUrl);
         }
@@ -428,6 +446,186 @@ public class MobMateWhisp implements NativeKeyListener {
             return wHearing;
         }
     }
+    // Moonshine初期化
+
+    private void initMoonshine() {
+        //TODO test
+//        String path = "M:\\_work\\moonshine\\_model\\base-ja\\quantized\\base-ja";
+        // モデルパスはprefsから（未設定ならデフォルト）
+        String path = prefs.get("moonshine.model_path", "");
+        if (path.isEmpty()) {
+            // 実行ディレクトリ直下の moonshine_model を探す
+            File defaultDir = new File("moonshine_model");
+            if (defaultDir.isDirectory()) {
+                path = defaultDir.getAbsolutePath();
+            } else {
+                Config.log("[Moonshine] ERROR: moonshine.model_path not set and moonshine_model/ not found. Falling back to Whisper.");
+                prefs.put("recog.engine", "whisper");
+                try { prefs.flush(); } catch (Exception ignore) {}
+                // Whisperにフォールバック
+                try {
+                    this.w = new LocalWhisperCPP(new File(model_dir, this.model), "");
+                    Config.log("[Moonshine] fallback: Whisper loaded OK");
+                } catch (Exception ex) {
+                    Config.logError("[Moonshine] fallback: Whisper load FAILED", ex);
+                }
+                return;
+            }
+        }
+
+        // archが不明なので全部試す
+        int[] archCandidates = {1, 3, 0, 2, 4, 5};
+        String[] archNames = {"BASE", "BASE_STREAMING", "TINY", "TINY_STREAMING", "SMALL_STREAMING", "MEDIUM_STREAMING"};
+
+
+        moonshine = new LocalMoonshineSTT();
+        // ★v1.5.0: Whisperと共通の設定をMoonshineにも適用
+        {
+            // スレッド数（Whisperと同じロジック。MoonshineはCPU推論のためスレッド数が効く）
+            int threads;
+            if (!lowGpuMode) {
+                threads = Math.min(
+                        Math.max(8, Runtime.getRuntime().availableProcessors() / 2),
+                        Config.getInt("whisper.n_threads",
+                                Runtime.getRuntime().availableProcessors() / 2)
+                );
+            } else {
+                threads = Math.max(2, Runtime.getRuntime().availableProcessors() / 4);
+            }
+            moonshine.setNumThreads(threads);
+
+            // ポーリング間隔（lowGpuMode対応。推論レイテンシ~200msのため200ms以下は空振り増加）
+            int pollMs = lowGpuMode ? 400 : 200;
+            pollMs = Config.getInt("moonshine.poll_interval_ms", pollMs);
+            moonshine.setPollInterval(pollMs);
+
+            Config.log("[Moonshine] config: threads=" + threads
+                    + " poll=" + pollMs + "ms"
+                    + " lowGpu=" + lowGpuMode
+                    + " (CPU inference, Vulkan DLC not required)");
+        }
+        boolean loaded = false;
+        for (int i = 0; i < archCandidates.length; i++) {
+            Config.log("[Moonshine] trying arch=" + archCandidates[i]
+                    + " (" + archNames[i] + ")...");
+            if (moonshine.load(path, archCandidates[i])) {
+                Config.log("[Moonshine] ★ arch=" + archCandidates[i]
+                        + " (" + archNames[i] + ") SUCCESS!");
+                loaded = true;
+                break;
+            }
+            Config.log("[Moonshine] arch=" + archCandidates[i] + " failed");
+        }
+
+        if (!loaded) {
+            Config.log("[Moonshine] all archs failed. Falling back to Whisper.");
+            moonshine = null;
+            prefs.put("recog.engine", "whisper");
+            try { prefs.flush(); } catch (Exception ignore) {}
+            try {
+                this.w = new LocalWhisperCPP(new File(model_dir, this.model), "");
+            } catch (Exception ex) {
+                Config.logError("[Moonshine] fallback Whisper load FAILED", ex);
+            }
+            return;
+        }
+
+        // ★アクション解決
+        final String strAction = prefs.get("action", "nothing");
+        Action action;
+        if ("paste".equals(strAction)) {
+            action = Action.COPY_TO_CLIPBOARD_AND_PASTE;
+        } else if ("type".equals(strAction)) {
+            action = Action.TYPE_STRING;
+        } else {
+            action = Action.NOTHING;
+        }
+
+        // ★v1.5.0: onPartial → UIタイトル更新 + lastPartialResult更新
+
+        // ★v1.5.0: onPartial → UIタイトル更新 + lastPartialResult更新
+        moonshine.setOnPartial(text -> {
+            if (text == null || text.isBlank()) return;
+            String trimmed = text.trim();
+            trimmed = removeCjkSpaces(trimmed);  // ★v1.5.0: CJK間スペース除去
+            // ★ignoreリスト判定
+            if (LocalWhisperCPP.isIgnoredStatic(trimmed)) {
+                Config.logDebug("★Ignored text: " + trimmed);
+                return;
+            }
+            // ★v1.5.0: Whisperから移植 — ガベージPartial検出（!!!!暴走等）
+            if (isGarbagePartialStatic(trimmed)) {
+                Config.logDebug("★Moon Partial dropped (garbage): len=" + trimmed.length());
+                return;
+            }
+            // ★v1.5.0: Whisperから移植 — UI詰まり防止（100文字制限）
+            String clamped = trimmed;
+            if (clamped.length() > 100) {
+                clamped = clamped.substring(0, 100) + "…";
+            }
+            MobMateWhisp.setLastPartial(clamped);
+            lastPartialUpdateMs = System.currentTimeMillis();
+            setTranscribing(true);  // ★ADD: partial到達時にtranscribing開始（全フレームではなく）
+            Config.logDebug("★Partial: " + clamped);
+            final String forUi = clamped;
+            SwingUtilities.invokeLater(() -> {
+                if (window != null) {
+                    window.setTitle("[TRANS]:" + forUi);
+                    window.setIconImage(imageTranscribing);
+                }
+            });
+        });
+
+        // ★v1.5.0: onCompleted → handleFinalText + 短文即時判定
+        moonshine.setOnCompleted(text -> {
+            if (text == null || text.isBlank()) return;
+            String trimmed = text.trim();
+            trimmed = removeCjkSpaces(trimmed);  // ★v1.5.0: CJK間スペース除去
+            if (LocalWhisperCPP.isIgnoredStatic(trimmed)) {
+                Config.logDebug("★Ignored text: " + trimmed);
+                return;
+            }
+            setTranscribing(false);  // ★ADD: COMPLETE時にtranscribing解除
+
+            // ★v1.5.0: 話者ゲート（VAD Finalで評価済みの結果を参照）
+            if (prefs.getBoolean("speaker.enabled", false) && speakerProfile.isReady()) {
+                if (!moonshineLastGateOk) {
+                    Config.logDebug("★Moon COMPLETE: speaker gate blocked -> " + trimmed);
+                    MobMateWhisp.setLastPartial("");
+                    return;
+                }
+            }
+
+            // ★COMPLETEが確定結果。partialはCOMPLETEを前方延長する場合のみ優先
+            String lastP = MobMateWhisp.getLastPartial();
+            boolean partialExtendsComplete = lastP != null && !lastP.isBlank()
+                    && lastP.startsWith(trimmed)
+                    && lastP.length() > trimmed.length();
+            if (partialExtendsComplete) {
+                Config.logDebug("★Instant FINAL (partial extends complete): " + lastP);
+                handleFinalText(lastP, action, true);
+            } else {
+                handleFinalText(trimmed, action, false);
+            }
+            MobMateWhisp.setLastPartial("");
+        });
+
+        moonshine.start();
+        Config.log("[Moonshine] ready (engine=moonshine)");
+    }
+    private static void shutdownMoonshine() {
+        if (moonshine != null) {
+            try {
+                Config.log("[Moonshine] shutting down...");
+                moonshine.close();
+                Config.log("[Moonshine] shutdown OK");
+            } catch (Exception ex) {
+                Config.logError("[Moonshine] shutdown error: " + ex.getMessage(), ex);
+            } finally {
+                moonshine = null;
+            }
+        }
+    }
 
     private Preferences getPrefs() {
         if (prefs == null) {
@@ -435,6 +633,100 @@ public class MobMateWhisp implements NativeKeyListener {
         }
         return prefs;
     }
+    public boolean isEngineMoonshine() {
+        return "moonshine".equalsIgnoreCase(prefs.get("recog.engine", "whisper"));
+    }
+    public String getRecogEngineName() {
+        return isEngineMoonshine() ? "Moonshine" : "Whisper";
+    }
+    // ★v1.5.0: Moonshine用 — LocalWhisperCPP.isGarbagePartial() のstatic版
+    // Whisper側はインスタンスメソッドだが、Moonshineコールバックから呼ぶためstaticで公開
+    private static boolean isGarbagePartialStatic(String s) {
+        if (s == null) return true;
+        String t = s.trim();
+        if (t.isEmpty()) return true;
+
+        // 同一文字の繰り返し（!だけ、-だけ等）
+        if (t.length() >= 40) {
+            char c0 = t.charAt(0);
+            boolean allSame = true;
+            for (int i = 1; i < t.length(); i++) {
+                if (t.charAt(i) != c0) { allSame = false; break; }
+            }
+            if (allSame) return true;
+        }
+
+        // 記号率が高すぎる（英数かな漢字がほぼ無い）
+        int good = 0, total = 0;
+        for (int i = 0; i < t.length(); i++) {
+            char c = t.charAt(i);
+            if (Character.isWhitespace(c)) continue;
+            total++;
+            if (Character.isLetterOrDigit(c)) good++;
+        }
+        if (total >= 20) {
+            double ratio = good * 1.0 / total;
+            return ratio < 0.15;
+        }
+
+        return false;
+    }
+    // ★v1.5.0: Moonshine用 — CJK文字間の不要スペース除去
+    // Moonshineが「や り た く」のように1文字ずつスペースを挟むケースの対策
+    static String removeCjkSpaces(String s) {
+        if (s == null || s.length() < 3) return s;
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == ' ' && i > 0 && i < s.length() - 1) {
+                char prev = s.charAt(i - 1);
+                char next = s.charAt(i + 1);
+                // CJK同士の間のスペースだけ除去
+                if (isCjk(prev) && isCjk(next)) {
+                    continue; // スペースをスキップ
+                }
+            }
+            sb.append(c);
+        }
+        return sb.toString();
+    }
+    private static boolean isCjk(char c) {
+        Character.UnicodeBlock b = Character.UnicodeBlock.of(c);
+        return b == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS
+                || b == Character.UnicodeBlock.HIRAGANA
+                || b == Character.UnicodeBlock.KATAKANA
+                || b == Character.UnicodeBlock.KATAKANA_PHONETIC_EXTENSIONS
+                || b == Character.UnicodeBlock.CJK_COMPATIBILITY_IDEOGRAPHS
+                || b == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_A
+                || b == Character.UnicodeBlock.HANGUL_SYLLABLES
+                || b == Character.UnicodeBlock.HANGUL_JAMO
+                || b == Character.UnicodeBlock.CJK_SYMBOLS_AND_PUNCTUATION
+                || b == Character.UnicodeBlock.HALFWIDTH_AND_FULLWIDTH_FORMS;
+    }
+    // ★v1.5.0: .onnx/.binファイルがある最深ディレクトリを再帰探索
+    static File findDeepestModelDir(File dir) {
+        File[] modelFiles = dir.listFiles((d, name) ->
+                name.endsWith(".onnx") || name.endsWith(".bin"));
+        if (modelFiles != null && modelFiles.length > 0) {
+            return dir;
+        }
+        File[] subDirs = dir.listFiles(File::isDirectory);
+        if (subDirs != null) {
+            for (File sub : subDirs) {
+                File found = findDeepestModelDir(sub);
+                File[] check = found.listFiles((d, name) ->
+                        name.endsWith(".onnx") || name.endsWith(".bin"));
+                if (check != null && check.length > 0) {
+                    return found;
+                }
+            }
+            if (subDirs.length > 0) {
+                return findDeepestModelDir(subDirs[0]);
+            }
+        }
+        return dir;
+    }
+
     void createTrayIcon() {
         Config.log("[TRAY] begin");
         // ★そもそもトレイ非対応環境なら即戻る（RDP/制限PCで多い）
@@ -1083,6 +1375,174 @@ public class MobMateWhisp implements NativeKeyListener {
         Config.log("[TRAY] popup: add Performance...");
         Menu performanceMenu = new Menu("Performance");
 
+        // ★v1.5.0: Recognition Engine Selection
+        Menu recogEngineMenu = new Menu("Recognition Engine");
+        String currentEngine = prefs.get("recog.engine", "whisper");
+        CheckboxMenuItem engineWhisper = new CheckboxMenuItem("Whisper");
+        CheckboxMenuItem engineMoonshine = new CheckboxMenuItem("Moonshine");
+        engineWhisper.setState("whisper".equalsIgnoreCase(currentEngine));
+        engineMoonshine.setState("moonshine".equalsIgnoreCase(currentEngine));
+
+        // ★v1.5.0: setState連鎖によるsoftRestart二重発火を防止するガード
+        final boolean[] updatingEngine = {false};
+
+        engineWhisper.addItemListener(e -> {
+            if (updatingEngine[0]) return;
+            if (engineWhisper.getState()) {
+                updatingEngine[0] = true;
+                try {
+                    engineMoonshine.setState(false);
+                    prefs.put("recog.engine", "whisper");
+                    try { prefs.flush(); } catch (Exception ignore) {}
+                    Config.log("★RecogEngine changed to: Whisper → soft restart");
+                    softRestart();
+                } finally {
+                    updatingEngine[0] = false;
+                }
+            } else {
+                engineWhisper.setState(true);
+            }
+        });
+        engineMoonshine.addItemListener(e -> {
+            if (updatingEngine[0]) return;
+            if (engineMoonshine.getState()) {
+                updatingEngine[0] = true;
+                try {
+                    engineWhisper.setState(false);
+                    prefs.put("recog.engine", "moonshine");
+                    try { prefs.flush(); } catch (Exception ignore) {}
+                    Config.log("★RecogEngine changed to: Moonshine → soft restart");
+                    softRestart();
+                } finally {
+                    updatingEngine[0] = false;
+                }
+            } else {
+                engineMoonshine.setState(true);
+            }
+        });
+
+        recogEngineMenu.add(engineWhisper);
+        recogEngineMenu.add(engineMoonshine);
+        recogEngineMenu.addSeparator();
+
+        // ★v1.5.0: Moonshine Model 言語選択（exe直下 moonshine_model/ を自動スキャン）
+        Menu moonModelMenu = new Menu("Moonshine Model");
+        String savedModelPath = prefs.get("moonshine.model_path", "");
+
+        File moonBaseDir = new File(getExeDir(), "moonshine_model");
+        File[] langDirs = moonBaseDir.isDirectory()
+                ? moonBaseDir.listFiles(File::isDirectory) : null;
+
+        List<CheckboxMenuItem> moonLangItems = new ArrayList<>();
+
+        if (langDirs != null && langDirs.length > 0) {
+            Arrays.sort(langDirs, Comparator.comparing(File::getName));
+            for (File langDir : langDirs) {
+                String langName = langDir.getName();
+                File modelDir = findDeepestModelDir(langDir);
+                String modelPath = modelDir.getAbsolutePath();
+
+                // 現在選択中かどうか
+                boolean selected = modelPath.equals(savedModelPath)
+                        || (!savedModelPath.isEmpty() && savedModelPath.contains(langName)
+                        && savedModelPath.contains("moonshine_model"));
+
+                CheckboxMenuItem item = new CheckboxMenuItem(langName);
+                item.setState(selected);
+                moonLangItems.add(item);
+
+                item.addItemListener(ev -> {
+                    if (item.getState()) {
+                        // 他を全部OFF
+                        for (CheckboxMenuItem other : moonLangItems) {
+                            if (other != item) other.setState(false);
+                        }
+                        prefs.put("moonshine.model_path", modelPath);
+                        try { prefs.flush(); } catch (Exception ignore) {}
+                        Config.log("★Moonshine model: " + langName + " → " + modelPath);
+
+                        if (isEngineMoonshine()) {
+                            softRestart();
+                        }
+                    } else {
+                        // 解除防止（最低1つ選択）
+                        item.setState(true);
+                    }
+                });
+                moonModelMenu.add(item);
+            }
+        } else {
+            MenuItem noModel = new MenuItem("(moonshine_model/ not found)");
+            noModel.setEnabled(false);
+            moonModelMenu.add(noModel);
+        }
+
+        // 何も選択されてない場合、先頭を自動選択
+        if (langDirs != null && langDirs.length > 0) {
+            boolean anySelected = moonLangItems.stream().anyMatch(CheckboxMenuItem::getState);
+            if (!anySelected && !moonLangItems.isEmpty()) {
+                moonLangItems.get(0).setState(true);
+                File firstModel = findDeepestModelDir(langDirs[0]);
+                prefs.put("moonshine.model_path", firstModel.getAbsolutePath());
+                try { prefs.flush(); } catch (Exception ignore) {}
+            }
+        }
+
+        moonModelMenu.addSeparator();
+
+        // 「フォルダを開く」
+        MenuItem openMoonDir = new MenuItem("Open moonshine_model/");
+        openMoonDir.addActionListener(e -> {
+            try {
+                if (!moonBaseDir.isDirectory()) moonBaseDir.mkdirs();
+                Desktop.getDesktop().open(moonBaseDir);
+            } catch (Exception ex) {
+                Config.logError("Failed to open moonshine_model dir", ex);
+            }
+        });
+        moonModelMenu.add(openMoonDir);
+
+        // 「カスタムパス（上級者向け）」
+        MenuItem customPath = new MenuItem("Custom Path...");
+        customPath.addActionListener(e -> {
+            SwingUtilities.invokeLater(() -> {
+                JFileChooser fc = new JFileChooser();
+                fc.setDialogTitle("Moonshine Model Directory");
+                fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+                fc.setAcceptAllFileFilterUsed(false);
+
+                String prev = prefs.get("moonshine.model_path", "");
+                if (!prev.isEmpty()) {
+                    File prevDir = new File(prev);
+                    if (prevDir.isDirectory()) {
+                        fc.setCurrentDirectory(prevDir);
+                    }
+                }
+
+                if (fc.showOpenDialog(window) != JFileChooser.APPROVE_OPTION) return;
+                File selected = fc.getSelectedFile();
+                if (selected == null || !selected.isDirectory()) return;
+
+                String newPath = selected.getAbsolutePath();
+                prefs.put("moonshine.model_path", newPath);
+                try { prefs.flush(); } catch (Exception ignore) {}
+                Config.log("★Moonshine model (custom): " + newPath);
+
+                // チェックボックスを全部外す（カスタムパスなので）
+                for (CheckboxMenuItem ci : moonLangItems) ci.setState(false);
+
+                if (isEngineMoonshine()) {
+                    softRestart();
+                }
+            });
+        });
+        moonModelMenu.add(customPath);
+
+        recogEngineMenu.add(moonModelMenu);
+
+        performanceMenu.add(recogEngineMenu);
+        performanceMenu.addSeparator();
+
         // GPU Selection
         Menu gpuMenu = new Menu(trayText("menu.gpuSelect"));
         int gpuIndex = prefs.getInt("vulkan.gpu.index", -1);
@@ -1642,6 +2102,7 @@ public class MobMateWhisp implements NativeKeyListener {
         MenuItem openWizardItem = new MenuItem(trayText("menu.wizard.open"));
         openWizardItem.addActionListener(e -> {
             SwingUtilities.invokeLater(() -> {
+                final String beforeEngine = prefs.get("recog.engine", "whisper"); // ★v1.5.0
                 FirstLaunchWizard wizard = null;
                 try {
                     try {
@@ -1655,6 +2116,13 @@ public class MobMateWhisp implements NativeKeyListener {
                     try {
                         if (wizard != null) wizard.stopAllWizardTests();
                     } catch (Throwable ignore) {}
+                }
+                // ★v1.5.0: エンジンが変わっていたらsoftRestart
+                String afterEngine = prefs.get("recog.engine", "whisper");
+                if (!java.util.Objects.equals(beforeEngine, afterEngine)) {
+                    Config.log("★Wizard(CC): engine changed " + beforeEngine
+                            + " → " + afterEngine + " → soft restart");
+                    softRestart();
                 }
             });
         });
@@ -3105,8 +3573,8 @@ public class MobMateWhisp implements NativeKeyListener {
                             Config.logDebug("★調整後 SILENCE_FRAMES_FOR_FINAL: " + SILENCE_FRAMES_FOR_FINAL);
 
                             boolean firstPartialSent = false;
-                            final int PREROLL_BYTES = (int) (16000 / 5);
-                            final int MIN_AUDIO_DATA_LENGTH = 16000 * 2;
+                            final int PREROLL_BYTES = (int) (16000 * 3 / 10);
+                            final int MIN_AUDIO_DATA_LENGTH = 16000;
                             long lastFinalMs = 0;
                             final long FINAL_COOLDOWN_MS = 200;
                             final long FORCE_FINAL_MS = 2500;
@@ -3154,6 +3622,12 @@ public class MobMateWhisp implements NativeKeyListener {
                                     byte[] pr = preRoll.toByteArray();
                                     preRoll.reset();
                                     preRoll.write(pr, pr.length - PREROLL_BYTES, PREROLL_BYTES);
+                                }
+                                // ★v1.5.0: Moonshineモードのときだけ音声を流す
+                                if (isEngineMoonshine() && moonshine != null && moonshine.isLoaded()) {
+                                    final float[] fpcm = pcm16leToFloat(pcm, n);
+                                    moonshine.addAudio(fpcm, 16000);
+                                    // ★REMOVE: setTranscribing(true)はonPartialで行う
                                 }
 
                                 int peak = vad.getPeak(pcm, n);
@@ -3265,6 +3739,11 @@ public class MobMateWhisp implements NativeKeyListener {
                                         ? ((ImprovedVAD) vad).isSpeech(pcm, n, buffer.size())
                                         : vad.isSpeech(pcm, n);
 
+                                // ★ADD: TTS再生中はVADをマスク（ループバック防止）
+                                if (isTtsSpeaking && speech) {
+                                    Config.logDebug("★VAD suppressed (TTS playing)");
+                                    speech = false;
+                                }
                                 // ===== 話者照合はfinalChunkレベルで実施（フレーム単位は精度不足）=====
 
                                 // ===== [ADD] strong signal but speech=false guard =====
@@ -3362,6 +3841,16 @@ public class MobMateWhisp implements NativeKeyListener {
                                         MobMateWhisp.setLastPartial("");
                                         lastPartialUpdateMs = 0L; // partial更新時刻もリセット
                                         Config.logDebug("★発話開始");
+                                        // ★ADD: Moonshineストリームを発話単位でリセット（コンテキスト汚染防止）
+                                        if (isEngineMoonshine() && moonshine != null && moonshine.isLoaded()) {
+                                            moonshine.resetStream();
+                                            // preRollをnewStreamに流す（発声冒頭の欠落防止）
+                                            byte[] pr = preRoll.toByteArray();
+                                            if (pr.length > 0) {
+                                                final float[] fpr = pcm16leToFloat(pr, pr.length);
+                                                moonshine.addAudio(fpr, 16000);
+                                            }
+                                        }
                                         SwingUtilities.invokeLater(() -> window.setTitle(UiText.t("ui.title.rec")));
                                     }
                                     buffer.write(pcm, 0, n);
@@ -3532,6 +4021,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
                                         lastFinalExecutionTime.set(nowMs);
                                         isProcessingFinal.set(true);
+                                        if (w != null) w.finalPriorityMode = true; // ★追加
 
                                         final boolean useRescueText = doRescueFromPartial;
                                         final String rescueText = useRescueText ? latestText.trim() : null;
@@ -3584,7 +4074,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                                 } else {
                                                     final long uttSeq = currentUtteranceSeq;
 
-                                                    // ★ADD: 話者ゲート（speaker.enabled時のみ）
+                                                    // 話者ゲート（speaker.enabled時のみ）
                                                     boolean speakerOk = true;
                                                     if (prefs.getBoolean("speaker.enabled", false)
                                                             && speakerProfile.isReady()) {
@@ -3593,6 +4083,23 @@ public class MobMateWhisp implements NativeKeyListener {
                                                             Config.logDebug("★Speaker REJECTED bytes=" + finalChunk.length);
                                                         }
                                                         updateSpeakerStatus();
+                                                    }
+                                                    // ★v1.5.0: Moonshine用にgate結果をキャッシュ（onCompletedが参照）
+                                                    if (isEngineMoonshine()) {
+                                                        moonshineLastGateOk = speakerOk;
+                                                    }
+                                                    // ★v1.5.0: Moonshineモードはspeaker gate外でmic_debugを書く
+                                                    // （COMPLETEはonCompletedで既にspeakされており、gateはWAVの記録に無関係）
+                                                    if (isEngineMoonshine() && micDump && finalChunk.length > 0) {
+                                                        try {
+                                                            int idx = MIC_DUMP_SEQ.getAndIncrement() % MIC_DUMP_ROTATE;
+                                                            File out = new File("mic_debug_" + idx + ".wav");
+                                                            writePcm16leToWav(finalChunk, audioFormat, out);
+                                                            Config.logDebug("★MIC: wrote " + out.getAbsolutePath()
+                                                                    + " bytes=" + finalChunk.length + " (moonshine-utterance)");
+                                                        } catch (Exception ex) {
+                                                            Config.logDebug("★MIC: per-utterance dump failed: " + ex);
+                                                        }
                                                     }
 
                                                     if (speakerOk) {
@@ -3609,7 +4116,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                                         }
 
                                                         // ★Mic debug wav (既存処理そのまま)
-                                                        if (micDump && finalChunk.length > 0) {
+                                                        if (!isEngineMoonshine() && micDump && finalChunk.length > 0) {
                                                             try {
                                                                 int idx = MIC_DUMP_SEQ.getAndIncrement() % MIC_DUMP_ROTATE;
                                                                 File out = new File("mic_debug_" + idx + ".wav");
@@ -3631,6 +4138,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                                 Config.logError("Final error", ex);
                                             } finally {
                                                 isProcessingFinal.set(false);
+                                                if (w != null) w.finalPriorityMode = false; // ★追加
                                                 SwingUtilities.invokeLater(() -> window.setTitle(UiText.t("ui.title.rec")));
                                             }
                                         });
@@ -3784,6 +4292,16 @@ public class MobMateWhisp implements NativeKeyListener {
             pcm[i + 1] = (byte) ((amplified >> 8) & 0xFF);
         }
     }
+    // 16bit LE PCM → float32 変換（Moonshine用）
+    private static float[] pcm16leToFloat(byte[] pcm, int len) {
+        int samples = len / 2;
+        float[] out = new float[samples];
+        for (int i = 0; i < samples; i++) {
+            short s = (short)(((pcm[i*2+1] & 0xFF) << 8) | (pcm[i*2] & 0xFF));
+            out[i] = s / 32768.0f;
+        }
+        return out;
+    }
 
     // ★ short utterance 用の強制Final
     private void forceFinal(String text, Action action) {
@@ -3841,6 +4359,7 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
     private void kickPartialTranscribe(ByteArrayOutputStream buffer) {
+        if (isEngineMoonshine()) return;  // ★v1.5.0: Moonshineは自前poll
         if (isProcessingFinal.get()) return;
         if (!isProcessingPartial.compareAndSet(false, true)) return;
         if (lowGpuMode && isProcessingFinal.get()) { return; }
@@ -4176,6 +4695,10 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
     public String transcribe(byte[] audioData, final Action action, boolean isEndOfCapture) throws Exception {
+        // ★v1.5.0: Moonshineモード時はWhisperを使わない
+        if (isEngineMoonshine()) {
+            return "";
+        }
         // ★ADD: silent chunk short-circuit (partialの無駄撃ちを抑える)
         if (!isEndOfCapture && audioData != null && audioData.length > 0) {
             if (isMostlySilentPcm16le(audioData)) {
@@ -4260,6 +4783,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     lastPartialUpdateMs = System.currentTimeMillis();
                     // ★追加: partial更新時に現在の発話IDを記録
                     // (maybeRescueSpeakFromPartialで古い発話のpartialを弾くため)
+                    setTranscribing(true);  // ★ADD: Moonshine partial検出でtranscribing状態に
                     Config.logDebug("★Cached partial (uttSeq=" + currentUtteranceSeq + "): " + str);
                 } else {
                     str = "";
@@ -4559,7 +5083,7 @@ public class MobMateWhisp implements NativeKeyListener {
             } catch (InterruptedException ignored) {
             }
         });
-        keepAlive.setDaemon(false);
+        keepAlive.setDaemon(true);
         keepAlive.start();
         SwingUtilities.invokeLater(() -> {
             // ===== FlatLaf Look&Feel =====
@@ -4623,7 +5147,12 @@ public class MobMateWhisp implements NativeKeyListener {
                     // ★Whisperネイティブメモリ解放（large-v3-q8_0で3GB+のリーク防止）
 //                    try { LocalWhisperCPP.freeAllContexts(); } catch (Throwable ignore) {}
                 }, "voiceger-shutdown"));
-                Runtime.getRuntime().addShutdownHook(new Thread(() -> SteamHelper.shutdown()));
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                    SteamHelper.shutdown();
+                    executorService.shutdownNow();
+                    audioService.shutdownNow();
+                    shutdownMoonshine();
+                }));
 
 
 
@@ -4759,6 +5288,31 @@ public class MobMateWhisp implements NativeKeyListener {
         installBoundsSaver(this.window, "ui.main");
 
         window.setVisible(true);
+        // ===== WAVドラッグ&ドロップ テスト用 =====
+        window.setTransferHandler(new javax.swing.TransferHandler() {
+            @Override
+            public boolean canImport(TransferSupport support) {
+                return support.isDataFlavorSupported(java.awt.datatransfer.DataFlavor.javaFileListFlavor);
+            }
+            @Override
+            public boolean importData(TransferSupport support) {
+                if (!canImport(support)) return false;
+                try {
+                    @SuppressWarnings("unchecked")
+                    java.util.List<File> files = (java.util.List<File>)
+                            support.getTransferable().getTransferData(java.awt.datatransfer.DataFlavor.javaFileListFlavor);
+                    for (File f : files) {
+                        if (!f.getName().toLowerCase().endsWith(".wav")) continue;
+                        executorService.submit(() -> transcribeWavFile(f));
+                    }
+                    return true;
+                } catch (Exception ex) {
+                    Config.logError("[DnD] failed", ex);
+                    return false;
+                }
+            }
+        });
+
         this.window.toFront();
         this.window.requestFocus();
 
@@ -4832,6 +5386,12 @@ public class MobMateWhisp implements NativeKeyListener {
 //        prefs.putBoolean("wizard.never", false);
 //        prefs.putBoolean("wizard.completed", false);
         SwingUtilities.invokeLater(() -> {
+            //TODO 整理してから表示する
+//            if (TipsDialog.shouldShow()) {
+//                TipsDialog tips = new TipsDialog(window);
+//                tips.setVisible(true);
+//                TipsDialog.markShown();
+//            }
             try {
                 boolean completed = prefs.getBoolean("wizard.completed", false);
                 boolean never = prefs.getBoolean("wizard.never", false);
@@ -4864,6 +5424,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 // ★ Wizard前後で device を比較して、変わってたら再キャリブレーション
                 final String beforeIn = prefs.get("audio.device", "");
                 final String beforeOut = prefs.get("audio.output.device", "");
+                final String beforeEngine = prefs.get("recog.engine", "whisper"); // ★v1.5.0
 
                 FirstLaunchWizard wizard = null;
                 try {
@@ -4920,6 +5481,15 @@ public class MobMateWhisp implements NativeKeyListener {
                 boolean inChanged = !java.util.Objects.equals(beforeIn, afterIn);
                 boolean outChanged = !java.util.Objects.equals(beforeOut, afterOut);
 
+                // ★v1.5.0: エンジンが変わっていたらsoftRestart
+                final String afterEngine = prefs.get("recog.engine", "whisper");
+                if (!java.util.Objects.equals(beforeEngine, afterEngine)) {
+                    Config.log("★Wizard: engine changed " + beforeEngine
+                            + " → " + afterEngine + " → soft restart");
+                    softRestart();
+                    return; // softRestartで全再構築されるのでデバイス個別処理は不要
+                }
+
                 if (inChanged) {
                     // ★入力が変わったなら必ず再キャリブレーション（ここが無いと Start が死ぬ）
                     SwingUtilities.invokeLater(() -> {
@@ -4939,7 +5509,55 @@ public class MobMateWhisp implements NativeKeyListener {
             } catch (Throwable t) {
                 Config.log("Wizard failed: " + t.getMessage());
             }
+
         });
+    }
+    private void transcribeWavFile(File wavFile) {
+        Config.log("[WAV-TEST] Loading: " + wavFile.getName());
+        try {
+            javax.sound.sampled.AudioInputStream in =
+                    javax.sound.sampled.AudioSystem.getAudioInputStream(wavFile);
+            javax.sound.sampled.AudioFormat targetFmt =
+                    new javax.sound.sampled.AudioFormat(16000f, 16, 1, true, false);
+            javax.sound.sampled.AudioInputStream converted =
+                    javax.sound.sampled.AudioSystem.getAudioInputStream(targetFmt, in);
+
+            byte[] pcm = converted.readAllBytes();
+            converted.close();
+            in.close();
+
+            double seconds = pcm.length / 32000.0;
+            if (seconds > 30.0) {
+                Config.log("[WAV-TEST] REJECTED: too long (" + String.format("%.1f", seconds) + "s > 30s)");
+                JOptionPane.showMessageDialog(window,
+                        "WAV too long: " + String.format("%.1f", seconds) + "s\nMax 30s for benchmark.",
+                        "WAV Test", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+
+            Config.log("[WAV-TEST] PCM bytes=" + pcm.length
+                    + " (" + String.format("%.2f", seconds) + "s)");
+
+            long t0 = System.currentTimeMillis();
+            // ★ 既存のtranscribeフローに完全に乗せる
+            transcribe(pcm, getActionFromPrefs(), true);
+            long dt = System.currentTimeMillis() - t0;
+
+            Config.log("[WAV-TEST] DONE ms=" + dt
+                    + " (" + String.format("%.2f", dt / 1000.0) + "s)");
+
+        } catch (Exception ex) {
+            Config.logError("[WAV-TEST] error: " + ex.getMessage(), ex);
+        }
+    }
+    private Action getActionFromPrefs() {
+        String strAction = prefs.get("action", "noting");
+        return switch (strAction) {
+            case "paste"     -> Action.COPY_TO_CLIPBOARD_AND_PASTE;
+            case "type"      -> Action.TYPE_STRING;
+            case "translate" -> Action.TRANSLATE_AND_SPEAK;
+            default          -> Action.NOTHING;
+        };
     }
     // ===== ウィンドウドラッグ移動を有効化 =====
     private void enableWindowDragging(JFrame frame) {
@@ -5029,11 +5647,30 @@ public class MobMateWhisp implements NativeKeyListener {
         hotkeyLabel.setFont(hotkeyLabel.getFont().deriveFont(11f));
         hotkeyLabel.setToolTipText("Radio Chat Hotkey");
 
-        // ★利用モデル（追加）
-        String modelName = (model != null) ? model.replace("ggml-", "").replace(".bin", "") : "N/A";
-        modelLabel = new JLabel("Mdl:" + modelName);
+        // ★利用モデル（v1.5.0: エンジンに応じた表示）
+        String modelName;
+        if (isEngineMoonshine()) {
+            // moonshine.model_path の末尾ディレクトリ名を表示
+            String mp = prefs.get("moonshine.model_path", "");
+            if (mp.isEmpty()) {
+                modelName = "auto";
+            } else {
+                // パス末尾から意味のある名前を取る（例: "base-ja" or "quantized/base-ja"）
+                java.nio.file.Path p = java.nio.file.Paths.get(mp);
+                java.nio.file.Path parent = p.getParent();
+                if (parent != null && parent.getFileName() != null) {
+                    modelName = parent.getFileName() + "/" + p.getFileName();
+                } else {
+                    modelName = p.getFileName().toString();
+                }
+            }
+        } else {
+            modelName = (model != null) ? model.replace("ggml-", "").replace(".bin", "") : "N/A";
+        }
+        String engineTag = isEngineMoonshine() ? "Moon" : "Whi";
+        modelLabel = new JLabel(engineTag + ":" + modelName);
         modelLabel.setFont(modelLabel.getFont().deriveFont(11f));
-        modelLabel.setToolTipText("Whisper Model");
+        modelLabel.setToolTipText(getRecogEngineName() + " Model: " + modelName);
 
         // ★話者照合ステータス
         boolean spkEnabled = prefs.getBoolean("speaker.enabled", false);
@@ -6505,6 +7142,7 @@ public class MobMateWhisp implements NativeKeyListener {
         // ★スピーカー出力レベルを計算してメーターに反映
         updateSpeakerMeterFromWav(wavBytes);
 
+        isTtsSpeaking = true;  // ★ADD: 再生開始前にフラグON
         playExecutor.submit(() -> {
             synchronized (psLock) {
                 try {
@@ -6519,7 +7157,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
                     psWriter.write("PLAYB64 " + devIndex + " " + id + "\n");
 
-                    final int CHUNK = 12000; // 1行長すぎ対策
+                    final int CHUNK = 12000;
                     for (int i = 0; i < b64.length(); i += CHUNK) {
                         int end = Math.min(b64.length(), i + CHUNK);
                         psWriter.write("DATA " + id + " " + b64.substring(i, end) + "\n");
@@ -6541,6 +7179,8 @@ public class MobMateWhisp implements NativeKeyListener {
                         Config.log("TTS pipe dead → restarting agent");
                         stopPsServerLocked();
                     }
+                } finally {
+                    isTtsSpeaking = false;  // ★ADD: DONE受信後（または例外後）にフラグOFF
                 }
             }
         });
@@ -6812,6 +7452,18 @@ public class MobMateWhisp implements NativeKeyListener {
         Config.log("ExeDir = " + exeDir);
         Config.log("LibsDir = " + libsDir);
         Backend[] backends = new Backend[]{
+                new Backend("CUDA", new File(libsDir, "cuda"),
+                        new String[]{
+                                "cublas64_12.dll",
+                                "cublasLt64_12.dll",
+                                "cudart64_12.dll",
+                                "ggml-cuda.dll",
+                                "ggml-base.dll",
+                                "ggml-cpu.dll",
+                                "ggml.dll",
+                        },
+                        "whisper.dll"
+                ),
                 new Backend("Vulkan", new File(libsDir, "vulkan"),
                         new String[]{
                                 "ggml-vulkan.dll",
@@ -6834,10 +7486,13 @@ public class MobMateWhisp implements NativeKeyListener {
         // ★ Vulkan GPU selection must be set BEFORE any DLL load
         int gpuIndex = prefs.getInt("vulkan.gpu.index", -1);
         if (gpuIndex >= 0) {
-            System.setProperty("GGML_VULKAN_DEVICE", String.valueOf(gpuIndex));
+            setNativeEnv("GGML_VULKAN_DEVICE", String.valueOf(gpuIndex));
+            // ★ ggml側が参照する可能性のある変数も念のため設定
+            setNativeEnv("GGML_VK_VISIBLE_DEVICES", String.valueOf(gpuIndex));
             Config.log("Using Vulkan GPU index: " + gpuIndex);
         } else {
-            System.clearProperty("GGML_VULKAN_DEVICE");
+            setNativeEnv("GGML_VULKAN_DEVICE", null);
+            setNativeEnv("GGML_VK_VISIBLE_DEVICES", null);
             Config.log("Using Vulkan GPU auto selection");
         }
 
@@ -6853,8 +7508,8 @@ public class MobMateWhisp implements NativeKeyListener {
             }
 
             // ★ DLCチェック追加（ここだけ追加）
-            if ("Vulkan".equals(b.name) && !vulkanDlcOwned) {
-                Config.log(" → Vulkan DLC not owned. Falling back to CPU.");
+            if (("Vulkan".equals(b.name) || "CUDA".equals(b.name)) && !vulkanDlcOwned) {
+                Config.log(" → " + b.name + " DLC not owned. Falling back to CPU.");
                 continue;
             }
 
@@ -6910,7 +7565,20 @@ public class MobMateWhisp implements NativeKeyListener {
             return false;
         }
     }
-    private File getExeDir() {
+    private static void setNativeEnv(String name, String value) {
+        try {
+            com.sun.jna.platform.win32.Kernel32 k =
+                    com.sun.jna.platform.win32.Kernel32.INSTANCE;
+            k.SetEnvironmentVariable(name, value); // null渡しで削除
+            Config.log("★setNativeEnv: " + name + "=" + value);
+        } catch (Throwable t) {
+            // JNA失敗時はSystem.setPropertyにフォールバック（効果は薄いが無害）
+            Config.log("★setNativeEnv failed: " + t.getMessage());
+            if (value != null) System.setProperty(name, value);
+            else System.clearProperty(name);
+        }
+    }
+    public File getExeDir() {
         try {
             String path = MobMateWhisp.class
                     .getProtectionDomain()
@@ -7173,6 +7841,8 @@ public class MobMateWhisp implements NativeKeyListener {
         // 代わりに w=null でstaleスレッドをNPEで安全に殺す
         // native free は Phase 2 の LocalWhisperCPP コンストラクタ内 close() に任せる
         Config.log("[SOFT_RESTART] inference drained=" + drained + ", nulling whisper refs");
+        // ★v1.5.0: Moonshine解放
+        shutdownMoonshine();
         LocalWhisperCPP old = this.w;
         this.w = null;
         try {
@@ -7267,27 +7937,34 @@ public class MobMateWhisp implements NativeKeyListener {
         int fontSize = prefs.getInt("ui.font.size", 14);   // ★デフォルト16に修正
         applyUIFont(fontSize);                              // ★ユーザーサイズで上書き
 
-        // (4) Whisperモデル再読み込み（DLLは既ロードなのでスキップ）
-
+        // (4) ★v1.5.0: エンジン選択に応じて再初期化
         if (isRecording()) {
             stopRecording();
         }
-        // Apply model
-        try {
-            File dir = new File(model_dir);
-            MobMateWhisp.this.model = prefs.get("model", model);
-            model = prefs.get("model", model);
-            File modelFile = new File(dir, model);
-            setModelPref(MobMateWhisp.this.model);
-            Config.log("[SOFT_RESTART] Model : " + model);
+        if (isEngineMoonshine()) {
+            // Moonshineモード → Whisperは不要、Moonshine再初期化
+            Config.log("[SOFT_RESTART] Engine = Moonshine");
+            this.w = null;
+            initMoonshine();
+        } else {
+            // Whisperモード → Moonshineは不要、Whisper再読み込み
+            Config.log("[SOFT_RESTART] Engine = Whisper");
             try {
-                MobMateWhisp.this.w = new LocalWhisperCPP(modelFile,"");
-                Config.log("[SOFT_RESTART] Whisper model reloaded: " + model);
-            } catch (FileNotFoundException e1) {
-                Config.logError("[SOFT_RESTART] Model not found: " + modelFile, null);
+                File dir = new File(model_dir);
+                MobMateWhisp.this.model = prefs.get("model", model);
+                model = prefs.get("model", model);
+                File modelFile = new File(dir, model);
+                setModelPref(MobMateWhisp.this.model);
+                Config.log("[SOFT_RESTART] Model : " + model);
+                try {
+                    MobMateWhisp.this.w = new LocalWhisperCPP(modelFile, "");
+                    Config.log("[SOFT_RESTART] Whisper model reloaded: " + model);
+                } catch (FileNotFoundException e1) {
+                    Config.logError("[SOFT_RESTART] Model not found: " + modelFile, null);
+                }
+            } catch (Throwable t) {
+                Config.logError("[SOFT_RESTART] Whisper reload failed: " + t, t);
             }
-        } catch (Throwable t) {
-            Config.logError("[SOFT_RESTART] Whisper reload failed: " + t, t);
         }
 
         // (5) SpeakerProfile再作成
