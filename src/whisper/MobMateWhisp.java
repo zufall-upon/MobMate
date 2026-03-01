@@ -385,15 +385,20 @@ public class MobMateWhisp implements NativeKeyListener {
                 System.exit(0);
             }
             if (!hasVirtualAudioDevice()) {
-                JOptionPane.showMessageDialog(
+                String[] options = {"Open Setup Guide", "Skip"};
+                int choice = JOptionPane.showOptionDialog(
                         null,
                         "Virtual audio device not found.\n" +
                                 "MobMate needs a virtual microphone/cable to send synthesized voice to games.\n\n" +
                                 "Setup guide:\nhttps://github.com/zufall-upon/MobMate#-virtual-audio-setup--仮想オーディオ設定",
                         "MobMate Setup",
-                        JOptionPane.INFORMATION_MESSAGE
+                        JOptionPane.DEFAULT_OPTION,
+                        JOptionPane.INFORMATION_MESSAGE,
+                        null,
+                        options,
+                        options[1]  // デフォルトは Skip
                 );
-                if (Desktop.isDesktopSupported()) {
+                if (choice == 0 && Desktop.isDesktopSupported()) {
                     try {
                         Desktop.getDesktop().browse(new URI("https://github.com/zufall-upon/MobMate#-virtual-audio-setup--仮想オーディオ設定"));
                     } catch (Exception ex) {}
@@ -576,27 +581,28 @@ public class MobMateWhisp implements NativeKeyListener {
             });
         });
 
-        // ★v1.5.0: onCompleted → handleFinalText + 短文即時判定
+        // ★v1.5.0: onCompleted → handleFinalText
         moonshine.setOnCompleted(text -> {
             if (text == null || text.isBlank()) return;
             String trimmed = text.trim();
-            trimmed = removeCjkSpaces(trimmed);  // ★v1.5.0: CJK間スペース除去
+            trimmed = removeCjkSpaces(trimmed);
             if (LocalWhisperCPP.isIgnoredStatic(trimmed)) {
                 Config.logDebug("★Ignored text: " + trimmed);
                 return;
             }
-            setTranscribing(false);  // ★ADD: COMPLETE時にtranscribing解除
+            setTranscribing(false);
 
-            // ★v1.5.0: 話者ゲート（VAD Finalで評価済みの結果を参照）
-            if (prefs.getBoolean("speaker.enabled", false) && speakerProfile.isReady()) {
-                if (!moonshineLastGateOk) {
-                    Config.logDebug("★Moon COMPLETE: speaker gate blocked -> " + trimmed);
-                    MobMateWhisp.setLastPartial("");
-                    return;
-                }
+            if (isSpeaking) {
+                // ★COMPLETEをpartialとして保持（VAD Finalブロックのrescue経路用）
+                MobMateWhisp.setLastPartial(trimmed);
+                lastPartialUpdateMs = System.currentTimeMillis(); // ★FIX: rescueのstale判定を正確化
+                // ★FIX: isSpeaking=trueでも直接handleFinalTextを呼ぶ（400ms pollのレース条件対策）
+                // VAD FinalブロックはlastSpeakStrの重複チェックで二重発声を防ぐ
+                handleFinalText(trimmed, action, false);
+                return;
             }
 
-            // ★COMPLETEが確定結果。partialはCOMPLETEを前方延長する場合のみ優先
+            // isSpeaking=false（VADがFinal処理済み or 無音確定後）
             String lastP = MobMateWhisp.getLastPartial();
             boolean partialExtendsComplete = lastP != null && !lastP.isBlank()
                     && lastP.startsWith(trimmed)
@@ -3354,7 +3360,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile long lastRescueUtteranceSeq = -1L;
     private volatile long lastRescueAtMs = 0L;
     private volatile String lastRescueNorm = "";
-    boolean isSpeaking = false;
+    volatile boolean isSpeaking = false;
     long speechStartTime = 0;
     long lastSpeechEndTime = 0;
     private void startRecording(Action action) {
@@ -3570,14 +3576,18 @@ public class MobMateWhisp implements NativeKeyListener {
                             if (vad.getNoiseProfile().isLowGainMic) {
                                 SILENCE_FRAMES_FOR_FINAL = Math.max(2, SILENCE_FRAMES_FOR_FINAL);
                             }
+                            // ★Moonshine: 文中でCOMPLETE発火するため、息継ぎによる誤断を防ぐ
+                            if (isEngineMoonshine()) {
+                                SILENCE_FRAMES_FOR_FINAL = Math.max(4, SILENCE_FRAMES_FOR_FINAL);
+                            }
                             Config.logDebug("★調整後 SILENCE_FRAMES_FOR_FINAL: " + SILENCE_FRAMES_FOR_FINAL);
 
                             boolean firstPartialSent = false;
-                            final int PREROLL_BYTES = (int) (16000 * 3 / 10);
+                            final int PREROLL_BYTES = (int) (16000 * 5 / 10);
                             final int MIN_AUDIO_DATA_LENGTH = 16000;
                             long lastFinalMs = 0;
                             final long FINAL_COOLDOWN_MS = 200;
-                            final long FORCE_FINAL_MS = 2500;
+                            final long FORCE_FINAL_MS = isEngineMoonshine() ? 5000L : 2500L;
                             long lastPartialMs = 0;
                             isSpeaking = false;
                             speechStartTime = 0;
@@ -3624,11 +3634,11 @@ public class MobMateWhisp implements NativeKeyListener {
                                     preRoll.write(pr, pr.length - PREROLL_BYTES, PREROLL_BYTES);
                                 }
                                 // ★v1.5.0: Moonshineモードのときだけ音声を流す
-                                if (isEngineMoonshine() && moonshine != null && moonshine.isLoaded()) {
-                                    final float[] fpcm = pcm16leToFloat(pcm, n);
-                                    moonshine.addAudio(fpcm, 16000);
-                                    // ★REMOVE: setTranscribing(true)はonPartialで行う
-                                }
+//                                if (isEngineMoonshine() && moonshine != null && moonshine.isLoaded()) {
+//                                    final float[] fpcm = pcm16leToFloat(pcm, n);
+//                                    moonshine.addAudio(fpcm, 16000);
+//                                    // ★REMOVE: setTranscribing(true)はonPartialで行う
+//                                }
 
                                 int peak = vad.getPeak(pcm, n);
                                 int avg  = vad.getAvg(pcm, n);
@@ -3841,10 +3851,9 @@ public class MobMateWhisp implements NativeKeyListener {
                                         MobMateWhisp.setLastPartial("");
                                         lastPartialUpdateMs = 0L; // partial更新時刻もリセット
                                         Config.logDebug("★発話開始");
-                                        // ★ADD: Moonshineストリームを発話単位でリセット（コンテキスト汚染防止）
+                                        // ★FIX: preRollをMoonshineに送る（発声冒頭の欠落防止）
+                                        // streamはFinal時にresetStream済みなのでここではresetは不要
                                         if (isEngineMoonshine() && moonshine != null && moonshine.isLoaded()) {
-                                            moonshine.resetStream();
-                                            // preRollをnewStreamに流す（発声冒頭の欠落防止）
                                             byte[] pr = preRoll.toByteArray();
                                             if (pr.length > 0) {
                                                 final float[] fpr = pcm16leToFloat(pr, pr.length);
@@ -3853,9 +3862,22 @@ public class MobMateWhisp implements NativeKeyListener {
                                         }
                                         SwingUtilities.invokeLater(() -> window.setTitle(UiText.t("ui.title.rec")));
                                     }
+                                    // ★クリッピング検知: buffer書き込み前にチェック
+//                                    if (isEngineMoonshine() && peak >= 32700
+//                                            && moonshine != null && moonshine.isLoaded()) {
+//                                        moonshine.resetStreamForClipping();
+//                                        Config.logDebug("★Clipping: skip frame & stream reset (peak=" + peak + ")");
+//                                        continue; // bufferに書かずスキップ
+//                                    }
                                     buffer.write(pcm, 0, n);
                                     partialBuf.write(pcm, 0, n);
                                     lastSpeechEndTime = now;
+
+                                    // Moonshineへの音声投入は発話中のみ（無音期間の汚染防止）
+                                    if (isEngineMoonshine() && moonshine != null && moonshine.isLoaded()) {
+                                        final float[] fpcm = pcm16leToFloat(pcm, n);
+                                        moonshine.addAudio(fpcm, 16000);
+                                    }
 
                                     PARTIAL_INTERVAL_MS = (!lowGpuMode) ?300: 700;
                                     if (now - lastPartialMs >= PARTIAL_INTERVAL_MS) {
@@ -3922,6 +3944,10 @@ public class MobMateWhisp implements NativeKeyListener {
                                                         MobMateWhisp.setLastPartial("");
                                                         vad.reset();
                                                         laughDet.reset();
+                                                        // Final確定時にMoonshineのstreamをリセット（前発話コンテキストの汚染防止）
+                                                        if (isEngineMoonshine() && moonshine != null && moonshine.isLoaded()) {
+                                                            moonshine.resetStreamForClipping();
+                                                        }
 
                                                         continue;
                                                     }
@@ -4065,6 +4091,10 @@ public class MobMateWhisp implements NativeKeyListener {
                                         incompleteHoldUntilMs = 0L;
                                         vad.reset();
                                         MobMateWhisp.setLastPartial("");
+                                        // Final確定時にMoonshineのstreamをリセット（前発話コンテキストの汚染防止）
+                                        if (isEngineMoonshine() && moonshine != null && moonshine.isLoaded()) {
+                                            moonshine.resetStream();
+                                        }
 
                                         executorService.submit(() -> {
                                             try {
@@ -4162,7 +4192,6 @@ public class MobMateWhisp implements NativeKeyListener {
                                                 lastSpeechEndTime = 0;
                                                 incompleteHoldUntilMs = 0L;
                                                 vad.reset();
-                                                MobMateWhisp.setLastPartial("");
                                                 SwingUtilities.invokeLater(() -> {
                                                     window.setTitle(UiText.t("ui.title.idle"));
                                                     MobMateWhisp.this.window.setIconImage(imageInactive);
@@ -4419,7 +4448,7 @@ public class MobMateWhisp implements NativeKeyListener {
         // ★同一文の連続を捨てすぎない(内部二重発火だけ潰す)
         // ★★修正: 前回発話と同じ、または前回発話で始まる場合もブロック
         long now = System.currentTimeMillis();
-        if (!lastSpeakStr.isEmpty() && (now - lastSpeakMs) <= 3000) {  // ★3秒以内
+        if (!lastSpeakStr.isEmpty() && (now - lastSpeakMs) <= 1200) {  // 秒以内
             // 完全一致 → 捨てる
             if (lastSpeakStr.equals(s)) {
                 Config.logDebug("★Final skip (exact dup <3s): " + s);

@@ -71,13 +71,14 @@ public class LocalMoonshineSTT {
     }
 
     // ---- フィールド ----
+    private long lastCompletedCount = 0;
     private int transcriber = -1;
     private int stream      = -1;
     private volatile boolean running = false;
     private Thread pollThread;
     // ★ADD: stream resetカウント（一定回数でtranscriber完全リロード）
     private int streamResetCount = 0;
-    private static final int STREAM_RESET_RELOAD_THRESHOLD = 30; // 30回ごとにreload
+    private static final int STREAM_RESET_RELOAD_THRESHOLD = 100;  // 30→100（2-3分で発動してたのを7-10分に延長
     private final Object audioNotify = new Object(); // ★v1.5.0: audio→poll即起床
     private volatile boolean hasNewAudio = false;
     private Consumer<String> onCompleted;
@@ -254,6 +255,10 @@ public class LocalMoonshineSTT {
     // ---- ★追加：終了時のメモリ解放処理 ----
     public void close() {
         running = false; // ポーリングスレッドを安全に止めるっす
+        if (pollThread != null) {
+            pollThread.interrupt();
+            try { pollThread.join(1000); } catch (InterruptedException ignored) {}
+        }
 
         if (stream >= 0) {
             Config.log("[Moonshine] freeing stream... handle=" + stream);
@@ -270,9 +275,9 @@ public class LocalMoonshineSTT {
         Config.log("[Moonshine] Successfully closed and freed memory.");
     }
     /** ★発話開始時に呼ぶ：ストリームをリセットして新しい発話コンテキストを開始 */
-    /** ★発話開始時に呼ぶ：ストリームをリセットして新しい発話コンテキストを開始 */
     public synchronized void resetStream() {
         if (!running || transcriber < 0) return;
+        
 
         streamResetCount++;
 
@@ -282,6 +287,9 @@ public class LocalMoonshineSTT {
                     + " >= " + STREAM_RESET_RELOAD_THRESHOLD + " → full transcriber reload");
             reloadTranscriber();
             streamResetCount = 0;
+            if (stream >= 0) {
+                MoonshineLib.INSTANCE.moonshine_start_stream(transcriber, stream);
+            }
             return;
         }
 
@@ -296,6 +304,7 @@ public class LocalMoonshineSTT {
                 Config.log("[Moonshine] resetStream: create_stream FAIL: " + stream);
                 return;
             }
+            lastCompletedCount = 0; // 新しいストリームになったら0に戻す
             int err = MoonshineLib.INSTANCE.moonshine_start_stream(transcriber, stream);
             if (err != 0) {
                 Config.log("[Moonshine] resetStream: start_stream FAIL: " + err);
@@ -347,6 +356,7 @@ public class LocalMoonshineSTT {
                 running = false;
                 return;
             }
+            lastCompletedCount = 0; // 新しいストリームになったら0に戻す
             int err = MoonshineLib.INSTANCE.moonshine_start_stream(transcriber, stream);
             if (err != 0) {
                 Config.log("[Moonshine] reload: start_stream FAIL");
@@ -384,6 +394,25 @@ public class LocalMoonshineSTT {
             else System.clearProperty(name);
         }
     }
+    // ★ADD: clipping専用reset（カウントに含めない）
+    public synchronized void resetStreamForClipping() {
+        if (!running || transcriber < 0) return;
+        try {
+            if (stream >= 0) {
+                MoonshineLib.INSTANCE.moonshine_stop_stream(transcriber, stream);
+                MoonshineLib.INSTANCE.moonshine_free_stream(transcriber, stream);
+                stream = -1;
+            }
+            stream = MoonshineLib.INSTANCE.moonshine_create_stream(transcriber, 0);
+            if (stream < 0) return;
+            lastCompletedCount = 0; // 新しいストリームになったら0に戻す
+            MoonshineLib.INSTANCE.moonshine_start_stream(transcriber, stream);
+            Config.logDebug("[Moonshine] stream reset OK (clipping)");
+        } catch (Error e) {
+            Config.log("[Moonshine] resetStreamForClipping ERROR: " + e.getMessage());
+        }
+        // ★streamResetCount は更新しない
+    }
 
     // ---- ポーリングスレッド（5ms間隔）----
     // ★ JNA Structure 不使用。生Pointerから手動オフセットで読む。
@@ -391,7 +420,7 @@ public class LocalMoonshineSTT {
     // ★v1.5.0: FORCE_UPDATE + wait/notify で低遅延化
     private void startPollThread() {
         pollThread = new Thread(() -> {
-            long lastCompletedCount = 0;
+//            long lastCompletedCount = 0;
             boolean firstPoll = true;
 
             while (running && !Thread.currentThread().isInterrupted()) {
