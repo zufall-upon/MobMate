@@ -36,6 +36,12 @@ public class LocalWhisperCPP {
     private volatile boolean lowGainMic = false;
     private volatile boolean hearingTranslateToEn = false;
     public volatile boolean finalPriorityMode = false;
+    // ===== static ignore cache (Moonshine/Whisper共通で軽くする) =====
+    private static final Object IGNORE_STATIC_LOCK = new Object();
+    private static volatile boolean ignoreStaticDirty = true;
+    private static volatile String cachedIgnoreModeStatic = "simple";
+    private static volatile List<String> cachedIgnoreWordsStatic = new ArrayList<>();
+    private static volatile List<Pattern> cachedIgnorePatternsStatic = new ArrayList<>();
 
 
     public synchronized void setHearingTranslateToEn(boolean v) {
@@ -331,24 +337,57 @@ public class LocalWhisperCPP {
         return false;
     }
 
+    private static void reloadIgnoreStaticIfNeeded() {
+        if (!ignoreStaticDirty) return;
+        synchronized (IGNORE_STATIC_LOCK) {
+            if (!ignoreStaticDirty) return;
+
+            String mode = Config.get("ignore.mode", "simple");
+            List<String> words = Config.loadIgnoreWords();
+
+            List<Pattern> pats = new ArrayList<>();
+            if ("regex".equalsIgnoreCase(mode)) {
+                for (String rule : words) {
+                    if (rule == null) continue;
+                    String r = rule.trim();
+                    if (r.isEmpty()) continue;
+                    try {
+                        pats.add(Pattern.compile(r));
+                    } catch (PatternSyntaxException e) {
+                        Config.logError("Invalid regex ignored: " + r, e);
+                    }
+                }
+            }
+
+            cachedIgnoreModeStatic = mode;
+            cachedIgnoreWordsStatic = new ArrayList<>(words);
+            cachedIgnorePatternsStatic = pats;
+
+            ignoreStaticDirty = false;
+        }
+    }
+
     public static boolean isIgnoredStatic(String text) {
         if (text == null || text.isEmpty()) return true;
-        String mode = Config.get("ignore.mode", "simple");
-        List<String> words = Config.loadIgnoreWords();
-        if ("regex".equalsIgnoreCase(mode)) {
-            for (String w : words) {
-                if (text.matches(w)) return true;
+
+        reloadIgnoreStaticIfNeeded();
+
+        if ("regex".equalsIgnoreCase(cachedIgnoreModeStatic)) {
+            for (Pattern p : cachedIgnorePatternsStatic) {
+                if (p.matcher(text).find()) return true;
             }
-        } else {
-            for (String w : words) {
-                if (!w.isEmpty() && text.contains(w)) return true;
-            }
+            return false;
+        }
+
+        for (String w : cachedIgnoreWordsStatic) {
+            if (w != null && !w.isEmpty() && text.contains(w)) return true;
         }
         return false;
     }
 
     public static void markIgnoreDirty() {
         ignoreDirty = true;
+        ignoreStaticDirty = true;
     }
 
     public static void applySoftwareGain(short[] samples, float gain) {
@@ -889,7 +928,7 @@ class ImprovedVAD extends SimpleVAD {
         boolean isPeakSpeech = peak >= peakThreshold;
         boolean isAvgSpeech  = avg  >= avgThreshold;
         // ★通常マイクは「avgだけ」で拾うと環境音を拾いがちなので、peak寄りにする
-        double peakFactor = noiseProfile.isLowGainMic ? 0.60 : 0.85;
+        double peakFactor = noiseProfile.isLowGainMic ? 0.60 : 0.95;
         boolean currentIsSpeech =
                 isPeakSpeech ||
                         (isAvgSpeech && peak >= peakThreshold * peakFactor);

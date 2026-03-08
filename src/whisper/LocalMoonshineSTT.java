@@ -76,6 +76,7 @@ public class LocalMoonshineSTT {
     private int stream      = -1;
     private volatile boolean running = false;
     private Thread pollThread;
+    private volatile int pollGeneration = 0;  // ゾンビpollThread防止用世代カウンタ
     // ★ADD: stream resetカウント（一定回数でtranscriber完全リロード）
     private int streamResetCount = 0;
     private static final int STREAM_RESET_RELOAD_THRESHOLD = 100;  // 30→100（2-3分で発動してたのを7-10分に延長
@@ -277,7 +278,8 @@ public class LocalMoonshineSTT {
     /** ★発話開始時に呼ぶ：ストリームをリセットして新しい発話コンテキストを開始 */
     public synchronized void resetStream() {
         if (!running || transcriber < 0) return;
-        
+
+        flushPendingTranscriptOnce();   // ★ADD: reset前に最後のpartial/COMPLETEを回収
 
         streamResetCount++;
 
@@ -287,9 +289,6 @@ public class LocalMoonshineSTT {
                     + " >= " + STREAM_RESET_RELOAD_THRESHOLD + " → full transcriber reload");
             reloadTranscriber();
             streamResetCount = 0;
-            if (stream >= 0) {
-                MoonshineLib.INSTANCE.moonshine_start_stream(transcriber, stream);
-            }
             return;
         }
 
@@ -311,6 +310,7 @@ public class LocalMoonshineSTT {
                 stream = -1;
                 return;
             }
+            injectSilencePadding(); // ★FIX: デコーダ安定化
             Config.logDebug("[Moonshine] stream reset OK (new utterance)");
         } catch (Error e) {
             Config.log("[Moonshine] resetStream ERROR: " + e.getMessage());
@@ -363,13 +363,29 @@ public class LocalMoonshineSTT {
                 running = false;
                 return;
             }
+            injectSilencePadding(); // ★FIX: デコーダ安定化
             Config.log("[Moonshine] ★ transcriber reload OK! new handle=" + transcriber + " stream=" + stream);
+
+            // ★FIX: pollThreadを再起動（reload後に内部状態をリセット）
+            if (pollThread != null && pollThread.isAlive()) {
+                pollThread.interrupt();
+                try { pollThread.join(1000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            }
+            startPollThread();
         } catch (Error e) {
             Config.log("[Moonshine] reloadTranscriber ERROR: " + e.getMessage());
             running = false;
         }
     }
     public boolean isLoaded() { return transcriber >= 0; }
+
+    /** 外部から強制リロード（連続無出力からの復旧用） *//** ★FIX: synchronized追加 + 二重start_stream除去 */
+    public synchronized void forceReload() {
+        Config.log("[Moonshine] ★ forceReload requested");
+        reloadTranscriber();
+        streamResetCount = 0;
+        // reloadTranscriber内でstart_stream済み → ここでは呼ばない
+    }
 
     // ★v1.5.0: ONNX Runtime向け環境変数をプロセスレベルで設定
     private void applyEnvSettings() {
@@ -397,6 +413,7 @@ public class LocalMoonshineSTT {
     // ★ADD: clipping専用reset（カウントに含めない）
     public synchronized void resetStreamForClipping() {
         if (!running || transcriber < 0) return;
+        flushPendingTranscriptOnce();   // ★ADD
         try {
             if (stream >= 0) {
                 MoonshineLib.INSTANCE.moonshine_stop_stream(transcriber, stream);
@@ -407,24 +424,112 @@ public class LocalMoonshineSTT {
             if (stream < 0) return;
             lastCompletedCount = 0; // 新しいストリームになったら0に戻す
             MoonshineLib.INSTANCE.moonshine_start_stream(transcriber, stream);
+            injectSilencePadding(); // ★FIX: デコーダ安定化
             Config.logDebug("[Moonshine] stream reset OK (clipping)");
         } catch (Error e) {
             Config.log("[Moonshine] resetStreamForClipping ERROR: " + e.getMessage());
         }
         // ★streamResetCount は更新しない
     }
+    /** ストリーム開始直後に無音パディング投入（デコーダウォームアップ） */
+    private void injectSilencePadding() {
+        if (transcriber < 0 || stream < 0) return;
+        try {
+            float[] pad = new float[1600*6]; // 400ms at 16kHz
+            MoonshineLib.INSTANCE.moonshine_transcribe_add_audio_to_stream(
+                    transcriber, stream, pad, (1600*6L), 16000, 0);
+        } catch (Error e) {
+            Config.logDebug("[Moonshine] silence padding error: " + e.getMessage());
+        }
+    }
+    // ★ADD: reset直前に pending transcript を1回だけ吸い上げる
+    private void flushPendingTranscriptOnce() {
+        if (transcriber < 0 || stream < 0) return;
+
+        try {
+            PointerByReference pRef = new PointerByReference();
+            int err = MoonshineLib.INSTANCE.moonshine_transcribe_stream(
+                    transcriber, stream,
+                    MOONSHINE_FLAG_FORCE_UPDATE, pRef);
+
+            if (err != 0) return;
+
+            Pointer pTx = pRef.getValue();
+            if (pTx == null) return;
+
+            Pointer pLines = pTx.getPointer(TX_OFF_LINES);
+            long lineCount = pTx.getLong(TX_OFF_LINE_COUNT);
+            if (pLines == null || lineCount <= 0) return;
+
+            for (long i = 0; i < lineCount; i++) {
+                long base = i * LINE_SIZE;
+
+                Pointer pText = pLines.getPointer(base + LINE_OFF_TEXT);
+                if (pText == null) continue;
+
+                String text;
+                try {
+                    text = pText.getString(0, "UTF-8").trim();
+                } catch (Error ignore) {
+                    continue;
+                }
+                if (text.isEmpty()) continue;
+
+                byte isComplete = pLines.getByte(base + LINE_OFF_IS_COMPLETE);
+                byte isUpdated = pLines.getByte(base + LINE_OFF_IS_UPDATED);
+                byte isNew = pLines.getByte(base + LINE_OFF_IS_NEW);
+                byte hasTextChanged = pLines.getByte(base + LINE_OFF_HAS_TEXT_CHANGED);
+                int latencyMs = pLines.getInt(base + LINE_OFF_LATENCY_MS);
+
+                if (isComplete != 0) {
+                    if (isUpdated != 0 || isNew != 0 || i >= lastCompletedCount) {
+                        Config.log("[Moonshine] COMPLETE(flush): " + text
+                                + " (latency=" + latencyMs + "ms)");
+                        if (onCompleted != null) onCompleted.accept(text);
+                    }
+                } else {
+                    if (hasTextChanged != 0 || isNew != 0) {
+                        Config.log("[Moonshine] partial(flush): " + text
+                                + " (" + latencyMs + "ms)");
+                        if (onPartial != null) onPartial.accept(text);
+                    }
+                }
+            }
+
+            long completed = 0;
+            for (long i = 0; i < lineCount; i++) {
+                long base = i * LINE_SIZE;
+                byte ic = pLines.getByte(base + LINE_OFF_IS_COMPLETE);
+                if (ic != 0) {
+                    Pointer pt = pLines.getPointer(base + LINE_OFF_TEXT);
+                    if (pt != null) {
+                        try {
+                            String t = pt.getString(0, "UTF-8").trim();
+                            if (!t.isEmpty()) completed = i + 1;
+                        } catch (Error ignore) {}
+                    }
+                } else {
+                    break;
+                }
+            }
+            lastCompletedCount = completed;
+
+        } catch (Error e) {
+            Config.logDebug("[Moonshine] flushPendingTranscriptOnce ERROR: " + e.getMessage());
+        }
+    }
 
     // ---- ポーリングスレッド（5ms間隔）----
     // ★ JNA Structure 不使用。生Pointerから手動オフセットで読む。
-    // ---- ポーリングスレッド ----
-    // ★v1.5.0: FORCE_UPDATE + wait/notify で低遅延化
     private void startPollThread() {
+        final int myGeneration = ++pollGeneration;  // この世代を覚える
         pollThread = new Thread(() -> {
 //            long lastCompletedCount = 0;
             boolean firstPoll = true;
 
-            while (running && !Thread.currentThread().isInterrupted()) {
+            while (running && pollGeneration == myGeneration && !Thread.currentThread().isInterrupted()) {
                 // ★ addAudioが来たら即起床、来なくてもpollIntervalMsでタイムアウト
+                boolean shouldPoll;
                 synchronized (audioNotify) {
                     if (!hasNewAudio) {
                         try {
@@ -433,8 +538,10 @@ public class LocalMoonshineSTT {
                             break;
                         }
                     }
+                    shouldPoll = hasNewAudio; // ★FIX: タイムアウト起床(audio無し)はpollしない
                     hasNewAudio = false;
                 }
+                if (!shouldPoll) continue; // ★FIX: 無音中にFORCE_UPDATEを連打してstream劣化するのを防ぐ
 
 
                 synchronized (LocalMoonshineSTT.this) {
@@ -452,7 +559,10 @@ public class LocalMoonshineSTT {
                                     + " (FORCE_UPDATE enabled)");
                             firstPoll = false;
                         }
-                        if (err != 0) continue;
+                        if (err != 0) {
+                            Config.logDebug("[Moonshine] poll err=" + err);
+                            continue;
+                        }
 
                         Pointer pTx = pRef.getValue();
                         if (pTx == null) continue;
@@ -477,7 +587,6 @@ public class LocalMoonshineSTT {
                                         + i + ": " + readErr.getMessage());
                                 continue;
                             }
-                            if (text.isEmpty()) continue;
 
                             byte isComplete = pLines.getByte(base + LINE_OFF_IS_COMPLETE);
                             byte isUpdated = pLines.getByte(base + LINE_OFF_IS_UPDATED);
@@ -485,8 +594,17 @@ public class LocalMoonshineSTT {
                             byte hasTextChanged = pLines.getByte(base + LINE_OFF_HAS_TEXT_CHANGED);
                             int latencyMs = pLines.getInt(base + LINE_OFF_LATENCY_MS);
 
+                            // ★FIX: 空テキスト行はログだけ出してスキップ（幽霊行の可視化）
+                            if (text.isEmpty()) {
+                                Config.logDebug("[Moonshine] ghost line: i=" + i
+                                        + " complete=" + isComplete
+                                        + " updated=" + isUpdated
+                                        + " new=" + isNew);
+                                continue;
+                            }
+
                             if (isComplete != 0) {
-                                if (isUpdated != 0 || i >= lastCompletedCount) {
+                                if (isUpdated != 0 || isNew != 0 || i >= lastCompletedCount) {
                                     Config.log("[Moonshine] COMPLETE: " + text
                                             + " (latency=" + latencyMs + "ms)");
                                     if (onCompleted != null) onCompleted.accept(text);
@@ -500,13 +618,22 @@ public class LocalMoonshineSTT {
                             }
                         }
 
-                        // 確定済み行のカウント更新
+                        // ★FIX: 確定済み行カウント — テキストが空の行は数えない
                         long completed = 0;
                         for (long i = 0; i < lineCount; i++) {
-                            byte ic = pLines.getByte(
-                                    i * LINE_SIZE + LINE_OFF_IS_COMPLETE);
-                            if (ic != 0) completed = i + 1;
-                            else break;
+                            long base = i * LINE_SIZE;
+                            byte ic = pLines.getByte(base + LINE_OFF_IS_COMPLETE);
+                            if (ic != 0) {
+                                Pointer pt = pLines.getPointer(base + LINE_OFF_TEXT);
+                                if (pt != null) {
+                                    try {
+                                        String t = pt.getString(0, "UTF-8").trim();
+                                        if (!t.isEmpty()) completed = i + 1;
+                                    } catch (Error ignore) {}
+                                }
+                            } else {
+                                break;
+                            }
                         }
                         lastCompletedCount = completed;
 

@@ -16,6 +16,7 @@ public class HistoryFrame extends JFrame implements ChangeListener {
     private final MobMateWhisp mobMateWhisp;
 //    private final JTextArea t = new JTextArea();
     private final JPanel historyListPanel = new JPanel();
+    private final JLabel partialLabel = new JLabel(" ");
     public static final int HISTORY_MAX_LINES = 100;
     private final java.util.concurrent.BlockingQueue<String> radioSpeakQueue =
             new java.util.concurrent.LinkedBlockingQueue<>();
@@ -40,6 +41,12 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         historyListPanel.add(Box.createVerticalGlue());
 
         JScrollPane scroll = new JScrollPane(historyListPanel);
+
+        // ★ADD: partial preview ラベルのスタイル設定
+        partialLabel.setFont(new Font(Font.SANS_SERIF, Font.ITALIC, 14));
+        partialLabel.setForeground(new Color(110, 150, 210));
+        partialLabel.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6));
+        partialLabel.setOpaque(true);
 
         // ===== Speak Input (★追加) =====
         final JTextField speakField = new JTextField();
@@ -117,6 +124,7 @@ public class HistoryFrame extends JFrame implements ChangeListener {
 
         // ===== Main panel =====
         final JPanel panel = new JPanel(new BorderLayout());
+        panel.add(partialLabel, BorderLayout.NORTH);   // ★ADD
         panel.add(scroll, BorderLayout.CENTER);
         panel.add(bottom, BorderLayout.SOUTH);
 
@@ -255,5 +263,26 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         float[] hsb = Color.RGBtoHSB(color.getRed(), color.getGreen(), color.getBlue(), null);
         float newBrightness = Math.max(0f, Math.min(1f, hsb[2] + factor));
         return Color.getHSBColor(hsb[0], hsb[1], newBrightness);
+    }
+    // ★ADD: Moonshine partial プレビュー更新（MobMateWhispから呼ばれる）
+    public void setPartialPreview(String text) {
+        SwingUtilities.invokeLater(() -> {
+            if (text == null || text.isBlank()) {
+                partialLabel.setText(" ");
+                partialLabel.setBackground(UIManager.getColor("Panel.background"));
+            } else {
+                partialLabel.setText("⏳ " + text);
+                Color bg = UIManager.getColor("Panel.background");
+                if (bg == null) bg = getBackground();
+                // ★背景に溶け込む控えめなブレンド（青+8だけ）
+                partialLabel.setBackground(new Color(
+                        Math.max(0, bg.getRed()   - 3),
+                        Math.max(0, bg.getGreen() - 3),
+                        Math.min(255, bg.getBlue() + 8)
+                ));
+            }
+            partialLabel.setOpaque(true);
+            partialLabel.repaint();
+        });
     }
 }
