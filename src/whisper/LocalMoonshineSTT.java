@@ -200,6 +200,7 @@ public class LocalMoonshineSTT {
 
             running = true;
             startPollThread();
+            injectSilencePadding(); // ★初回開始時もデコーダを温める
         } catch (Error e) {
             Config.log("[Moonshine] start ERROR: " + e.getClass().getName()
                     + " - " + e.getMessage());
@@ -410,10 +411,10 @@ public class LocalMoonshineSTT {
             else System.clearProperty(name);
         }
     }
-    // ★ADD: clipping専用reset（カウントに含めない）
+    // clipping専用reset（カウントに含めない）
     public synchronized void resetStreamForClipping() {
         if (!running || transcriber < 0) return;
-        flushPendingTranscriptOnce();   // ★ADD
+        flushPendingTranscriptOnce();
         try {
             if (stream >= 0) {
                 MoonshineLib.INSTANCE.moonshine_stop_stream(transcriber, stream);
@@ -435,84 +436,118 @@ public class LocalMoonshineSTT {
     private void injectSilencePadding() {
         if (transcriber < 0 || stream < 0) return;
         try {
-            float[] pad = new float[1600*6]; // 400ms at 16kHz
+            // 1600 samples = 100ms @16kHz
+            // まずは 1.0秒 だけ入れて様子を見る
+            final int padSamples = 1600 * 6; // 1000ms at 16kHz
+
+            float[] pad = new float[padSamples];
             MoonshineLib.INSTANCE.moonshine_transcribe_add_audio_to_stream(
-                    transcriber, stream, pad, (1600*6L), 16000, 0);
+                    transcriber, stream, pad, (long) padSamples, 16000, 0);
+
+            // ★重要: padding投入後もpoll側が即見に行けるように起こす
+            synchronized (audioNotify) {
+                hasNewAudio = true;
+                audioNotify.notify();
+            }
+
+            Config.logDebug("[Moonshine] silence padding injected: " + padSamples + " samples");
         } catch (Error e) {
             Config.logDebug("[Moonshine] silence padding error: " + e.getMessage());
         }
     }
-    // ★ADD: reset直前に pending transcript を1回だけ吸い上げる
+    /** flush直前に末尾へ短い無音を足して、語尾の着地を安定させる */
+    private void injectTailSilencePadding() {
+        if (transcriber < 0 || stream < 0) return;
+        try {
+            float[] pad = new float[1600 * 6]; // 200ms at 16kHz
+            MoonshineLib.INSTANCE.moonshine_transcribe_add_audio_to_stream(
+                    transcriber, stream, pad, (1600 * 6L), 16000, 0);
+            Config.logDebug("[Moonshine] tail silence injected: " + (1600 * 6) + " samples");
+        } catch (Error e) {
+            Config.logDebug("[Moonshine] tail silence error: " + e.getMessage());
+        }
+    }
+    // reset直前に pending transcript を1回だけ吸い上げる
     private void flushPendingTranscriptOnce() {
         if (transcriber < 0 || stream < 0) return;
 
         try {
-            PointerByReference pRef = new PointerByReference();
-            int err = MoonshineLib.INSTANCE.moonshine_transcribe_stream(
-                    transcriber, stream,
-                    MOONSHINE_FLAG_FORCE_UPDATE, pRef);
+            // ★語尾欠け対策: 末尾に短い無音を足す
+            injectTailSilencePadding();
 
-            if (err != 0) return;
+            String bestComplete = null;
+            String bestPartial = null;
+            int bestLatency = -1;
+            long completedCountSnapshot = lastCompletedCount;
 
-            Pointer pTx = pRef.getValue();
-            if (pTx == null) return;
-
-            Pointer pLines = pTx.getPointer(TX_OFF_LINES);
-            long lineCount = pTx.getLong(TX_OFF_LINE_COUNT);
-            if (pLines == null || lineCount <= 0) return;
-
-            for (long i = 0; i < lineCount; i++) {
-                long base = i * LINE_SIZE;
-
-                Pointer pText = pLines.getPointer(base + LINE_OFF_TEXT);
-                if (pText == null) continue;
-
-                String text;
-                try {
-                    text = pText.getString(0, "UTF-8").trim();
-                } catch (Error ignore) {
-                    continue;
-                }
-                if (text.isEmpty()) continue;
-
-                byte isComplete = pLines.getByte(base + LINE_OFF_IS_COMPLETE);
-                byte isUpdated = pLines.getByte(base + LINE_OFF_IS_UPDATED);
-                byte isNew = pLines.getByte(base + LINE_OFF_IS_NEW);
-                byte hasTextChanged = pLines.getByte(base + LINE_OFF_HAS_TEXT_CHANGED);
-                int latencyMs = pLines.getInt(base + LINE_OFF_LATENCY_MS);
-
-                if (isComplete != 0) {
-                    if (isUpdated != 0 || isNew != 0 || i >= lastCompletedCount) {
-                        Config.log("[Moonshine] COMPLETE(flush): " + text
-                                + " (latency=" + latencyMs + "ms)");
-                        if (onCompleted != null) onCompleted.accept(text);
-                    }
-                } else {
-                    if (hasTextChanged != 0 || isNew != 0) {
-                        Config.log("[Moonshine] partial(flush): " + text
-                                + " (" + latencyMs + "ms)");
-                        if (onPartial != null) onPartial.accept(text);
+            // ★1回勝負をやめて、短い2パス確認にする
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass > 0) {
+                    try {
+                        Thread.sleep(35); // 最小限のsettle wait
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
                     }
                 }
+
+                PointerByReference pRef = new PointerByReference();
+                int err = MoonshineLib.INSTANCE.moonshine_transcribe_stream(
+                        transcriber, stream,
+                        MOONSHINE_FLAG_FORCE_UPDATE, pRef);
+
+                if (err != 0) continue;
+
+                Pointer pTx = pRef.getValue();
+                if (pTx == null) continue;
+
+                Pointer pLines = pTx.getPointer(TX_OFF_LINES);
+                long lineCount = pTx.getLong(TX_OFF_LINE_COUNT);
+                if (pLines == null || lineCount <= 0) continue;
+
+                for (long i = 0; i < lineCount; i++) {
+                    long base = i * LINE_SIZE;
+
+                    Pointer pText = pLines.getPointer(base + LINE_OFF_TEXT);
+                    if (pText == null) continue;
+
+                    String text;
+                    try {
+                        text = pText.getString(0, "UTF-8").trim();
+                    } catch (Error ignore) {
+                        continue;
+                    }
+                    if (text.isEmpty()) continue;
+
+                    byte isComplete = pLines.getByte(base + LINE_OFF_IS_COMPLETE);
+                    int latencyMs = pLines.getInt(base + LINE_OFF_LATENCY_MS);
+
+                    if (isComplete != 0) {
+                        if (i >= completedCountSnapshot) {
+                            bestComplete = text;
+                            bestLatency = latencyMs;
+                            completedCountSnapshot = i + 1;
+                        }
+                    } else {
+                        bestPartial = text;
+                        bestLatency = latencyMs;
+                    }
+                }
+
+                // ★completeが取れたらそこで勝ち
+                if (bestComplete != null) break;
             }
 
-            long completed = 0;
-            for (long i = 0; i < lineCount; i++) {
-                long base = i * LINE_SIZE;
-                byte ic = pLines.getByte(base + LINE_OFF_IS_COMPLETE);
-                if (ic != 0) {
-                    Pointer pt = pLines.getPointer(base + LINE_OFF_TEXT);
-                    if (pt != null) {
-                        try {
-                            String t = pt.getString(0, "UTF-8").trim();
-                            if (!t.isEmpty()) completed = i + 1;
-                        } catch (Error ignore) {}
-                    }
-                } else {
-                    break;
-                }
+            lastCompletedCount = completedCountSnapshot;
+
+            if (bestComplete != null) {
+                Config.log("[Moonshine] COMPLETE(flush): " + bestComplete
+                        + " (latency=" + bestLatency + "ms)");
+                if (onCompleted != null) onCompleted.accept(bestComplete);
+            } else if (bestPartial != null) {
+                Config.log("[Moonshine] partial(flush): " + bestPartial
+                        + " (" + bestLatency + "ms)");
+                if (onPartial != null) onPartial.accept(bestPartial);
             }
-            lastCompletedCount = completed;
 
         } catch (Error e) {
             Config.logDebug("[Moonshine] flushPendingTranscriptOnce ERROR: " + e.getMessage());

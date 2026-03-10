@@ -38,6 +38,7 @@ import static whisper.VoicegerManager.checkVoicegerFiles;
  */
 public class FirstLaunchWizard extends JDialog {
 
+    private static final String DISCORD_INVITE_URL = "https://discord.gg/CkhYzNw7YF";
     private final MobMateWhisp mobmatewhisp;
     private boolean completed = false;
 
@@ -54,7 +55,7 @@ public class FirstLaunchWizard extends JDialog {
     private static final int STEP_VOICEVOX = 3;
     private static final int STEP_XTTS     = 4;
     private static final int STEP_VOICEGER = 5;
-    private static final int STEP_COUNT    = 6;
+    private static final int STEP_COUNT    = 3;
 
     private int step = STEP_ENGINE;
 
@@ -89,12 +90,17 @@ public class FirstLaunchWizard extends JDialog {
 
 
     public FirstLaunchWizard(Frame owner, MobMateWhisp mmw) throws FileNotFoundException, NativeHookException {
+        this(owner, mmw, false);
+    }
+
+    public FirstLaunchWizard(Frame owner, MobMateWhisp mmw, boolean forceControlCenter)
+            throws FileNotFoundException, NativeHookException {
         super(owner, UiText.t("wizard.title"), true);
         this.mobmatewhisp = mmw;
-        // 初回だけは「ウィザード(Card)」で最短成功体験、2回目以降は「Control Center(Tab)」
+
         boolean completed = prefs.getBoolean("wizard.completed", false);
         boolean never = prefs.getBoolean("wizard.never", false);
-        if (completed || never) controlCenterMode = true;
+        if (forceControlCenter || completed || never) controlCenterMode = true;
 
         setSize(760, 760);
         setLocationRelativeTo(owner);
@@ -106,28 +112,23 @@ public class FirstLaunchWizard extends JDialog {
             add(controlCenterBottomBar(), BorderLayout.SOUTH);
         } else {
             // ===== legacy wizard (CardLayout) =====
-            cardPanel.add(stepRecogEngine(), "step0");  // ★v1.5.0
+            cardPanel.add(stepRecogEngine(), "step0");
             cardPanel.add(stepInputDevice(), "step1");
             cardPanel.add(stepOutputDevice(), "step2");
-            cardPanel.add(stepVoiceVox(), "step3");
-            cardPanel.add(stepXtts(), "step4");
-            cardPanel.add(stepVoiceger(), "step5");
+            // ★初回成功はここまで
+            // cardPanel.add(stepVoiceVox(), "step3");
+            // cardPanel.add(stepXtts(), "step4");
+            // cardPanel.add(stepVoiceger(), "step5");
 
             add(cardPanel, BorderLayout.CENTER);
             add(bottomBar(), BorderLayout.SOUTH);
 
-            // 初期 step enter
             onStepEnter(step);
         }
 
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
-                // ×で閉じた扱い
-//                completed = false;
-//                prefs.putBoolean("wizard.completed", false);
-
-                // リソース解放（念のため）
                 try {
                     if (controlCenterMode) {
                         if (lastStepForTabs >= 0) onStepExit(lastStepForTabs);
@@ -142,7 +143,6 @@ public class FirstLaunchWizard extends JDialog {
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosed(WindowEvent e) {
-                // 念のため全停止
                 onStepExit(step);
             }
         });
@@ -301,41 +301,26 @@ public class FirstLaunchWizard extends JDialog {
 
         // exe直下の moonshine_model/ をスキャンして言語フォルダを列挙
         JComboBox<String> langCombo = new JComboBox<>();
-        File moonBaseDir = new File(mobmatewhisp.getExeDir(), "moonshine_model");
-        File[] langDirs = moonBaseDir.isDirectory()
-                ? moonBaseDir.listFiles(File::isDirectory) : null;
+        File moonBaseDir = mobmatewhisp.getMoonBaseDir();
 
         JLabel pathLabel = new JLabel(" ");
         pathLabel.setFont(pathLabel.getFont().deriveFont(11f));
         pathLabel.setForeground(Color.GRAY);
 
-        if (langDirs != null && langDirs.length > 0) {
-            Arrays.sort(langDirs, Comparator.comparing(File::getName));
-            for (File d : langDirs) {
-                langCombo.addItem(d.getName());
-            }
-            // 既存設定があればそれを選択
-            String savedPath = prefs.get("moonshine.model_path", "");
-            if (!savedPath.isEmpty()) {
-                // パスから言語名を逆引き
-                for (int i = 0; i < langCombo.getItemCount(); i++) {
-                    if (savedPath.contains(langCombo.getItemAt(i))) {
-                        langCombo.setSelectedIndex(i);
-                        break;
-                    }
-                }
-            }
-            // 選択中のモデルパスを表示
-            updateMoonModelPath(langCombo, moonBaseDir, pathLabel);
+        reloadMoonshineLangCombo(langCombo, moonBaseDir, pathLabel);
 
-            langCombo.addActionListener(e -> {
-                updateMoonModelPath(langCombo, moonBaseDir, pathLabel);
-            });
-        } else {
-            langCombo.addItem(UiText.t("wizard.engine.model.notfound"));
-            langCombo.setEnabled(false);
-            pathLabel.setText(UiText.t("wizard.engine.model.notfound.hint"));
-        }
+        langCombo.addActionListener(e -> {
+            updateMoonModelPath(langCombo, moonBaseDir, pathLabel);
+        });
+
+// Explorer から戻ってきた時に自動再読込
+        addWindowFocusListener(new WindowAdapter() {
+            @Override
+            public void windowGainedFocus(WindowEvent e) {
+                SwingUtilities.invokeLater(() ->
+                        reloadMoonshineLangCombo(langCombo, moonBaseDir, pathLabel));
+            }
+        });
 
         JPanel langRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
         langRow.add(new JLabel(UiText.t("wizard.engine.model.lang")));
@@ -360,6 +345,10 @@ public class FirstLaunchWizard extends JDialog {
             }
         });
         btnRow.add(openFolder);
+        JButton refreshModels = new JButton("再読込");
+        refreshModels.addActionListener(e ->
+                reloadMoonshineLangCombo(langCombo, moonBaseDir, pathLabel));
+        btnRow.add(refreshModels);
 
         // 「他の言語モデルをダウンロード」リンク
         JButton dlLink = new JButton(UiText.t("wizard.engine.model.download"));
@@ -434,26 +423,56 @@ public class FirstLaunchWizard extends JDialog {
     }
 
     /** Moonshineモデルパスを解決してprefsに保存＋ラベル更新 */
+    private void reloadMoonshineLangCombo(JComboBox<String> combo, File baseDir, JLabel label) {
+        String prevSelected = (String) combo.getSelectedItem();
+        String savedPath = prefs.get("moonshine.model_path", "");
+
+        LinkedHashMap<String, File> moonModels = mobmatewhisp.scanMoonshineModelMap();
+
+        combo.removeAllItems();
+
+        if (moonModels.isEmpty()) {
+            combo.addItem(UiText.t("wizard.engine.model.notfound"));
+            combo.setEnabled(false);
+            label.setText(UiText.t("wizard.engine.model.notfound.hint"));
+            return;
+        }
+
+        combo.setEnabled(true);
+
+        for (String key : moonModels.keySet()) {
+            combo.addItem(key);
+        }
+
+        String selectedKey = mobmatewhisp.findMoonshineModelKey(savedPath, moonModels);
+        if (selectedKey == null && prevSelected != null && moonModels.containsKey(prevSelected)) {
+            selectedKey = prevSelected;
+        }
+        if (selectedKey == null) {
+            selectedKey = moonModels.keySet().iterator().next();
+        }
+
+        combo.setSelectedItem(selectedKey);
+        updateMoonModelPath(combo, baseDir, label);
+    }
+
     private void updateMoonModelPath(JComboBox<String> combo, File baseDir, JLabel label) {
         String langName = (String) combo.getSelectedItem();
         if (langName == null || langName.isEmpty()) return;
 
-        File langDir = new File(baseDir, langName);
-        if (!langDir.isDirectory()) {
-            label.setText("⚠ " + langDir.getAbsolutePath() + " not found");
+        LinkedHashMap<String, File> moonModels = mobmatewhisp.scanMoonshineModelMap();
+        File modelDir = moonModels.get(langName);
+
+        if (modelDir == null || !modelDir.isDirectory()) {
+            label.setText(UiText.t("wizard.engine.model.notfound.hint"));
             return;
         }
 
-        // 言語ディレクトリ内でモデルを探す
-        // 構造例: moonshine_model/ja/quantized/base-ja/
-        // または: moonshine_model/ja/  (直接モデルファイルが入っている)
-        File modelDir = findDeepestModelDir(langDir);
         String modelPath = modelDir.getAbsolutePath();
 
         prefs.put("moonshine.model_path", modelPath);
         try { prefs.flush(); } catch (Exception ignore) {}
 
-        // パスが長い場合は末尾を表示
         String display = modelPath;
         if (display.length() > 60) {
             display = "..." + display.substring(display.length() - 57);
@@ -503,11 +522,22 @@ public class FirstLaunchWizard extends JDialog {
         p.add(title("wizard.step1.title"));
         p.add(text("wizard.step1.desc"));
 
+        JLabel okHint = new JLabel("Success: the meter should move while you speak.");
+        okHint.setForeground(new Color(76, 175, 80));
+        okHint.setBorder(BorderFactory.createEmptyBorder(0, 0, 8, 0));
+        p.add(okHint);
+
         JComboBox<String> micList = new JComboBox<>();
 
-        // ===== 既存ロジックと同じ取得 =====
         List<String> mixers = mobmatewhisp.getInputsMixerNames();
         Collections.sort(mixers);
+
+        if (mixers.isEmpty()) {
+            JLabel err = new JLabel("No input device found. Check Windows microphone settings.");
+            err.setForeground(new Color(220, 80, 80));
+            p.add(err);
+            return p;
+        }
 
         String audioDevice = prefs.get("audio.device", "");
         String previous = prefs.get("audio.device.previous", "");
@@ -517,7 +547,7 @@ public class FirstLaunchWizard extends JDialog {
             currentAudioDevice = audioDevice;
         } else if (!previous.isEmpty() && mixers.contains(previous)) {
             currentAudioDevice = previous;
-        } else if (!mixers.isEmpty()) {
+        } else {
             currentAudioDevice = mixers.get(0);
             prefs.put("audio.device", currentAudioDevice);
         }
@@ -525,23 +555,24 @@ public class FirstLaunchWizard extends JDialog {
         for (String name : mixers) {
             micList.addItem(name);
         }
-        if (!currentAudioDevice.isEmpty()) {
-            micList.setSelectedItem(currentAudioDevice);
-        }
+        micList.setSelectedItem(currentAudioDevice);
 
         p.add(micList);
-        p.add(text("wizard.step1.test"));
 
         JProgressBar level = new JProgressBar(0, 100);
         level.setStringPainted(true);
+        level.setString("Speak now");
         p.add(level);
 
-        // ===== 選択変更時の挙動（本体と同じ） =====
+        JLabel subHint = new JLabel("If the meter does not move: check Windows mic level / boost / default device.");
+        subHint.setForeground(Color.GRAY);
+        subHint.setBorder(BorderFactory.createEmptyBorder(8, 0, 0, 0));
+        p.add(subHint);
+
         micList.addActionListener(e -> {
             String name = (String) micList.getSelectedItem();
             if (name == null) return;
 
-            // prefs 更新（完全に同じ）
             prefs.put("audio.device.previous", prefs.get("audio.device", ""));
             prefs.put("audio.device", name);
             try {
@@ -550,16 +581,11 @@ public class FirstLaunchWizard extends JDialog {
                 ex.printStackTrace();
             }
 
-            // モニタ再起動
             stopMicMonitor();
             startMicMonitorByName(name, level);
         });
 
-        // 初期モニタ開始
-        if (!currentAudioDevice.isEmpty()) {
-            startMicMonitorByName(currentAudioDevice, level);
-        }
-
+        startMicMonitorByName(currentAudioDevice, level);
         return p;
     }
 
@@ -627,11 +653,22 @@ public class FirstLaunchWizard extends JDialog {
 
         p.add(title("wizard.step2.title"));
         p.add(text("wizard.step2.desc"));
-        p.add(text("wizard.step2.note"));
+
+        JLabel okHint = new JLabel("Success: click Play test voice, hear \"test now.\", then click Next.");
+        okHint.setForeground(new Color(76, 175, 80));
+        okHint.setBorder(BorderFactory.createEmptyBorder(0, 0, 8, 0));
+        p.add(okHint);
 
         JComboBox<String> outputList = new JComboBox<>();
         List<String> outputMixers = mobmatewhisp.getOutputMixerNames();
         Collections.sort(outputMixers);
+
+        if (outputMixers.isEmpty()) {
+            JLabel err = new JLabel("No output device found.");
+            err.setForeground(new Color(220, 80, 80));
+            p.add(err);
+            return p;
+        }
 
         String outputDevice = prefs.get("audio.output.device", "");
         String prevOutputDevice = prefs.get("audio.output.device.previous", "");
@@ -641,7 +678,7 @@ public class FirstLaunchWizard extends JDialog {
             current = outputDevice;
         } else if (!prevOutputDevice.isEmpty() && outputMixers.contains(prevOutputDevice)) {
             current = prevOutputDevice;
-        } else if (!outputMixers.isEmpty()) {
+        } else {
             current = outputMixers.get(0);
             prefs.put("audio.output.device", current);
         }
@@ -649,30 +686,40 @@ public class FirstLaunchWizard extends JDialog {
         for (String name : outputMixers) {
             outputList.addItem(name);
         }
-        if (!current.isEmpty()) {
-            outputList.setSelectedItem(current);
-        }
+        outputList.setSelectedItem(current);
 
         p.add(outputList);
-        p.add(text("wizard.step2.test"));
 
-        outputTestBar = new JProgressBar(0, 100);
-        outputTestBar.setStringPainted(true);
-        p.add(outputTestBar);
-        p.addHierarchyListener(e -> {
-            if ((e.getChangeFlags() & java.awt.event.HierarchyEvent.SHOWING_CHANGED) == 0) return;
+        JPanel testRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        testRow.setOpaque(false);
 
-            if (p.isShowing()) {
-                System.out.println("[Wizard] Step2 showing -> startOutputSpeakTest");
-                SwingUtilities.invokeLater(() -> startOutputSpeakTest(outputTestBar));
-            } else {
-                System.out.println("[Wizard] Step2 hidden -> stopOutputSpeakTest");
-                stopOutputSpeakTest();
-            }
+        JButton testBtn = new JButton("Play test voice");
+        JLabel testStatus = new JLabel(" ");
+        testStatus.setForeground(Color.GRAY);
+
+        testBtn.addActionListener(e -> {
+            testStatus.setText("Playing...");
+            new Thread(() -> {
+                try {
+                    mobmatewhisp.speakWindows("test now.");
+                    SwingUtilities.invokeLater(() ->
+                            testStatus.setText("Played. If you heard it, click Next."));
+                } catch (Throwable ex) {
+                    SwingUtilities.invokeLater(() ->
+                            testStatus.setText("Failed. Check output device."));
+                }
+            }, "WizardOutputTestOnce").start();
         });
 
+        testRow.add(testBtn);
+        testRow.add(testStatus);
+        p.add(testRow);
 
-        // 出力デバイス変更 → prefs反映
+        JLabel nextHint = new JLabel("Next step: hold Push-to-Talk in the main window and speak until captions appear.");
+        nextHint.setForeground(Color.GRAY);
+        nextHint.setBorder(BorderFactory.createEmptyBorder(8, 0, 0, 0));
+        p.add(nextHint);
+
         outputList.addActionListener(e -> {
             String name = (String) outputList.getSelectedItem();
             if (name == null) return;
@@ -1743,7 +1790,33 @@ public class FirstLaunchWizard extends JDialog {
     /* =========================
    Control Center (tabbed UI)
  ========================= */
-
+    private void openDiscordInvite() {
+        try {
+            if (Desktop.isDesktopSupported()) {
+                Desktop.getDesktop().browse(new URI(DISCORD_INVITE_URL));
+            }
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this,
+                    "Failed to open Discord link:\n" + ex.getMessage(),
+                    "MobMate",
+                    JOptionPane.ERROR_MESSAGE);
+        }
+    }
+    public void selectVoiceVoxTab() {
+        if (controlTabs != null) {
+            controlTabs.setSelectedIndex(3);
+        }
+    }
+    public void selectXttsTab() {
+        if (controlTabs != null) {
+            controlTabs.setSelectedIndex(4);
+        }
+    }
+    public void selectVoicegerTab() {
+        if (controlTabs != null) {
+            controlTabs.setSelectedIndex(5);
+        }
+    }
     private JTabbedPane buildControlCenterTabs() {
         JTabbedPane tabs = new JTabbedPane();
 
@@ -1797,16 +1870,22 @@ public class FirstLaunchWizard extends JDialog {
 
         JPanel right = new JPanel(new FlowLayout(FlowLayout.RIGHT));
 
+        JButton discord = new JButton(UiText.t("wizard.discord"));
+        discord.addActionListener(e -> openDiscordInvite());
+
         JButton close = new JButton(UiText.t("wizard.finish"));
         close.addActionListener(e -> {
-            // タブ移動で leave が呼ばれないケースがあるので念のため
             if (lastStepForTabs >= 0) onStepExit(lastStepForTabs);
+
             completed = true;
-//            prefs.putBoolean("wizard.completed", true);
+            prefs.putBoolean("wizard.completed", true);
+            prefs.putBoolean("wizard.never", false);
             try { prefs.sync(); } catch (Exception ignore) {}
+
             dispose();
         });
 
+        right.add(discord);
         right.add(close);
         p.add(right, BorderLayout.EAST);
         return p;
@@ -1910,6 +1989,9 @@ public class FirstLaunchWizard extends JDialog {
     private JPanel bottomBar() {
         JPanel p = new JPanel(new FlowLayout(FlowLayout.RIGHT));
 
+        JButton discord = new JButton(UiText.t("wizard.discord"));
+        discord.addActionListener(e -> openDiscordInvite());
+
         JButton back = new JButton(UiText.t("wizard.back"));
         JButton next = new JButton(UiText.t("wizard.next"));
 
@@ -1931,13 +2013,21 @@ public class FirstLaunchWizard extends JDialog {
         });
 
         next.addActionListener(e -> {
-            int prev = step;
-            step++;
+            if (step >= LAST_STEP) {
+                onStepExit(step);
 
-            if (step > LAST_STEP) {
+                completed = true;
+                prefs.putBoolean("wizard.completed", true);
+                prefs.putBoolean("wizard.never", false);
+                try { prefs.sync(); } catch (Exception ignore) {}
+
                 dispose();
                 return;
             }
+
+            int prev = step;
+            step++;
+            if (step > LAST_STEP) step = LAST_STEP;
 
             onStepExit(prev);
             cardLayout.next(cardPanel);
@@ -1947,11 +2037,11 @@ public class FirstLaunchWizard extends JDialog {
             back.setEnabled(step > 0);
         });
 
+        p.add(discord);
         p.add(back);
         p.add(next);
         return p;
     }
-
 
     /* =========================
        UI helpers

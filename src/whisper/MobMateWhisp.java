@@ -65,6 +65,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private final Random rnd = new Random();
     private String[] laughOptions;
     private HistoryFrame historyFrame;
+    private MobMateSettingsFrame settingsCenterFrame;
 
     // Moonshine
     private static LocalMoonshineSTT moonshine;
@@ -190,6 +191,9 @@ public class MobMateWhisp implements NativeKeyListener {
     /** Moonshine連続無出力カウント（Partial/COMPLETEが来たら0リセット） */
     private volatile int moonshineNoOutputCount = 0;
     private volatile long moonshineLastOutputMs = 0L;
+    // ★強制Final直後のfinal-only COMPLETE回収待ち
+    private volatile long moonResetDeferredUntilMs = 0L;
+    private static final long MOON_FINAL_DRAIN_MS = 220L;
     // 10/20回は短すぎるのでかなり伸ばす
     private static final int MOONSHINE_NO_OUTPUT_RELOAD = 60;
     // さらに「直近で何か出ていた」ならreloadしない
@@ -272,6 +276,7 @@ public class MobMateWhisp implements NativeKeyListener {
     // ★ デモモードアナウンス（体験版のみ有効にする制御はお好みで）
     private void startDemoAnnounceTimer() {
         if (!Version.IS_DEMO) return;
+        if (!demoAnnounceStarted.compareAndSet(false, true)) return;
 
         // デモメッセージ（5言語）
         Map<String, String> demoMsg = new java.util.LinkedHashMap<>();
@@ -748,6 +753,53 @@ public class MobMateWhisp implements NativeKeyListener {
                 || b == Character.UnicodeBlock.CJK_SYMBOLS_AND_PUNCTUATION
                 || b == Character.UnicodeBlock.HALFWIDTH_AND_FULLWIDTH_FORMS;
     }
+
+    private static final AtomicBoolean demoAnnounceStarted = new AtomicBoolean(false);
+    private static boolean hasMoonshineModelFiles(File dir) {
+        if (dir == null || !dir.isDirectory()) return false;
+        File[] files = dir.listFiles((d, name) ->
+                name.endsWith(".onnx") || name.endsWith(".bin"));
+        return files != null && files.length > 0;
+    }
+    public File getMoonBaseDir() {
+        return new File(getExeDir(), "moonshine_model");
+    }
+    public LinkedHashMap<String, File> scanMoonshineModelMap() {
+        LinkedHashMap<String, File> out = new LinkedHashMap<>();
+
+        File moonBaseDir = getMoonBaseDir();
+        File[] langDirs = moonBaseDir.isDirectory()
+                ? moonBaseDir.listFiles(File::isDirectory)
+                : null;
+
+        if (langDirs == null || langDirs.length == 0) {
+            return out;
+        }
+
+        Arrays.sort(langDirs, Comparator.comparing(File::getName, String.CASE_INSENSITIVE_ORDER));
+
+        for (File langDir : langDirs) {
+            File modelDir = findDeepestModelDir(langDir);
+            if (hasMoonshineModelFiles(modelDir)) {
+                out.put(langDir.getName(), modelDir);
+            }
+        }
+        return out;
+    }
+    public String findMoonshineModelKey(String savedPath, Map<String, File> modelMap) {
+        if (savedPath == null || savedPath.isBlank() || modelMap == null || modelMap.isEmpty()) {
+            return null;
+        }
+
+        String normSaved = new File(savedPath).getAbsolutePath();
+        for (Map.Entry<String, File> e : modelMap.entrySet()) {
+            String modelPath = e.getValue().getAbsolutePath();
+            if (normSaved.equals(modelPath) || normSaved.startsWith(modelPath + File.separator)) {
+                return e.getKey();
+            }
+        }
+        return null;
+    }
     // ★v1.5.0: .onnx/.binファイルがある最深ディレクトリを再帰探索
     static File findDeepestModelDir(File dir) {
         File[] modelFiles = dir.listFiles((d, name) ->
@@ -793,17 +845,29 @@ public class MobMateWhisp implements NativeKeyListener {
             Config.log("[TRAY] updateComponentTreeUI...");
             SwingUtilities.updateComponentTreeUI(frame);
             // Create a pop-up menu components
-            final PopupMenu popup = createPopupMenu();
+            final PopupMenu popup = createTrayUtilityPopup();
             this.trayIcon.setPopupMenu(popup);
             Config.log("[TRAY] add mouse listener...");
             this.trayIcon.addMouseListener(new MouseAdapter() {
+                private void refreshTrayPopup(MouseEvent e) {
+                    if (!e.isPopupTrigger()) return;
+                    try {
+                        trayIcon.setPopupMenu(createTrayUtilityPopup());
+                    } catch (Throwable t) {
+                        Config.logError("[TRAY] popup refresh failed", t);
+                    }
+                }
+                @Override
+                public void mousePressed(MouseEvent e) {
+                    refreshTrayPopup(e);
+                }
                 @Override
                 public void mouseReleased(MouseEvent e) {
+                    refreshTrayPopup(e);
                     if (!e.isPopupTrigger()) {
                         stopRecording();
                     }
                 }
-
             });
             try {
                 Config.log("[TRAY] frame visible...");
@@ -952,1272 +1016,104 @@ public class MobMateWhisp implements NativeKeyListener {
             }
         }
     }
-    private Menu engVvMenu;
-    private CheckboxMenuItem engVv;
-    private ItemListener engListener;
-    protected PopupMenu createPopupMenu() {
-        Config.log("[TRAY] popup: begin");
-        final String strAction = prefs.get("action", "noting");
 
-        Config.log("[TRAY] popup: add Required...");
-        Menu requiredMenu = new Menu(trayText("menu.required"));
-        final PopupMenu popup = new PopupMenu();
-        CheckboxMenuItem autoPaste = new CheckboxMenuItem(trayText("menu.autoPaste"));
-        autoPaste.setState(strAction.equals("paste"));
-        requiredMenu.add(autoPaste);
-        CheckboxMenuItem autoType = new CheckboxMenuItem(trayText("menu.autoType"));
-        autoType.setState(strAction.equals("type"));
-        requiredMenu.add(autoType);
-        final ItemListener typeListener = new ItemListener() {
-            @Override
-            public void itemStateChanged(ItemEvent e) {
-                if (e.getSource().equals(autoPaste) && e.getStateChange() == ItemEvent.SELECTED) {
-                    Config.log("itemStateChanged() PASTE " + e.toString());
-                    prefs.put("action", "paste");
-                    autoType.setState(false);
-                } else if (e.getSource().equals(autoType) && e.getStateChange() == ItemEvent.SELECTED) {
-                    Config.log("itemStateChanged() TYPE " + e.toString());
-                    prefs.put("action", "type");
-                    autoPaste.setState(false);
-                } else {
-                    prefs.put("action", "nothing");
-                }
-                try {
-                    prefs.sync();
-                } catch (BackingStoreException e1) {
-                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
-                }
-            }
-        };
-        autoPaste.addItemListener(typeListener);
-        autoType.addItemListener(typeListener);
-        CheckboxMenuItem detectSilece = new CheckboxMenuItem(trayText("menu.silenceDetection"));
-        detectSilece.setState(prefs.getBoolean("silence-detection", true));
-        detectSilece.addItemListener(new ItemListener() {
-            @Override
-            public void itemStateChanged(ItemEvent e) {
-                prefs.putBoolean("silence-detection", detectSilece.getState());
-                try {
-                    prefs.sync();
-                } catch (BackingStoreException e1) {
-                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
-                }
-            }
-        });
-        requiredMenu.add(detectSilece);
-        // ===== Whisper translate (auto -> EN) =====
-        final CheckboxMenuItem translateToEnItem =
-                new CheckboxMenuItem("Translate to English (Whisper)");
-        translateToEnItem.setState(prefs.getBoolean("whisper.translate_to_en", false));
-        translateToEnItem.addItemListener(new ItemListener() {
-            @Override
-            public void itemStateChanged(ItemEvent e) {
-                prefs.putBoolean("whisper.translate_to_en", translateToEnItem.getState());
-                try {
-                    prefs.sync();
-                } catch (BackingStoreException ex) {
-                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + ex.getMessage());
-                }
-            }
-        });
-        requiredMenu.add(translateToEnItem);
-        // Shift hotkey modifier
-        Menu hotkeysMenu = new Menu(trayText("menu.keyboardShortcut"));
-        final CheckboxMenuItem shiftHotkeyMenuItem = new CheckboxMenuItem("SHIFT");
-        shiftHotkeyMenuItem.setState(prefs.getBoolean("shift-hotkey", false));
-        hotkeysMenu.add(shiftHotkeyMenuItem);
-        shiftHotkeyMenuItem.addItemListener(new ItemListener() {
-            @Override
-            public void itemStateChanged(ItemEvent e) {
-                MobMateWhisp.this.shiftHotkey = shiftHotkeyMenuItem.getState();
-                prefs.putBoolean("shift-hotkey", MobMateWhisp.this.shiftHotkey);
-                try {
-                    prefs.sync();
-                } catch (BackingStoreException e1) {
-                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
-                }
-                updateToolTip();
-            }
-        });
-        // Ctrl hotkey modifier
-        final CheckboxMenuItem ctrlHotkeyMenuItem = new CheckboxMenuItem("CTRL");
-        ctrlHotkeyMenuItem.setState(prefs.getBoolean("ctrl-hotkey", false));
-        hotkeysMenu.add(ctrlHotkeyMenuItem);
-        ctrlHotkeyMenuItem.addItemListener(new ItemListener() {
-            @Override
-            public void itemStateChanged(ItemEvent e) {
-                MobMateWhisp.this.ctrltHotkey = ctrlHotkeyMenuItem.getState();
-                prefs.putBoolean("ctrl-hotkey", MobMateWhisp.this.ctrltHotkey);
-                try {
-                    prefs.sync();
-                } catch (BackingStoreException e1) {
-                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
-                }
-                updateToolTip();
-            }
-        });
-        hotkeysMenu.addSeparator();
-        for (final String key : MobMateWhisp.ALLOWED_HOTKEYS) {
-            final CheckboxMenuItem hotkeyMenuItem = new CheckboxMenuItem(key);
-            if (this.hotkey.equals(key)) {
-                hotkeyMenuItem.setState(true);
-            }
-            hotkeysMenu.add(hotkeyMenuItem);
-            hotkeyMenuItem.addItemListener(new ItemListener() {
-                @Override
-                public void itemStateChanged(ItemEvent e) {
-                    if (hotkeyMenuItem.getState()) {
-                        MobMateWhisp.this.hotkey = key;
-                        prefs.put("hotkey", MobMateWhisp.this.hotkey);
-                        try {
-                            prefs.sync();
-                        } catch (BackingStoreException e1) {
-                            JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + e1.getMessage());
-                        }
-                        hotkeyMenuItem.setState(false);
-                        updateToolTip();
-                    }
-                }
-            });
-        }
-        if (this.remoteUrl == null) {
-            Menu modelMenu = new Menu(trayText("menu.models"));
-            final File dir = new File("models");
-            List<CheckboxMenuItem> allModels = new ArrayList<>();
-            if (new File(dir, this.model).exists()) {
-                for (File f : Objects.requireNonNull(dir.listFiles())) {
-                    final String name = f.getName();
-                    if (name.endsWith(".bin")) {
-                        final boolean selected = this.model.equals(name);
-                        String cleanName = name.replace(".bin", "");
-                        cleanName = cleanName.replace(".bin", "");
-                        cleanName = cleanName.replace("ggml", "");
-                        cleanName = cleanName.replace("-", " ");
-                        cleanName = cleanName.trim();
-                        final CheckboxMenuItem modelItem = new CheckboxMenuItem(cleanName);
-                        modelItem.setState(selected);
-                        modelItem.addItemListener(new ItemListener() {
-                            @Override
-                            public void itemStateChanged(ItemEvent e) {
-                                if (isRecording()) {
-                                    stopRecording();
-                                }
-                                if (modelItem.getState()) {
-                                    // Deselected others
-                                    for (CheckboxMenuItem item : allModels) {
-                                        if (item != modelItem) {
-                                            item.setState(false);
-                                        }
-                                    }
-                                    // Apply model
-                                    MobMateWhisp.this.model = f.getName();
-                                    setModelPref(MobMateWhisp.this.model);
-                                    try {
-                                        MobMateWhisp.this.w = new LocalWhisperCPP(f,"");
-                                    } catch (FileNotFoundException e1) {
-                                        JOptionPane.showMessageDialog(null, e1.getMessage());
-                                    }
-                                }
-                            }
-                        });
-                        allModels.add(modelItem);
-                        modelMenu.add(modelItem);
-                    }
-                }
-            }
-            requiredMenu.add(modelMenu);
-        }
-        requiredMenu.add(hotkeysMenu);
-        final Menu modeMenu = new Menu(trayText("menu.keyTriggerMode"));
-        final CheckboxMenuItem pushToTalkItem = new CheckboxMenuItem(trayText("menu.pushToTalk"));
-        final CheckboxMenuItem pushToTalkDoubleTapItem = new CheckboxMenuItem(trayText("menu.pushToTalkDoubleTap"));
-        final CheckboxMenuItem startStopItem = new CheckboxMenuItem(trayText("menu.startStop"));
-        String currentMode = prefs.get("trigger-mode", START_STOP);
-        pushToTalkItem.setState(PUSH_TO_TALK.equals(currentMode));
-        pushToTalkDoubleTapItem.setState(PUSH_TO_TALK_DOUBLE_TAP.equals(currentMode));
-        startStopItem.setState(START_STOP.equals(currentMode));
-        if (!pushToTalkItem.getState() && !pushToTalkDoubleTapItem.getState() && !startStopItem.getState()) {
-            pushToTalkItem.setState(true);
-            prefs.put("trigger-mode", PUSH_TO_TALK);
-            try {
-                prefs.sync();
-            } catch (BackingStoreException ex) {
-                JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + ex.getMessage());
-            }
-        }
-        final ItemListener modeListener = new ItemListener() {
-            @Override
-            public void itemStateChanged(ItemEvent e) {
-                CheckboxMenuItem source = (CheckboxMenuItem) e.getSource();
-                if (source == pushToTalkItem && e.getStateChange() == ItemEvent.SELECTED) {
-                    pushToTalkItem.setState(true);
-                    pushToTalkDoubleTapItem.setState(false);
-                    startStopItem.setState(false);
-                    prefs.put("trigger-mode", PUSH_TO_TALK);
-                } else if (source == pushToTalkDoubleTapItem && e.getStateChange() == ItemEvent.SELECTED) {
-                    pushToTalkItem.setState(false);
-                    pushToTalkDoubleTapItem.setState(true);
-                    startStopItem.setState(false);
-                    prefs.put("trigger-mode", PUSH_TO_TALK_DOUBLE_TAP);
-                } else if (source == startStopItem && e.getStateChange() == ItemEvent.SELECTED) {
-                    pushToTalkItem.setState(false);
-                    pushToTalkDoubleTapItem.setState(false);
-                    startStopItem.setState(true);
-                    prefs.put("trigger-mode", START_STOP);
-                } else {
-                    // Default to push to talk
-                    pushToTalkItem.setState(true);
-                    pushToTalkDoubleTapItem.setState(false);
-                    startStopItem.setState(false);
-                    prefs.put("trigger-mode", PUSH_TO_TALK);
-                }
-                try {
-                    prefs.sync();
-                } catch (BackingStoreException ex) {
-                    JOptionPane.showMessageDialog(null, "Cannot save preferences\n" + ex.getMessage());
-                }
-            }
-        };
-        pushToTalkItem.addItemListener(modeListener);
-        pushToTalkDoubleTapItem.addItemListener(modeListener);
-        startStopItem.addItemListener(modeListener);
-        modeMenu.add(pushToTalkItem);
-        modeMenu.add(pushToTalkDoubleTapItem);
-        modeMenu.add(startStopItem);
-        requiredMenu.add(modeMenu);
-        popup.add(requiredMenu);
+    protected JPopupMenu createDeltaQuickMenu() {
+        final JPopupMenu popup = new JPopupMenu();
 
-        // ========================================
-        // Audio Settings
-        // ========================================
-        Config.log("[TRAY] popup: add Audio Settings...");
-        Menu audioMenu = new Menu("Audio Settings");
-
-        // Input Devices
-        final Menu audioInputsItem = new Menu(trayText("menu.audioInputs"));
-        String audioDevice = prefs.get("audio.device", "");
-        String previsouAudipDevice = prefs.get("audio.device.previous", "");
-        List<String> mixers = getInputsMixerNames();
-        if (!mixers.isEmpty()) {
-            String currentAudioDevice = "";
-            if (!audioDevice.isEmpty() && mixers.contains(audioDevice)) {
-                currentAudioDevice = audioDevice;
-            } else if (!previsouAudipDevice.isEmpty() && mixers.contains(previsouAudipDevice)) {
-                currentAudioDevice = previsouAudipDevice;
-            } else {
-                currentAudioDevice = mixers.getFirst();
-                prefs.put("audio.device", currentAudioDevice);
-                try {
-                    prefs.sync();
-                } catch (BackingStoreException ignored) {
-                }
-            }
-            Collections.sort(mixers);
-            List<CheckboxMenuItem> all2 = new ArrayList<>();
-            for (String name : mixers) {
-                CheckboxMenuItem menuItem = new CheckboxMenuItem(name);
-                if (currentAudioDevice.equals(name)) {
-                    menuItem.setState(true);
-                }
-                audioInputsItem.add(menuItem);
-                all2.add(menuItem);
-                menuItem.addItemListener(new ItemListener() {
-                    @Override
-                    public void itemStateChanged(ItemEvent e) {
-                        if (menuItem.getState()) {
-                            for (CheckboxMenuItem m : all2) {
-                                m.setState(m == menuItem);
-                            }
-                            prefs.put("audio.device.previous",
-                                    prefs.get("audio.device", ""));
-                            prefs.put("audio.device", name);
-                            try {
-                                prefs.sync();
-                            } catch (BackingStoreException ex) {
-                            }
-                            SwingUtilities.invokeLater(() -> {
-                                isCalibrationComplete = false;
-                                button.setEnabled(false);
-                                button.setText("Calibrating...");
-                                window.setTitle("Input changed, calibrating...");
-                                primeVadByEmptyRecording();
-                            });
-                        }
-                        if (isRecording()) {
-                            stopRecording();
-                        }
-                    }
-                });
-            }
-        }
-        audioMenu.add(audioInputsItem);
-
-        // Output Devices
-        Menu audioOutputsItem = new Menu(trayText("menu.audioOutputs"));
-        String outputDevice = prefs.get("audio.output.device", "");
-        String prevOutputDevice = prefs.get("audio.output.device.previous", "");
-        List<String> outputMixers = getOutputMixerNames();
-        if (!outputMixers.isEmpty()) {
-            Collections.sort(outputMixers);
-            List<CheckboxMenuItem> all3 = new ArrayList<>();
-            for (int i = 0; i < outputMixers.size(); i++) {
-                String name = outputMixers.get(i);
-                String displayName = String.format("%02d: %s", i, name);
-                CheckboxMenuItem item = new CheckboxMenuItem(displayName);
-                item.setState(outputDevice.equals(name));
-                audioOutputsItem.add(item);
-                all3.add(item);
-                final String mixerName = name;
-                item.addItemListener(e -> {
-                    if (item.getState()) {
-                        for (CheckboxMenuItem m : all3) {
-                            m.setState(m == item);
-                        }
-                        prefs.put("audio.output.device.previous",
-                                prefs.get("audio.output.device", ""));
-                        prefs.put("audio.output.device", mixerName);
-                        try {
-                            prefs.sync();
-                        } catch (BackingStoreException ignored) {
-                        }
-                    }
-                });
-            }
-        }
-        audioMenu.add(audioOutputsItem);
-
-        // Input Gain
-        Menu inputGainMenu = new Menu(trayText("menu.inputGain"));
-        boolean autogaintuner = prefs.getBoolean("audio.autoGain", true);
-        float currentGain = prefs.getFloat("audio.inputGainMultiplier", 1.0f);
-        CheckboxMenuItem autoGainItem = new CheckboxMenuItem(trayText("menu.autoGainTuner"));
-        autoGainItem.setState(autogaintuner);
-        autoGainItem.addItemListener(e -> {
-            prefs.putBoolean("audio.autoGain", autoGainItem.getState());
-            autoGainEnabled = autoGainItem.getState();
-            try { prefs.sync(); } catch (Exception ignore) {}
-            reloadAudioPrefsForMeter();
-        });
-        inputGainMenu.add(autoGainItem);
-        inputGainMenu.addSeparator();
-        List<CheckboxMenuItem> gainItems = new ArrayList<>();
-        for (int i = 0; i < 10; i++) {
-            float gain = 1.0f + (0.8f * i);
-            String label = String.format("x %.1f", gain);
-            CheckboxMenuItem item = new CheckboxMenuItem(label, gain == currentGain);
-            item.addItemListener(e -> {
-                for (CheckboxMenuItem it : gainItems) {
-                    it.setState(false);
-                }
-                item.setState(true);
-                prefs.putFloat("audio.inputGainMultiplier", gain);
-                try { prefs.sync(); } catch (Exception ignore) {}
-                if (isRecording()) {
-                    stopRecording();
-                }
-                reloadAudioPrefsForMeter();
-            });
-            gainItems.add(item);
-            inputGainMenu.add(item);
-        }
-        audioMenu.add(inputGainMenu);
-        popup.add(audioMenu);
-
-        // ========================================
-        // Speaker Verification Settings
-        // ========================================
-        Menu speakerMenu = new Menu("Speaker Verification");
-
-        CheckboxMenuItem speakerEnabledItem = new CheckboxMenuItem("Enable Speaker Filter");
-        speakerEnabledItem.setState(prefs.getBoolean("speaker.enabled", false));
-        speakerEnabledItem.addItemListener(e -> {
-            boolean on = speakerEnabledItem.getState();
-            prefs.putBoolean("speaker.enabled", on);
-            try { prefs.sync(); } catch (Exception ignore) {}
-            if (!on) {
-                speakerProfile.reset();
-                File spkFile = new File("speaker_profile.dat");
-                if (spkFile.exists()) spkFile.delete();
-                Config.log("★Speaker verification disabled, profile cleared");
-            }
-            updateSpeakerStatus();
-        });
-        speakerMenu.add(speakerEnabledItem);
-        speakerMenu.addSeparator();
-
-        // エンロールサンプル数 (5〜10)
-        Menu enrollCountMenu = new Menu("Enroll Samples");
-        int currentEnrollSamples = prefs.getInt("speaker.enroll_samples", 5);
-        List<CheckboxMenuItem> enrollItems = new ArrayList<>();
-        for (int cnt : new int[]{3, 5, 7, 10}) {
-            String label = cnt + " samples" + (cnt == 5 ? " (default)" : "");
-            CheckboxMenuItem item = new CheckboxMenuItem(label, cnt == currentEnrollSamples);
-            final int val = cnt;
-            item.addItemListener(e -> {
-                for (CheckboxMenuItem it : enrollItems) it.setState(false);
-                item.setState(true);
-                prefs.putInt("speaker.enroll_samples", val);
-                speakerProfile.updateSettings(
-                        val,
-                        prefs.getFloat("speaker.threshold_initial", 0.55f),
-                        prefs.getFloat("speaker.threshold_target", 0.72f));
-                try { prefs.sync(); } catch (Exception ignore) {}
-            });
-            enrollItems.add(item);
-            enrollCountMenu.add(item);
-        }
-        speakerMenu.add(enrollCountMenu);
-
-        // 感度（initial threshold）
-        Menu sensitivityMenu = new Menu("Sensitivity");
-        float currentInitTh = prefs.getFloat("speaker.threshold_initial", 0.55f);
-        List<CheckboxMenuItem> sensItems = new ArrayList<>();
-        for (float[] opt : new float[][]{
-                {0.1f},{0.25f},{0.45f}, {0.55f}, {0.60f}, {0.70f}, {0.80f}}) {
-            float th = opt[0];
-            String label = String.format("%.0f%%", th * 100)
-                    + (th == 0.60f ? " (default)" : "")
-                    + (th <= 0.45f ? " - loose" : th >= 0.60f ? " - strict" : "");
-            CheckboxMenuItem item = new CheckboxMenuItem(label,
-                    Math.abs(th - currentInitTh) < 0.01f);
-            item.addItemListener(e -> {
-                for (CheckboxMenuItem it : sensItems) it.setState(false);
-                item.setState(true);
-                prefs.putFloat("speaker.threshold_initial", th);
-                speakerProfile.updateSettings(
-                        prefs.getInt("speaker.enroll_samples", 5),
-                        th,
-                        prefs.getFloat("speaker.threshold_target", 0.72f));
-                try { prefs.sync(); } catch (Exception ignore) {}
-            });
-            sensItems.add(item);
-            sensitivityMenu.add(item);
-        }
-        speakerMenu.add(sensitivityMenu);
-
-        speakerMenu.addSeparator();
-
-        // プロファイルリセット
-        MenuItem resetProfileItem = new MenuItem("Reset Speaker Profile");
-        resetProfileItem.addActionListener(e -> {
-            int confirm = JOptionPane.showConfirmDialog(null,
-                    "Reset speaker profile?\nYou will need to re-enroll on next Start.",
-                    "Speaker Verification", JOptionPane.YES_NO_OPTION);
-            if (confirm == JOptionPane.YES_OPTION) {
-                speakerProfile.reset();
-                File spkFile = new File("speaker_profile.dat");
-                if (spkFile.exists()) spkFile.delete();
-                Config.log("★Speaker profile reset by user");
-                updateSpeakerStatus();
-            }
-        });
-        speakerMenu.add(resetProfileItem);
-        popup.add(speakerMenu);
-
-        // ========================================
-        // Performance
-        // ========================================
-        Config.log("[TRAY] popup: add Performance...");
-        Menu performanceMenu = new Menu("Performance");
-
-        // ★v1.5.0: Recognition Engine Selection
-        Menu recogEngineMenu = new Menu("Recognition Engine");
-        String currentEngine = prefs.get("recog.engine", "whisper");
-        CheckboxMenuItem engineWhisper = new CheckboxMenuItem("Whisper");
-        CheckboxMenuItem engineMoonshine = new CheckboxMenuItem("Moonshine");
-        engineWhisper.setState("whisper".equalsIgnoreCase(currentEngine));
-        engineMoonshine.setState("moonshine".equalsIgnoreCase(currentEngine));
-
-        // ★v1.5.0: setState連鎖によるsoftRestart二重発火を防止するガード
-        final boolean[] updatingEngine = {false};
-
-        engineWhisper.addItemListener(e -> {
-            if (updatingEngine[0]) return;
-            if (engineWhisper.getState()) {
-                updatingEngine[0] = true;
-                try {
-                    engineMoonshine.setState(false);
-                    prefs.put("recog.engine", "whisper");
-                    try { prefs.flush(); } catch (Exception ignore) {}
-                    Config.log("★RecogEngine changed to: Whisper → soft restart");
-                    softRestart();
-                } finally {
-                    updatingEngine[0] = false;
-                }
-            } else {
-                engineWhisper.setState(true);
-            }
-        });
-        engineMoonshine.addItemListener(e -> {
-            if (updatingEngine[0]) return;
-            if (engineMoonshine.getState()) {
-                updatingEngine[0] = true;
-                try {
-                    engineWhisper.setState(false);
-                    prefs.put("recog.engine", "moonshine");
-                    try { prefs.flush(); } catch (Exception ignore) {}
-                    Config.log("★RecogEngine changed to: Moonshine → soft restart");
-                    softRestart();
-                } finally {
-                    updatingEngine[0] = false;
-                }
-            } else {
-                engineMoonshine.setState(true);
-            }
-        });
-
-        recogEngineMenu.add(engineWhisper);
-        recogEngineMenu.add(engineMoonshine);
-        recogEngineMenu.addSeparator();
-
-        // ★v1.5.0: Moonshine Model 言語選択（exe直下 moonshine_model/ を自動スキャン）
-        Menu moonModelMenu = new Menu("Moonshine Model");
-        String savedModelPath = prefs.get("moonshine.model_path", "");
-
-        File moonBaseDir = new File(getExeDir(), "moonshine_model");
-        File[] langDirs = moonBaseDir.isDirectory()
-                ? moonBaseDir.listFiles(File::isDirectory) : null;
-
-        List<CheckboxMenuItem> moonLangItems = new ArrayList<>();
-
-        if (langDirs != null && langDirs.length > 0) {
-            Arrays.sort(langDirs, Comparator.comparing(File::getName));
-            for (File langDir : langDirs) {
-                String langName = langDir.getName();
-                File modelDir = findDeepestModelDir(langDir);
-                String modelPath = modelDir.getAbsolutePath();
-
-                // 現在選択中かどうか
-                boolean selected = modelPath.equals(savedModelPath)
-                        || (!savedModelPath.isEmpty() && savedModelPath.contains(langName)
-                        && savedModelPath.contains("moonshine_model"));
-
-                CheckboxMenuItem item = new CheckboxMenuItem(langName);
-                item.setState(selected);
-                moonLangItems.add(item);
-
-                item.addItemListener(ev -> {
-                    if (item.getState()) {
-                        // 他を全部OFF
-                        for (CheckboxMenuItem other : moonLangItems) {
-                            if (other != item) other.setState(false);
-                        }
-                        prefs.put("moonshine.model_path", modelPath);
-                        try { prefs.flush(); } catch (Exception ignore) {}
-                        Config.log("★Moonshine model: " + langName + " → " + modelPath);
-
-                        if (isEngineMoonshine()) {
-                            softRestart();
-                        }
-                    } else {
-                        // 解除防止（最低1つ選択）
-                        item.setState(true);
-                    }
-                });
-                moonModelMenu.add(item);
-            }
-        } else {
-            MenuItem noModel = new MenuItem("(moonshine_model/ not found)");
-            noModel.setEnabled(false);
-            moonModelMenu.add(noModel);
-        }
-
-        // 何も選択されてない場合、先頭を自動選択
-        if (langDirs != null && langDirs.length > 0) {
-            boolean anySelected = moonLangItems.stream().anyMatch(CheckboxMenuItem::getState);
-            if (!anySelected && !moonLangItems.isEmpty()) {
-                moonLangItems.get(0).setState(true);
-                File firstModel = findDeepestModelDir(langDirs[0]);
-                prefs.put("moonshine.model_path", firstModel.getAbsolutePath());
-                try { prefs.flush(); } catch (Exception ignore) {}
-            }
-        }
-
-        moonModelMenu.addSeparator();
-
-        // 「フォルダを開く」
-        MenuItem openMoonDir = new MenuItem("Open moonshine_model/");
-        openMoonDir.addActionListener(e -> {
-            try {
-                if (!moonBaseDir.isDirectory()) moonBaseDir.mkdirs();
-                Desktop.getDesktop().open(moonBaseDir);
-            } catch (Exception ex) {
-                Config.logError("Failed to open moonshine_model dir", ex);
-            }
-        });
-        moonModelMenu.add(openMoonDir);
-
-        // 「カスタムパス（上級者向け）」
-        MenuItem customPath = new MenuItem("Custom Path...");
-        customPath.addActionListener(e -> {
-            SwingUtilities.invokeLater(() -> {
-                JFileChooser fc = new JFileChooser();
-                fc.setDialogTitle("Moonshine Model Directory");
-                fc.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
-                fc.setAcceptAllFileFilterUsed(false);
-
-                String prev = prefs.get("moonshine.model_path", "");
-                if (!prev.isEmpty()) {
-                    File prevDir = new File(prev);
-                    if (prevDir.isDirectory()) {
-                        fc.setCurrentDirectory(prevDir);
-                    }
-                }
-
-                if (fc.showOpenDialog(window) != JFileChooser.APPROVE_OPTION) return;
-                File selected = fc.getSelectedFile();
-                if (selected == null || !selected.isDirectory()) return;
-
-                String newPath = selected.getAbsolutePath();
-                prefs.put("moonshine.model_path", newPath);
-                try { prefs.flush(); } catch (Exception ignore) {}
-                Config.log("★Moonshine model (custom): " + newPath);
-
-                // チェックボックスを全部外す（カスタムパスなので）
-                for (CheckboxMenuItem ci : moonLangItems) ci.setState(false);
-
-                if (isEngineMoonshine()) {
-                    softRestart();
-                }
-            });
-        });
-        moonModelMenu.add(customPath);
-
-        recogEngineMenu.add(moonModelMenu);
-
-        performanceMenu.add(recogEngineMenu);
-        performanceMenu.addSeparator();
-
-        // GPU Selection
-        Menu gpuMenu = new Menu(trayText("menu.gpuSelect"));
-        int gpuIndex = prefs.getInt("vulkan.gpu.index", -1);
-        List<CheckboxMenuItem> gpuItems = new ArrayList<>();
-        CheckboxMenuItem autoGpuItem = new CheckboxMenuItem(trayText("menu.gpu.auto"));
-        autoGpuItem.setState(gpuIndex < 0);
-        gpuMenu.add(autoGpuItem);
-        gpuItems.add(autoGpuItem);
-        autoGpuItem.addItemListener(e -> {
-            if (autoGpuItem.getState()) {
-                for (CheckboxMenuItem m : gpuItems) m.setState(m == autoGpuItem);
-                prefs.putInt("vulkan.gpu.index", -1);
-                try { prefs.sync(); } catch (Exception ignore) {}
-                JOptionPane.showMessageDialog(null, "GPU selection changed.\nPlease restart MobMate.",
-                        "MobMate", JOptionPane.INFORMATION_MESSAGE);
-                restartSelf(true);
-            }
-        });
-        gpuMenu.addSeparator();
-        File vulkanDir = new File(getExeDir(), "libs/vulkan");
-        boolean vulkanBackendPresent = vulkanDir.exists() && new File(vulkanDir, "whisper.dll").exists();
-        Config.log("[TRAY] gpuMenu: vulkanBackendPresent=" + vulkanBackendPresent);
-        if (!vulkanBackendPresent) {
-            MenuItem na = new MenuItem("Vulkan not available");
-            na.setEnabled(false);
-            gpuMenu.add(na);
-        } else {
-            int count = 0;
-            try {
-                ExecutorService ex = Executors.newSingleThreadExecutor(r -> {
-                    Thread t = new Thread(r, "vulkan-enum");
-                    t.setDaemon(true);
-                    return t;
-                });
-                try {
-                    Future<Integer> f = ex.submit(VulkanGpuUtil::getGpuCount);
-                    count = f.get(1200, TimeUnit.MILLISECONDS);
-                } finally {
-                    ex.shutdownNow();
-                }
-                Config.log("[TRAY] gpuMenu: VulkanGpuUtil.getGpuCount=" + count);
-            } catch (TimeoutException te) {
-                Config.log("[TRAY] gpuMenu: Vulkan GPU enumeration TIMEOUT -> skip");
-            } catch (Throwable t) {
-                Config.logError("[TRAY] gpuMenu: Vulkan GPU enumeration FAILED: " + t, t);
-                count = 0;
-            }
-            if (count <= 0) {
-                MenuItem na = new MenuItem("Vulkan GPUs: (not detected)");
-                na.setEnabled(false);
-                gpuMenu.add(na);
-            } else {
-                for (int i = 0; i < count; i++) {
-                    final int idx = i;
-                    String name;
+        JMenuItem hearingItem = new JMenuItem(uiOr("ui.main.delta.hearing", "Hearing (β)"));
+        hearingItem.addActionListener(e ->
+                SwingUtilities.invokeLater(() -> {
                     try {
-                        name = "Vulkan " + i + ": " + VulkanGpuUtil.getGpuName(i);
+                        showHearingWindow();
                     } catch (Throwable t) {
-                        name = "Vulkan " + i;
+                        Config.logError("[Hearing] showHearingWindow failed", t);
                     }
-                    CheckboxMenuItem item = new CheckboxMenuItem(name);
-                    item.setState(gpuIndex == idx);
-                    gpuMenu.add(item);
-                    gpuItems.add(item);
-                    item.addItemListener(e -> {
-                        if (item.getState()) {
-                            for (CheckboxMenuItem m : gpuItems) m.setState(m == item);
-                            prefs.putInt("vulkan.gpu.index", idx);
-                            try { prefs.sync(); } catch (Exception ignore) {}
-                            JOptionPane.showMessageDialog(null, "GPU selection changed.\nPlease restart MobMate.",
-                                    "MobMate", JOptionPane.INFORMATION_MESSAGE);
-                            restartSelf(true);
-                        }
-                    });
-                }
-            }
-        }
-        performanceMenu.add(gpuMenu);
+                }));
+        popup.add(hearingItem);
 
-        // Low GPU Mode
-        CheckboxMenuItem lowGpuItem = new CheckboxMenuItem(trayText("menu.lowGpuMode"));
-        lowGpuItem.setState(MobMateWhisp.lowGpuMode);
-        lowGpuItem.addItemListener(e -> {
-            boolean enabled = lowGpuItem.getState();
-            MobMateWhisp.lowGpuMode = enabled;
-            prefs.putBoolean("perf.low_gpu_mode", enabled);
-            try { prefs.sync(); } catch (Exception ignore) {}
-            Config.log("Low GPU mode pref set to: " + enabled);
-            if (!isRecording()) {
-                LocalWhisperCPP.markInitialPromptDirty();
-                try {
-                    this.w = new LocalWhisperCPP(new File(model_dir, this.model),"");
-                } catch (FileNotFoundException ex) {
-                    throw new RuntimeException(ex);
-                }
-            } else {
-                Config.log("Low GPU mode will apply after recording stops.");
-            }
-            if (isRecording()) {
-                stopRecording();
-            }
-        });
-        performanceMenu.add(lowGpuItem);
+        popup.addSeparator();
 
-        // VAD Laugh
-        CheckboxMenuItem vadLaughItem = new CheckboxMenuItem(trayText("menu.vadLaugh"));
-        vadLaughItem.setState(useAlternateLaugh);
-        vadLaughItem.addItemListener(e -> {
-            boolean enabled = vadLaughItem.getState();
-            MobMateWhisp.useAlternateLaugh = enabled;
-            prefs.putBoolean("silence.alternate", enabled);
-            try { prefs.sync(); } catch (Exception ignore) {}
-        });
-        performanceMenu.add(vadLaughItem);
-        popup.add(performanceMenu);
-
-        // ========================================
-        // TTS Settings
-        // ========================================
-        Config.log("[TRAY] popup: add TTS Settings...");
-        Menu ttsMenu = new Menu("TTS Settings");
-
-        // TTS Engine
-        Menu ttsEngineMenu = new Menu("Engine");
-        String enginePref = prefs.get("tts.engine", "auto");
-        List<CheckboxMenuItem> engItems = new ArrayList<>();
-        CheckboxMenuItem engAuto = new CheckboxMenuItem("Auto");
-        CheckboxMenuItem engXtts = new CheckboxMenuItem("XTTS");
-        CheckboxMenuItem engWin  = new CheckboxMenuItem("Windows");
-        CheckboxMenuItem engVgWav = new CheckboxMenuItem("Voiceger(WavToWav)");
-        Menu engVgTtsMenu = new Menu("Voiceger(TTS)");
-        CheckboxMenuItem engVgTts = new CheckboxMenuItem("Use Voiceger(TTS)");
-        engVvMenu = new Menu("VOICEVOX");
-        engVv = new CheckboxMenuItem("Use VOICEVOX");
-        engAuto.setState("auto".equalsIgnoreCase(enginePref));
-        engVv.setState("voicevox".equalsIgnoreCase(enginePref));
-        engXtts.setState("xtts".equalsIgnoreCase(enginePref));
-        engWin.setState("windows".equalsIgnoreCase(enginePref));
-        String eng = enginePref == null ? "auto" : enginePref.toLowerCase(Locale.ROOT);
-        engVgWav.setState("voiceger".equals(eng) || "voiceger_w2w".equals(eng) || "voiceger_vc".equals(eng));
-        engVgTts.setState("voiceger_tts".equals(eng));
-        engItems.add(engAuto);
-        engItems.add(engVv);
-        engItems.add(engXtts);
-        engItems.add(engWin);
-        engItems.add(engVgWav);
-        engItems.add(engVgTts);
-        engListener = e -> {
-            CheckboxMenuItem src = (CheckboxMenuItem) e.getSource();
-            if (!src.getState()) return;
-            for (CheckboxMenuItem m : engItems) m.setState(m == src);
-            String prev = prefs.get("tts.engine", "auto");
-            String v = "auto";
-            if (src == engVv) v = "voicevox";
-            else if (src == engXtts) v = "xtts";
-            else if (src == engWin) v = "windows";
-            else if (src == engVgWav) v = "voiceger_vc";
-            else if (src == engVgTts) v = "voiceger_tts";
-            prefs.put("tts.engine", v);
-            try { prefs.sync(); } catch (Exception ignore) {}
-            String pv = (prev == null) ? "" : prev.toLowerCase(Locale.ROOT);
-            String nv = v.toLowerCase(Locale.ROOT);
-            if (!nv.equals(pv) && nv.startsWith("voiceger")) {
-                restartVoicegerApiAsync();
-            }
-        };
-        engAuto.addItemListener(engListener);
-        engVv.addItemListener(engListener);
-        engXtts.addItemListener(engListener);
-        engWin.addItemListener(engListener);
-        engVgWav.addItemListener(engListener);
-        engVgTts.addItemListener(engListener);
-        engVvMenu.add(engVv);
-        engVvMenu.addSeparator();
-        engVgTtsMenu.add(engVgTts);
-        engVgTtsMenu.addSeparator();
-        String curLang = prefs.get("voiceger.tts.lang", "all_ja");
-        List<CheckboxMenuItem> vgLangItems = new ArrayList<>();
-        boolean anySelected = false;
-        String[][] langs = {
-                {"Japanese", "all_ja"},
-                {"English", "en"},
-                {"Chinese", "all_zh"},
-                {"Korean", "all_ko"},
-                {"Cantonese", "all_yue"},
-        };
-        for (String[] it : langs) {
-            String label = it[0];
-            String code  = it[1];
-            CheckboxMenuItem mi = new CheckboxMenuItem(label);
-            boolean selected = code.equalsIgnoreCase(curLang);
-            mi.setState(selected);
-            if (selected) anySelected = true;
-            vgLangItems.add(mi);
-            engVgTtsMenu.add(mi);
-            mi.addItemListener(ev -> {
-                if (!mi.getState()) return;
-                for (CheckboxMenuItem m : vgLangItems) m.setState(m == mi);
-                prefs.put("voiceger.tts.lang", code);
-                try { prefs.sync(); } catch (Exception ignore) {}
-                if (!engVgTts.getState()) {
-                    engVgTts.setState(true);
-                }
-                engListener.itemStateChanged(
-                        new ItemEvent(engVgTts, ItemEvent.ITEM_STATE_CHANGED, engVgTts, ItemEvent.SELECTED)
-                );
-            });
-        }
-        if (!anySelected) {
-            prefs.put("voiceger.tts.lang", "all_ja");
-            try { prefs.sync(); } catch (Exception ignore) {}
-        }
-        ttsEngineMenu.add(engAuto);
-        ttsEngineMenu.addSeparator();
-        ttsEngineMenu.add(engVvMenu);
-        ttsEngineMenu.add(engXtts);
-        ttsEngineMenu.add(engWin);
-        ttsEngineMenu.addSeparator();
-        ttsEngineMenu.add(engVgWav);
-        ttsEngineMenu.add(engVgTtsMenu);
-        ttsMenu.add(ttsEngineMenu);
-
-        // Voice Selection
-        Menu ttsVoicesItem = new Menu(trayText("menu.voices"));
-        String voicePref = prefs.get("tts.windows.voice", "auto");
-        List<CheckboxMenuItem> voiceAll = new ArrayList<>();
-        CheckboxMenuItem autoVoiceItem = new CheckboxMenuItem(trayText("menu.voice.auto"));
-        autoVoiceItem.setState("auto".equals(voicePref));
-        ttsVoicesItem.add(autoVoiceItem);
-        voiceAll.add(autoVoiceItem);
-        autoVoiceItem.addItemListener(e -> {
-            if (autoVoiceItem.getState()) {
-                for (CheckboxMenuItem m : voiceAll) m.setState(m == autoVoiceItem);
-                prefs.put("tts.windows.voice", "auto");
-                try { prefs.sync(); } catch (Exception ignore) {}
-            }
-        });
-        ttsVoicesItem.addSeparator();
-        List<String> voices = getWindowsVoices();
-        Collections.sort(voices);
-        for (int i = 0; i < voices.size(); i++) {
-            String voice = voices.get(i);
-            String label = String.format("%02d: %s", i, voice);
-            CheckboxMenuItem item = new CheckboxMenuItem(label);
-            item.setState(voice.equals(voicePref));
-            ttsVoicesItem.add(item);
-            voiceAll.add(item);
-            item.addItemListener(e -> {
-                if (item.getState()) {
-                    for (CheckboxMenuItem m : voiceAll) m.setState(m == item);
-                    prefs.put("tts.windows.voice", voice);
-                    try { prefs.sync(); } catch (Exception ignore) {}
-                }
-            });
-        }
-        ttsVoicesItem.addSeparator();
-        ttsMenu.add(ttsVoicesItem);
-
-        // Auto Emotion (VOICEVOX)
-        CheckboxMenuItem autoEmotionItem = new CheckboxMenuItem(trayText("menu.voicevox.autoEmotion"));
-        boolean currentAutoEmotion = prefs.getBoolean("voicevox.auto_emotion", true);
-        autoEmotionItem.setState(currentAutoEmotion);
-        autoEmotionItem.addItemListener(e -> {
-            boolean enabled = autoEmotionItem.getState();
-            prefs.putBoolean("voicevox.auto_emotion", enabled);
-            try { prefs.sync(); } catch (Exception ignore) {}
-            Config.log("VOICEVOX auto emotion set to: " + enabled);
-        });
-        ttsMenu.add(autoEmotionItem);
-        popup.add(ttsMenu);
-
-        // ========================================
-        // Radio Chat
-        // ========================================
-        Config.log("[TRAY] popup: add Radio Chat...");
-        Menu radioMenu = new Menu("Radio Chat");
-
-        // Hotkey Settings
-        Menu radioHotkeyMenu = new Menu("Hotkey");
-        Menu radioModMenu = new Menu("Modifier");
-        final String[] MODS = { "NONE", "SHIFT", "CTRL", "SHIFT+CTRL" };
-        final int[] MODMASK = { 0, 1, 2, 3 };
-        final int curModMask = prefs.getInt("radio.modMask", 0);
-        final java.util.List<CheckboxMenuItem> modItems = new java.util.ArrayList<>();
-        for (int idx = 0; idx < MODS.length; idx++) {
-            final String label = MODS[idx];
-            final int mask = MODMASK[idx];
-            final CheckboxMenuItem it = new CheckboxMenuItem(label);
-            it.setState(mask == curModMask);
-            modItems.add(it);
-            radioModMenu.add(it);
-            it.addItemListener(ev -> {
-                if (!it.getState()) return;
-                for (CheckboxMenuItem other : modItems) other.setState(other == it);
-                int recMask = getRecordingModMask();
-                String recKeyName = MobMateWhisp.this.hotkey;
-                int curKeyCode = prefs.getInt("radio.keyCode",
-                        com.github.kwhat.jnativehook.keyboard.NativeKeyEvent.VC_F18);
-                String curKeyName2 = com.github.kwhat.jnativehook.keyboard.NativeKeyEvent.getKeyText(curKeyCode);
-                if (mask == recMask && curKeyName2.equalsIgnoreCase(recKeyName)) {
-                    it.setState(false);
-                    JOptionPane.showMessageDialog(null,
-                            "This hotkey conflicts with Recording hotkey.\nChoose another modifier or key.",
-                            "MobMate", JOptionPane.WARNING_MESSAGE);
-                    for (CheckboxMenuItem other : modItems) {
-                        if (prefs.getInt("radio.modMask", 0) == mask) other.setState(true);
-                    }
-                    return;
-                }
-                prefs.putInt("radio.modMask", mask);
-                try { prefs.sync(); } catch (Exception ignore) {}
-                MobMateWhisp.this.radioModMask = mask;
-                Config.log("Radio modMask set: " + mask + " (" + label + ")");
-            });
-        }
-        radioHotkeyMenu.add(radioModMenu);
-        Menu radioKeyMenu = new Menu("Key");
-        final int curKeyCode = prefs.getInt("radio.keyCode",
-                com.github.kwhat.jnativehook.keyboard.NativeKeyEvent.VC_F18);
-        final java.util.List<CheckboxMenuItem> keyItems = new java.util.ArrayList<>();
-        for (int i = 1; i <= 18; i++) {
-            final int keyCode = vcForF(i);
-            final String label = "F" + i;
-            final CheckboxMenuItem it = new CheckboxMenuItem(label);
-            it.setState(keyCode == curKeyCode);
-            keyItems.add(it);
-            radioKeyMenu.add(it);
-            it.addItemListener(ev -> {
-                if (!it.getState()) return;
-                int mask = prefs.getInt("radio.modMask", 0);
-                int recMask = getRecordingModMask();
-                String recKeyName = MobMateWhisp.this.hotkey;
-                if (mask == recMask && label.equalsIgnoreCase(recKeyName)) {
-                    it.setState(false);
-                    JOptionPane.showMessageDialog(null,
-                            "This hotkey conflicts with Recording hotkey.\nChoose another key or add a modifier.",
-                            "MobMate", JOptionPane.WARNING_MESSAGE);
-                    return;
-                }
-                for (CheckboxMenuItem other : keyItems) other.setState(other == it);
-                prefs.putInt("radio.keyCode", keyCode);
-                try { prefs.sync(); } catch (Exception ignore) {}
-                MobMateWhisp.this.radioKeyCode = keyCode;
-                Config.log("Radio key set: " + label + " (keyCode=" + keyCode + ")");
-            });
-        }
-        radioHotkeyMenu.add(radioKeyMenu);
-        radioMenu.add(radioHotkeyMenu);
-
-        // Overlay Settings
-        Menu overlaySettingsMenu = new Menu("Overlay Settings");
-        CheckboxMenuItem overlayEnableItem = new CheckboxMenuItem("Enable Overlay");
-        overlayEnableItem.setState(overlayEnable);
-        overlayEnableItem.addItemListener(e -> {
-            boolean enabled = overlayEnableItem.getState();
-            setRadioOverlayEnabled(enabled);
-        });
-        overlaySettingsMenu.add(overlayEnableItem);
-        overlaySettingsMenu.addSeparator();
-        Menu overlayPosMenu = new Menu("Position");
-        String currentPos = (overlayPosition == null ? "TOP_LEFT" : overlayPosition).toUpperCase();
-        String[] positions = {"TOP_LEFT", "TOP_RIGHT", "BOTTOM_LEFT", "BOTTOM_RIGHT"};
-        List<CheckboxMenuItem> posItems = new ArrayList<>();
-        for (String pos : positions) {
-            CheckboxMenuItem item = new CheckboxMenuItem(pos.replace("_", " "));
-            item.setState(pos.equals(currentPos));
-            posItems.add(item);
-            item.addItemListener(e -> {
-                if (!item.getState()) return;
-                for (CheckboxMenuItem other : posItems) other.setState(other == item);
-                setRadioOverlayPosition(pos);
-            });
-            overlayPosMenu.add(item);
-        }
-        overlaySettingsMenu.add(overlayPosMenu);
-        Menu overlayDisplayMenu = new Menu("Display");
-        int currentDisplay = overlayDisplay;
-        GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
-        GraphicsDevice[] screens = ge.getScreenDevices();
-        List<CheckboxMenuItem> displayItems = new ArrayList<>();
-        for (int i = 0; i < screens.length; i++) {
-            final int displayIndex = i;
-            String label = "Display " + (i + 1);
-            try {
-                DisplayMode dm = screens[i].getDisplayMode();
-                label += String.format(" (%dx%d)", dm.getWidth(), dm.getHeight());
-            } catch (Exception ignore) {}
-            CheckboxMenuItem item = new CheckboxMenuItem(label);
-            item.setState(i == currentDisplay);
-            displayItems.add(item);
-            item.addItemListener(e -> {
-                if (!item.getState()) return;
-                for (CheckboxMenuItem other : displayItems) other.setState(other == item);
-                setRadioOverlayDisplay(displayIndex);
-            });
-            overlayDisplayMenu.add(item);
-        }
-        overlaySettingsMenu.add(overlayDisplayMenu);
-        Menu overlayFontMenu = new Menu("Font Size");
-        int currentFontSize = overlayFontSize;
-        List<CheckboxMenuItem> fontItems = new ArrayList<>();
-        for (int size : new int[]{12, 14, 16, 18, 20, 24}) {
-            final int fontSize = size;
-            CheckboxMenuItem item = new CheckboxMenuItem(size + "pt");
-            item.setState(size == currentFontSize);
-            fontItems.add(item);
-            item.addItemListener(e -> {
-                if (!item.getState()) return;
-                for (CheckboxMenuItem other : fontItems) other.setState(other == item);
-                setRadioOverlayFontSize(fontSize);
-            });
-            overlayFontMenu.add(item);
-        }
-        overlaySettingsMenu.add(overlayFontMenu);
-        Menu overlayOpacityMenu = new Menu("Opacity");
-        int currentOpacity = (int) (overlayOpacity * 100.0f);
-        List<CheckboxMenuItem> opacityItems = new ArrayList<>();
-        for (int op : new int[]{50, 65, 78, 85, 95, 100}) {
-            final int opacity = op;
-            CheckboxMenuItem item = new CheckboxMenuItem(op + "%");
-            item.setState(op == currentOpacity);
-            opacityItems.add(item);
-            item.addItemListener(e -> {
-                if (!item.getState()) return;
-                for (CheckboxMenuItem other : opacityItems) other.setState(other == item);
-                setRadioOverlayOpacity(opacity / 100.0f);
-            });
-            overlayOpacityMenu.add(item);
-        }
-        overlaySettingsMenu.add(overlayOpacityMenu);
-        overlaySettingsMenu.addSeparator();
-        Menu overlayThemeMenu = new Menu("Theme");
-        String[][] colors = {
-                {"Green", "green", "30,90,50"},
-                {"Blue", "blue", "30,50,90"},
-                {"Gray", "gray", "40,40,40"},
-                {"Dark Red", "red", "70,30,30"}
-        };
-        String currentBgHex = toHex(overlayBg);
-        List<CheckboxMenuItem> themeItems = new ArrayList<>();
-        for (String[] c : colors) {
-            final String label = c[0];
-            final String bgHex = rgbCsvToHex(c[2]);
-            CheckboxMenuItem item = new CheckboxMenuItem(label);
-            item.setState(bgHex.equalsIgnoreCase(currentBgHex));
-            themeItems.add(item);
-            item.addItemListener(e -> {
-                if (!item.getState()) return;
-                for (CheckboxMenuItem other : themeItems) other.setState(other == item);
-                setRadioOverlayColors(bgHex, "#FFFFFF");
-            });
-            overlayThemeMenu.add(item);
-        }
-        overlaySettingsMenu.add(overlayThemeMenu);
-        Menu overlayLinesMenu = new Menu("Max Lines");
-        int currentMaxLines = overlayMaxLines;
-        List<CheckboxMenuItem> lineItems = new ArrayList<>();
-        for (int lines : new int[]{4, 6, 8, 10, 12, 16, 20}) {
-            final int maxLines = lines;
-            CheckboxMenuItem item = new CheckboxMenuItem(lines + " lines");
-            item.setState(lines == currentMaxLines);
-            lineItems.add(item);
-            item.addItemListener(e -> {
-                if (!item.getState()) return;
-                for (CheckboxMenuItem other : lineItems) other.setState(other == item);
-                setRadioOverlayMaxLines(maxLines);
-            });
-            overlayLinesMenu.add(item);
-        }
-        overlaySettingsMenu.add(overlayLinesMenu);
-        radioMenu.add(overlaySettingsMenu);
-        popup.add(radioMenu);
-
-        // ========================================
-        // Appearance
-        // ========================================
-        Config.log("[TRAY] popup: add Appearance...");
-        Menu appearanceMenu = new Menu("Appearance");
-        Menu fontSizeMenu = new Menu(trayText("menu.fontSize"));
-        int currentSize = prefs.getInt("ui.font.size", 16);
-        List<CheckboxMenuItem> fontItems2 = new ArrayList<>();
-        for (int size = 12; size <= 24; size += 2) {
-            String label = size + " px";
-            CheckboxMenuItem item = new CheckboxMenuItem(label);
-            item.setState(size == currentSize);
-            final int fontSize = size;
-            item.addItemListener(e -> {
-                if (item.getState()) {
-                    for (CheckboxMenuItem m : fontItems2) {
-                        m.setState(m == item);
-                    }
-                    prefs.putInt("ui.font.size", fontSize);
-                    try { prefs.sync(); } catch (Exception ignore) {}
-                    applyUIFont(fontSize);
-                    SwingUtilities.updateComponentTreeUI(window);
-                    window.invalidate();
-                    window.validate();
-                    window.repaint();
-                    if (historyFrame != null) {
-                        SwingUtilities.updateComponentTreeUI(historyFrame);
-                        historyFrame.refresh();
-                    }
-                    if (window != null) {
-                        SwingUtilities.updateComponentTreeUI(window);
-                        // フォント変更後にサイズを再計算させる
-                        window.invalidate();
-                        window.pack();
-                        window.setSize(window.getPreferredSize());
-
-                        window.validate();
-                        window.repaint();
-                    }
-                }
-            });
-            fontItems2.add(item);
-            fontSizeMenu.add(item);
-        }
-        appearanceMenu.add(fontSizeMenu);
-
-        // ===== Theme Toggle =====
-        MenuItem themeToggleItem = new MenuItem("Toggle Dark/Light Theme");
-        appearanceMenu.add(themeToggleItem);
-        themeToggleItem.addActionListener(e -> {
-            // 現在のテーマを反転
-            boolean currentDark = prefs.getBoolean("ui.theme.dark", true);
-            prefs.putBoolean("ui.theme.dark", !currentDark);
-            try {
-                prefs.sync();
-            } catch (BackingStoreException ignored) {
-            }
-
-            // テーマを即座に切り替え
-            SwingUtilities.invokeLater(() -> {
-                try {
-                    if (!currentDark) {
-                        com.formdev.flatlaf.FlatDarkLaf.setup();
-                    } else {
-                        com.formdev.flatlaf.FlatLightLaf.setup();
-                    }
-                    // 全ウィンドウを更新
-                    for (Window w : Window.getWindows()) {
-                        SwingUtilities.updateComponentTreeUI(w);
-                    }
-                } catch (Exception ignored) {
-                }
-            });
-        });
-        popup.add(appearanceMenu);
-
-        // ========================================
-        // Advanced
-        // ========================================
-        Config.log("[TRAY] popup: add Advanced...");
-        Menu advancedMenu = new Menu("Advanced");
-
-        // Wizard
-        MenuItem openWizardItem = new MenuItem(trayText("menu.wizard.open"));
-        openWizardItem.addActionListener(e -> {
-            SwingUtilities.invokeLater(() -> {
-                final String beforeEngine = prefs.get("recog.engine", "whisper"); // ★v1.5.0
-                FirstLaunchWizard wizard = null;
-                try {
-                    try {
-                        wizard = new FirstLaunchWizard(window, MobMateWhisp.this);
-                    } catch (FileNotFoundException | NativeHookException ex) {
-                        throw new RuntimeException(ex);
-                    }
-                    wizard.setLocationRelativeTo(window);
-                    wizard.setVisible(true);
-                } finally {
-                    try {
-                        if (wizard != null) wizard.stopAllWizardTests();
-                    } catch (Throwable ignore) {}
-                }
-                // ★v1.5.0: エンジンが変わっていたらsoftRestart
-                String afterEngine = prefs.get("recog.engine", "whisper");
-                if (!java.util.Objects.equals(beforeEngine, afterEngine)) {
-                    Config.log("★Wizard(CC): engine changed " + beforeEngine
-                            + " → " + afterEngine + " → soft restart");
-                    softRestart();
-                }
-            });
-        });
-        advancedMenu.add(openWizardItem);
-
-        // Debug Menu
+        JMenu debugMenu = new JMenu(uiOr("ui.main.delta.debug", "Debug"));
         boolean readyToZip = Config.getBool("log.debug", false);
-        Menu debugMenu = new Menu("MobMateWhispTalk v" + Version.APP_VERSION);
+
         if (!readyToZip) {
-            MenuItem enableDebugItem = new MenuItem(trayText("menu.debug.enableLog"));
+            JMenuItem enableDebugItem = new JMenuItem(UiText.t("menu.debug.enableLog"));
             enableDebugItem.addActionListener(e -> {
                 try {
                     Config.appendOutTts("log.debug=true");
                     Config.appendOutTts("log.vad.detailed=true");
-                    JOptionPane.showMessageDialog(null,
-                            "Debug logging enabled temporarily.\n" +
-                                    "Restart the app and reproduce the issue.\n" +
-                                    "(Automatically turns off after ~500 messages.)",
-                            "MobMate", JOptionPane.INFORMATION_MESSAGE);
+                    JOptionPane.showMessageDialog(
+                            window,
+                            uiOr("ui.main.delta.debug.enable.msg",
+                                    "Debug logging enabled temporarily.\n"
+                                            + "Restart the app and reproduce the issue.\n"
+                                            + "(Automatically turns off after ~500 messages.)"),
+                            "MobMate",
+                            JOptionPane.INFORMATION_MESSAGE
+                    );
                     restartSelf(true);
                 } catch (Exception ex) {
-                    Config.log("Failed to Debug Log Output ON..");
+                    Config.log("Failed to Debug Log Output ON.");
                 }
             });
             debugMenu.add(enableDebugItem);
         } else {
-            MenuItem zipLogsItem = new MenuItem(trayText("menu.debug.createZip"));
+            JMenuItem zipLogsItem = new JMenuItem(UiText.t("menu.debug.createZip"));
             zipLogsItem.addActionListener(e -> {
                 try {
                     File zip = DebugLogZipper.createZip();
-                    JOptionPane.showMessageDialog(null,
-                            "Debug logs have been collected.\n\n" +
-                                    "Please attach this zip file and send it to support.\n\n" +
-                                    zip.getAbsolutePath(),
-                            "MobMate", JOptionPane.INFORMATION_MESSAGE);
+                    JOptionPane.showMessageDialog(
+                            window,
+                            uiOr("ui.main.delta.debug.zip.msg",
+                                    "Debug logs have been collected.\n\n"
+                                            + "Please attach this zip file and send it to support.\n\n")
+                                    + zip.getAbsolutePath(),
+                            "MobMate",
+                            JOptionPane.INFORMATION_MESSAGE
+                    );
                 } catch (Exception ex) {
-                    Config.log("Failed to Debug Log Output Zipping..");
+                    Config.log("Failed to Debug Log Output Zipping.");
                 }
             });
             debugMenu.add(zipLogsItem);
         }
-        debugMenu.addSeparator();
-        advancedMenu.add(debugMenu);
-        popup.add(advancedMenu);
+        popup.add(debugMenu);
 
-
-        // ========================================
-        // Other Items
-        // ========================================
         popup.addSeparator();
+
+        JMenuItem softRestartItem = new JMenuItem(uiOr("ui.main.delta.softRestart", "Soft Restart"));
+        softRestartItem.addActionListener(e -> softRestart());
+        popup.add(softRestartItem);
+
+        popup.addSeparator();
+
+        JMenuItem exitItem = new JMenuItem(UiText.t("menu.exit"));
+        exitItem.addActionListener(e -> {
+            try { VoicegerManager.stopIfRunning(MobMateWhisp.prefs); } catch (Throwable ignore) {}
+            Config.mirrorAllToCloud();
+            System.exit(0);
+        });
+        popup.add(exitItem);
+
+        return popup;
+    }
+    protected PopupMenu createTrayUtilityPopup() {
+        Config.log("[TRAY] utility popup: begin");
+
+        final PopupMenu popup = new PopupMenu();
+
+        MenuItem openWindowItem = new MenuItem("Open Window");
+        openWindowItem.addActionListener(e ->
+                SwingUtilities.invokeLater(() -> bringToFront(window)));
+        popup.add(openWindowItem);
+
+        MenuItem historyItem = new MenuItem("History");
+        historyItem.addActionListener(e ->
+                SwingUtilities.invokeLater(this::showHistory));
+        popup.add(historyItem);
+
+        popup.addSeparator();
+
         MenuItem hearingBetaItem = new MenuItem("Hearing (β)");
         hearingBetaItem.addActionListener(e -> {
             SwingUtilities.invokeLater(() -> {
@@ -2231,14 +1127,60 @@ public class MobMateWhisp implements NativeKeyListener {
         popup.add(hearingBetaItem);
 
         popup.addSeparator();
-        // ===== Soft Restart =====
-        MenuItem softRestartItem = new MenuItem("Soft Restart");
-        popup.add(softRestartItem);
-        softRestartItem.addActionListener(e -> softRestart());
+
+        boolean readyToZip = Config.getBool("log.debug", false);
+        Menu debugMenu = new Menu("MobMateWhispTalk v" + Version.APP_VERSION);
+
+        if (!readyToZip) {
+            MenuItem enableDebugItem = new MenuItem(trayText("menu.debug.enableLog"));
+            enableDebugItem.addActionListener(e -> {
+                try {
+                    Config.appendOutTts("log.debug=true");
+                    Config.appendOutTts("log.vad.detailed=true");
+                    JOptionPane.showMessageDialog(
+                            null,
+                            "Debug logging enabled temporarily.\n"
+                                    + "Restart the app and reproduce the issue.\n"
+                                    + "(Automatically turns off after ~500 messages.)",
+                            "MobMate",
+                            JOptionPane.INFORMATION_MESSAGE
+                    );
+                    restartSelf(true);
+                } catch (Exception ex) {
+                    Config.log("Failed to Debug Log Output ON..");
+                }
+            });
+            debugMenu.add(enableDebugItem);
+        } else {
+            MenuItem zipLogsItem = new MenuItem(trayText("menu.debug.createZip"));
+            zipLogsItem.addActionListener(e -> {
+                try {
+                    File zip = DebugLogZipper.createZip();
+                    JOptionPane.showMessageDialog(
+                            null,
+                            "Debug logs have been collected.\n\n"
+                                    + "Please attach this zip file and send it to support.\n\n"
+                                    + zip.getAbsolutePath(),
+                            "MobMate",
+                            JOptionPane.INFORMATION_MESSAGE
+                    );
+                } catch (Exception ex) {
+                    Config.log("Failed to Debug Log Output Zipping..");
+                }
+            });
+            debugMenu.add(zipLogsItem);
+        }
+        popup.add(debugMenu);
 
         popup.addSeparator();
+
+        MenuItem softRestartItem = new MenuItem("Soft Restart");
+        softRestartItem.addActionListener(e -> softRestart());
+        popup.add(softRestartItem);
+
+        popup.addSeparator();
+
         MenuItem exitItem = new MenuItem(trayText("menu.exit"));
-        popup.add(exitItem);
         exitItem.addActionListener(new ActionListener() {
             @Override
             public void actionPerformed(ActionEvent e) {
@@ -2247,50 +1189,18 @@ public class MobMateWhisp implements NativeKeyListener {
                 System.exit(0);
             }
         });
+        popup.add(exitItem);
 
-        Font awtFont = new Font(UIManager.getFont("Menu.font").getFamily(), Font.PLAIN,
-                prefs.getInt("ui.font.size", 12));
+        Font awtFont = new Font(
+                UIManager.getFont("Menu.font").getFamily(),
+                Font.PLAIN,
+                prefs.getInt("ui.font.size", 12)
+        );
         applyAwtFontRecursive(popup, awtFont);
 
         startDemoAnnounceTimer();
-        Config.log("[TRAY] popup: end");
+        Config.log("[TRAY] utility popup: end");
         return popup;
-    }
-
-
-    private void rebuildVoiceVoxSpeakerMenu(Menu engVvMenu, CheckboxMenuItem engVv, ItemListener engListener, Preferences prefs) {
-        engVvMenu.removeAll();
-
-        if (isVoiceVoxAvailable()) {
-            String vvVoicePref = prefs.get("tts.voice", "auto");
-            List<CheckboxMenuItem> vvAll = new ArrayList<>();
-
-            List<VoiceVoxSpeaker> speakers = getVoiceVoxSpeakers(); // id + name
-            for (VoiceVoxSpeaker sp : speakers) {
-                String key = "" + sp.id();
-                String label = key + ":" + sp.name();
-                CheckboxMenuItem item = new CheckboxMenuItem(label);
-                item.setState(key.equals(vvVoicePref));
-                engVvMenu.add(item);
-                vvAll.add(item);
-
-                item.addItemListener(ev -> {
-                    if (item.getState()) {
-                        // 話者を選んだら VOICEVOXエンジンも有効化（迷いを減らす）
-                        engVv.setState(true);
-                        engListener.itemStateChanged(new ItemEvent(engVv, 0, engVv, ItemEvent.SELECTED));
-
-                        for (CheckboxMenuItem m : vvAll) m.setState(m == item);
-                        prefs.put("tts.voice", key);
-                        try { prefs.sync(); } catch (Exception ignore) {}
-                    }
-                });
-            }
-        } else {
-            MenuItem na = new MenuItem("VOICEVOX not available (starting...)");
-            na.setEnabled(false);
-            engVvMenu.add(na);
-        }
     }
 
 
@@ -3878,6 +2788,21 @@ public class MobMateWhisp implements NativeKeyListener {
                                     speech = false;
                                     Config.logDebug("VAD: BGM-like stable sound suppressed");
                                 }
+                                // ★強制Final直後のfinal-only COMPLETE回収待ち
+                                if (moonResetDeferredUntilMs != 0L) {
+                                    long moonWaitMs = moonResetDeferredUntilMs - System.currentTimeMillis();
+                                    if (speech && !isSpeaking && moonWaitMs > 0L) {
+                                        try {
+                                            Thread.sleep(Math.min(moonWaitMs, 25L));
+                                        } catch (InterruptedException ie) {
+                                            Thread.currentThread().interrupt();
+                                        }
+                                        continue;
+                                    }
+                                    if (moonWaitMs <= 0L && (!speech || !isSpeaking)) {
+                                        tryDrainAndResetMoonshine();
+                                    }
+                                }
                                 if (vad instanceof ImprovedVAD) {
                                     silenceFrames = ((ImprovedVAD) vad).getConsecutiveSilenceFrames();
                                 }
@@ -4205,6 +3130,8 @@ public class MobMateWhisp implements NativeKeyListener {
                                         incompleteHoldUntilMs = 0L;
                                         vad.reset();
                                         MobMateWhisp.setLastPartial("");
+                                        // ★Moonshineは少しdrain待ちしてからresetする
+                                        deferMoonshineResetAfterFinal();
 
                                         executorService.submit(() -> {
                                             try {
@@ -4294,14 +3221,6 @@ public class MobMateWhisp implements NativeKeyListener {
                                             } catch (Exception ex) {
                                                 Config.logError("Final error", ex);
                                             } finally {
-                                                // ★Moonshineはここでリセット 先にresetすると、短い笑いの pending partial/complete を潰しやすい
-                                                if (isEngineMoonshine() && moonshine != null && moonshine.isLoaded()) {
-                                                    try {
-                                                        moonshine.resetStream();
-                                                    } catch (Exception ex) {
-                                                        Config.logDebug("★Moonshine reset deferred failed: " + ex);
-                                                    }
-                                                }
                                                 isProcessingFinal.set(false);
                                                 if (w != null) w.finalPriorityMode = false; // ★追加
                                                 SwingUtilities.invokeLater(() -> window.setTitle(UiText.t("ui.title.rec")));
@@ -4474,6 +3393,23 @@ public class MobMateWhisp implements NativeKeyListener {
             out[i] = s / 32768.0f;
         }
         return out;
+    }
+    private void deferMoonshineResetAfterFinal() {
+        if (!isEngineMoonshine() || moonshine == null || !moonshine.isLoaded()) return;
+
+        // ★即時resetに変更
+        moonResetDeferredUntilMs = 0L;
+
+        try {
+            moonshine.resetStream();
+            Config.logDebug("★Moon drain done -> stream reset");
+        } catch (Exception ex) {
+            Config.logDebug("★Moon drain reset failed: " + ex);
+        }
+    }
+    private void tryDrainAndResetMoonshine() {
+        // ★旧deferred wait系は使わない
+        moonResetDeferredUntilMs = 0L;
     }
 
     // ★ short utterance 用の強制Final
@@ -5396,6 +4332,26 @@ public class MobMateWhisp implements NativeKeyListener {
             }
         });
     }
+    private void showStartupWizardIfNeeded() {
+        if (window == null) return;
+        if (prefs.getBoolean("wizard.completed", false)) return;
+        if (prefs.getBoolean("wizard.never", false)) return;
+
+        SwingUtilities.invokeLater(() -> {
+            FirstLaunchWizard wizard = null;
+            try {
+                wizard = new FirstLaunchWizard(window, this);
+                wizard.setLocationRelativeTo(window);
+                wizard.setVisible(true);
+            } catch (Throwable t) {
+                Config.logError("[Wizard] startup open failed", t);
+            } finally {
+                try {
+                    if (wizard != null) wizard.stopAllWizardTests();
+                } catch (Throwable ignore) {}
+            }
+        });
+    }
 
 
     // 共有されるのでvolatile推奨
@@ -5449,6 +4405,11 @@ public class MobMateWhisp implements NativeKeyListener {
         titleBar.add(Box.createHorizontalStrut(4));
         titleBar.add(historyButton);
 
+        final JButton settingsCenterButton = new JButton(uiOr("ui.main.settingsCenter", "Settings"));
+        settingsCenterButton.setToolTipText(uiOr("ui.main.settingsCenter.tip", "Settings Center"));
+        titleBar.add(Box.createHorizontalStrut(4));
+        titleBar.add(settingsCenterButton);
+
         final JButton prefButton = new JButton(UiText.t("ui.main.prefs"));
         titleBar.add(Box.createHorizontalStrut(4));
         titleBar.add(prefButton);
@@ -5494,6 +4455,20 @@ public class MobMateWhisp implements NativeKeyListener {
         installBoundsSaver(this.window, "ui.main");
 
         window.setVisible(true);
+
+        // ★前回開いていた場合だけ、起動時にHistoryも自動で開く
+        SwingUtilities.invokeLater(() -> {
+            if (prefs.getBoolean("ui.history.open_on_startup", true)) {
+                showHistory();
+
+                // 主役はメイン画面のまま
+                if (window != null) {
+                    window.toFront();
+                    window.requestFocus();
+                }
+            }
+        });
+
         // ===== WAVドラッグ&ドロップ テスト用 =====
         window.setTransferHandler(new javax.swing.TransferHandler() {
             @Override
@@ -5522,26 +4497,43 @@ public class MobMateWhisp implements NativeKeyListener {
         this.window.toFront();
         this.window.requestFocus();
 
-        final PopupMenu popup = createPopupMenu();
-        prefButton.add(popup);
+        prefButton.setToolTipText(uiOr("ui.main.prefs.tip", "Quick menu"));
+
         this.button.addActionListener(e -> toggleRecordingFromUI());
+
         historyButton.addActionListener(new ActionListener() {
             @Override
             public void actionPerformed(ActionEvent e) {
                 showHistory();
             }
         });
+
+        settingsCenterButton.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                openSettingsCenter();
+            }
+        });
+
         prefButton.addActionListener(new ActionListener() {
             @Override
             public void actionPerformed(ActionEvent e) {
-                rebuildVoiceVoxSpeakerMenu(engVvMenu, engVv, engListener, prefs);
-                popup.show((Component) e.getSource(), 0, 0);
+                JPopupMenu popup = createDeltaQuickMenu();
+                popup.show(prefButton, 0, prefButton.getHeight());
             }
         });
+
         this.window.addWindowListener(new WindowAdapter() {
             @Override
             public void windowActivated(WindowEvent e) {
-                bringToFront(window);
+                // Settings / History / Hearing が開いている時は、
+                // 親ウィンドウを前面に引っ張らない（ちらつき防止）
+                if (settingsCenterFrame != null && settingsCenterFrame.isShowing()) return;
+                if (historyFrame != null && historyFrame.isShowing()) return;
+                if (hearingFrame != null && hearingFrame.isShowing()) return;
+
+                // 通常時だけ明示前面化したいなら残す
+                // bringToFront(window);
             }
         });
 
@@ -5643,40 +4635,6 @@ public class MobMateWhisp implements NativeKeyListener {
                         if (wizard != null) wizard.stopAllWizardTests(); // ある実装前提（無ければ下の(2)を先に入れる）
                     } catch (Throwable ignore) {}
                 }
-
-                // ★ウィザード終了後、PopupMenuを再構築
-                prefButton.removeAll();
-                PopupMenu newPopup = createPopupMenu();
-                prefButton.add(newPopup);
-                // prefButtonのActionListenerも更新（既存のままだと古いpopupを参照）
-                for (ActionListener al : prefButton.getActionListeners()) {
-                    prefButton.removeActionListener(al);
-                }
-                PopupMenu finalNewPopup = newPopup;
-                prefButton.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        rebuildVoiceVoxSpeakerMenu(engVvMenu, engVv, engListener, prefs);
-                        finalNewPopup.show((Component) e.getSource(), 0, 0);
-                    }
-                });
-
-                // ★ウィザード終了後、PopupMenuを再構築
-                prefButton.removeAll();
-                newPopup = createPopupMenu();
-                prefButton.add(newPopup);
-                // prefButtonのActionListenerも更新（既存のままだと古いpopupを参照）
-                for (ActionListener al : prefButton.getActionListeners()) {
-                    prefButton.removeActionListener(al);
-                }
-                PopupMenu finalNewPopup1 = newPopup;
-                prefButton.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        rebuildVoiceVoxSpeakerMenu(engVvMenu, engVv, engListener, prefs);
-                        finalNewPopup1.show((Component) e.getSource(), 0, 0);
-                    }
-                });
 
 //                prefs.putBoolean("wizard.completed", true);
                 try { prefs.sync(); } catch (Exception ignore) {}
@@ -5876,9 +4834,9 @@ public class MobMateWhisp implements NativeKeyListener {
         hotkeyLabel.setFont(hotkeyLabel.getFont().deriveFont(11f));
         hotkeyLabel.setToolTipText("Hotkey");
 
-        modelLabel = new JLabel("Model: " + (model != null ? model.replace(".bin", "") : "-"));
+        modelLabel = new JLabel(buildCurrentModelStatusText());
         modelLabel.setFont(modelLabel.getFont().deriveFont(11f));
-        modelLabel.setToolTipText("Current Model");
+        modelLabel.setToolTipText(buildCurrentModelTooltip());
 
         memLabel = new JLabel("Mem: -");
         memLabel.setFont(memLabel.getFont().deriveFont(11f));
@@ -5925,6 +4883,27 @@ public class MobMateWhisp implements NativeKeyListener {
         statusBar.add(versionLabel);
 
         return statusBar;
+    }
+
+    private String buildCurrentModelStatusText() {
+        if (isEngineMoonshine()) {
+            String savedPath = prefs.get("moonshine.model_path", "");
+            String key = findMoonshineModelKey(savedPath, scanMoonshineModelMap());
+
+            if (key != null && !key.isBlank()) {
+                return "Model: moonshine-" + key;
+            }
+            if (savedPath != null && !savedPath.isBlank()) {
+                return "Model: moonshine-" + new File(savedPath).getName();
+            }
+            return "Model: moonshine";
+        }
+
+        return "Model: " + (model != null ? model.replace(".bin", "") : "-");
+    }
+
+    private String buildCurrentModelTooltip() {
+        return isEngineMoonshine() ? "Current Moonshine model" : "Current Whisper model";
     }
 
     // ===== ホットキー文字列取得 =====
@@ -6109,6 +5088,12 @@ public class MobMateWhisp implements NativeKeyListener {
                 long usedMB = (runtime.totalMemory() - runtime.freeMemory()) / 1024 / 1024;
                 memLabel.setText("Mem: " + usedMB + "MB");
             }
+
+            if (modelLabel != null) {
+                modelLabel.setText(buildCurrentModelStatusText());
+                modelLabel.setToolTipText(buildCurrentModelTooltip());
+            }
+
             // ★LAT表示を更新
             if (latencyLabel != null) {
                 latencyLabel.setText(buildLatencyText());
@@ -6467,18 +5452,94 @@ public class MobMateWhisp implements NativeKeyListener {
             @Override public void componentResized(ComponentEvent e){ save(); }
         });
     }
+
+
+    private static String uiOr(String key, String fallback) {
+        try {
+            String v = UiText.t(key);
+            if (v == null || v.isBlank() || key.equals(v)) return fallback;
+            return v;
+        } catch (Throwable t) {
+            return fallback;
+        }
+    }
+    private void setHistoryStartupPref(boolean open) {
+        prefs.putBoolean("ui.history.open_on_startup", open);
+        try { prefs.sync(); } catch (Exception ignore) {}
+    }
+    public void openSettingsCenter() {
+        SwingUtilities.invokeLater(() -> {
+            try {
+                if (settingsCenterFrame != null) {
+                    if (settingsCenterFrame.isDisplayable()) {
+                        settingsCenterFrame.toFront();
+                        settingsCenterFrame.requestFocus();
+                        return;
+                    }
+                    settingsCenterFrame = null;
+                }
+
+                final MobMateSettingsFrame dlg = new MobMateSettingsFrame(window, this);
+
+                dlg.addWindowListener(new WindowAdapter() {
+                    @Override
+                    public void windowClosed(WindowEvent e) {
+                        if (settingsCenterFrame == dlg) {
+                            settingsCenterFrame = null;
+                        }
+                    }
+                });
+
+                Rectangle fb;
+                if (window != null) {
+                    fb = new Rectangle(window.getX() + 20, window.getY() + 70, 1080, 760);
+                } else {
+                    fb = new Rectangle(40, 40, 1080, 760);
+                }
+
+                restoreBounds(dlg, "ui.settings", fb);
+                installBoundsSaver(dlg, "ui.settings");
+
+                settingsCenterFrame = dlg;
+                dlg.setVisible(true);
+            } catch (Throwable ex) {
+                settingsCenterFrame = null;
+                Config.logError("[SettingsCenter] open failed", ex);
+
+                JOptionPane.showMessageDialog(
+                        window,
+                        "Failed to open Settings Center.\n"
+                                + ex.getClass().getSimpleName()
+                                + (ex.getMessage() != null ? ": " + ex.getMessage() : ""),
+                        "MobMate",
+                        JOptionPane.ERROR_MESSAGE
+                );
+            }
+        });
+    }
+    public List<String> getWindowsVoicesForSettings() {
+        return getWindowsVoices();
+    }
+    public List<VoiceVoxSpeaker> getVoiceVoxSpeakersForSettings() {
+        return getVoiceVoxSpeakers();
+    }
+    public void requestSoftRestartForSettings() {
+        softRestart();
+    }
     public void showHistory() {
         if (historyFrame != null && historyFrame.isShowing()) {
+            setHistoryStartupPref(true);
             historyFrame.toFront();
             historyFrame.requestFocus();
             return;
         }
+
         historyFrame = new HistoryFrame(this);
         historyFrame.setMinimumSize(new Dimension(510, 200));
         historyFrame.setSize(510, 400);
         SwingUtilities.updateComponentTreeUI(historyFrame);
 
-        Rectangle fb = null;
+        Rectangle fb;
         if (window != null) {
             fb = new Rectangle(window.getX() + 15, window.getY() + 80, 510, 400);
         } else {
@@ -6487,8 +5548,35 @@ public class MobMateWhisp implements NativeKeyListener {
         restoreBounds(historyFrame, "ui.history", fb);
         installBoundsSaver(historyFrame, "ui.history");
 
+        historyFrame.addWindowListener(new WindowAdapter() {
+            @Override
+            public void windowClosing(WindowEvent e) {
+                setHistoryStartupPref(false);
+            }
+
+            @Override
+            public void windowClosed(WindowEvent e) {
+                setHistoryStartupPref(false);
+                historyFrame = null;
+            }
+        });
+
+        historyFrame.addComponentListener(new ComponentAdapter() {
+            @Override
+            public void componentHidden(ComponentEvent e) {
+                setHistoryStartupPref(false);
+            }
+
+            @Override
+            public void componentShown(ComponentEvent e) {
+                setHistoryStartupPref(true);
+            }
+        });
+
         historyFrame.refresh();
         historyFrame.setVisible(true);
+        setHistoryStartupPref(true);
+
         SwingUtilities.updateComponentTreeUI(historyFrame);
         historyFrame.updateIcon(
                 isRecording(),
@@ -6562,6 +5650,14 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
 
+    public void requestVoicegerRestartForSettings() {
+        try {
+            // ★古い成功キャッシュ/失敗直後の揺れを持ち越さない
+            vgHealthOkUntilMs = 0L;
+        } catch (Throwable ignore) {}
+
+        restartVoicegerApiAsync();
+    }
     // ===== Voiceger TTS pipelining =====
     private final ExecutorService vgTtsExec = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "vg-tts-prefetch");
@@ -9030,7 +8126,7 @@ final class VoicegerManager {
             pb.redirectErrorStream(true);
             pb.redirectOutput(ProcessBuilder.Redirect.appendTo(log.toFile()));
 
-// env（Wizard同様）
+            // env（Wizard同様）
             Map<String, String> env = pb.environment();
             env.putIfAbsent("NUMBA_DISABLE_CACHING", "1");
             env.putIfAbsent("NUMBA_DISABLE_JIT", "1");
@@ -9284,6 +8380,31 @@ final class VoicegerManager {
             miss.add(".../pretrained_models/chinese-roberta-wwm-ext-large/");
         if (!java.nio.file.Files.isDirectory(pretrained.resolve("chinese-hubert-base")))
             miss.add(".../pretrained_models/chinese-hubert-base/");
+
+        // TTS fine-tuned weights (/tts本体)
+        java.nio.file.Path gptWeights = gptSoVits.resolve("GPT_weights_v2");
+        if (!java.nio.file.Files.isDirectory(gptWeights)) {
+            miss.add("GPT-SoVITS/GPT_weights_v2/");
+        } else {
+            try (var s = java.nio.file.Files.list(gptWeights)) {
+                boolean hasCkpt = s.anyMatch(p -> p.getFileName().toString().toLowerCase().endsWith(".ckpt"));
+                if (!hasCkpt) miss.add("GPT-SoVITS/GPT_weights_v2/*.ckpt");
+            } catch (Exception ignore) {
+                miss.add("GPT-SoVITS/GPT_weights_v2/*.ckpt");
+            }
+        }
+
+        java.nio.file.Path sovitsWeights = gptSoVits.resolve("SoVITS_weights_v2");
+        if (!java.nio.file.Files.isDirectory(sovitsWeights)) {
+            miss.add("GPT-SoVITS/SoVITS_weights_v2/");
+        } else {
+            try (var s = java.nio.file.Files.list(sovitsWeights)) {
+                boolean hasPth = s.anyMatch(p -> p.getFileName().toString().toLowerCase().endsWith(".pth"));
+                if (!hasPth) miss.add("GPT-SoVITS/SoVITS_weights_v2/*.pth");
+            } catch (Exception ignore) {
+                miss.add("GPT-SoVITS/SoVITS_weights_v2/*.pth");
+            }
+        }
 
         // G2PWModel
         java.nio.file.Path g2pw = gptSoVits.resolve("GPT_SoVITS").resolve("text").resolve("G2PWModel");
