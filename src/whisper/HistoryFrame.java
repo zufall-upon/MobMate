@@ -5,6 +5,7 @@ import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.*;
 import java.io.File;
+import java.util.Objects;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
@@ -17,6 +18,9 @@ public class HistoryFrame extends JFrame implements ChangeListener {
 //    private final JTextArea t = new JTextArea();
     private final JPanel historyListPanel = new JPanel();
     private final JLabel partialLabel = new JLabel(" ");
+    private final JComboBox<String> talkLangCombo = new JComboBox<>();
+    private final JComboBox<String> talkTranslateTargetCombo = new JComboBox<>(LanguageOptions.translationTargets());
+    private boolean adjustingTalkControls = false;
     public static final int HISTORY_MAX_LINES = 100;
     private final java.util.concurrent.BlockingQueue<String> radioSpeakQueue =
             new java.util.concurrent.LinkedBlockingQueue<>();
@@ -81,10 +85,6 @@ public class HistoryFrame extends JFrame implements ChangeListener {
             ensureRadioSpeakWorker();
             radioSpeakQueue.offer(text);
 
-            SwingUtilities.invokeLater(() -> {
-                mobMateWhisp.addHistory(text);      // ★ここで1回だけ追加
-                Config.appendOutTts(text);          // outttsは従来通り1回
-            });
         });
 
         JPanel speakPanel = new JPanel(new BorderLayout());
@@ -122,9 +122,40 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         bottom.add(speakPanel, BorderLayout.NORTH);
         bottom.add(buttonPanel, BorderLayout.SOUTH);
 
+        // ===== Talk controls =====
+        talkLangCombo.setRenderer(LanguageOptions.whisperRenderer());
+        talkTranslateTargetCombo.setRenderer(LanguageOptions.translationRenderer());
+        talkLangCombo.setPreferredSize(new Dimension(132, 28));
+        talkTranslateTargetCombo.setPreferredSize(new Dimension(138, 28));
+        talkLangCombo.addActionListener(e -> {
+            if (adjustingTalkControls) return;
+            String selected = Objects.toString(talkLangCombo.getSelectedItem(), "");
+            if (!mobMateWhisp.requestTalkLanguageChange(this, selected)) {
+                refreshTalkControls();
+            }
+        });
+        talkTranslateTargetCombo.addActionListener(e -> {
+            if (adjustingTalkControls) return;
+            mobMateWhisp.setTalkTranslateTarget(Objects.toString(talkTranslateTargetCombo.getSelectedItem(), "OFF"));
+        });
+
+        JPanel talkControlPanel = new JPanel();
+        talkControlPanel.setLayout(new BoxLayout(talkControlPanel, BoxLayout.X_AXIS));
+        talkControlPanel.add(new JLabel("Lang:"));
+        talkControlPanel.add(Box.createHorizontalStrut(6));
+        talkControlPanel.add(talkLangCombo);
+        talkControlPanel.add(Box.createHorizontalStrut(10));
+        talkControlPanel.add(new JLabel("To:"));
+        talkControlPanel.add(Box.createHorizontalStrut(6));
+        talkControlPanel.add(talkTranslateTargetCombo);
+
+        JPanel topPanel = new JPanel(new BorderLayout(8, 0));
+        topPanel.add(partialLabel, BorderLayout.CENTER);
+        topPanel.add(talkControlPanel, BorderLayout.EAST);
+
         // ===== Main panel =====
         final JPanel panel = new JPanel(new BorderLayout());
-        panel.add(partialLabel, BorderLayout.NORTH);   // ★ADD
+        panel.add(topPanel, BorderLayout.NORTH);
         panel.add(scroll, BorderLayout.CENTER);
         panel.add(bottom, BorderLayout.SOUTH);
 
@@ -134,6 +165,7 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         );
 
         // ===== Listeners =====
+        refreshTalkControls();
         mobMateWhisp.addHistoryListener(this);
 
         this.addWindowListener(new WindowAdapter() {
@@ -162,7 +194,7 @@ public class HistoryFrame extends JFrame implements ChangeListener {
             while (true) {
                 try {
                     String s = radioSpeakQueue.take();
-                    mobMateWhisp.speak(s);
+                    mobMateWhisp.speakTalkTextForUi(s);
                 } catch (Exception ex) {
                     Config.logError("RadioSpeak worker error: " + ex.getMessage(), ex);
                 }
@@ -176,7 +208,7 @@ public class HistoryFrame extends JFrame implements ChangeListener {
     public void stateChanged(ChangeEvent e) {
         historyListPanel.removeAll();
 
-        Object[] arr = mobMateWhisp.getHistory().toArray();
+        MobMateWhisp.HistoryEntry[] arr = mobMateWhisp.getHistory().toArray(new MobMateWhisp.HistoryEntry[0]);
 
         String ignoreMode = Config.get("ignore.mode", "simple"); // simple | regex
         java.util.List<String> ignoreWords = Config.loadIgnoreWords();
@@ -187,8 +219,10 @@ public class HistoryFrame extends JFrame implements ChangeListener {
 
         int rowIndex = 0;
         for (int i = arr.length - 1; i >= minIndex; i--) {
-            String s = (String) arr[i];
-            HistoryRowPanel row = new HistoryRowPanel(mobMateWhisp, s);
+            MobMateWhisp.HistoryEntry entry = arr[i];
+            String displayText = entry.displayText();
+            String rawText = entry.rawText();
+            HistoryRowPanel row = new HistoryRowPanel(mobMateWhisp, displayText, rawText);
 
             // --- zebra background (FlatLaf対応) ---
             Color baseColor = UIManager.getColor("Panel.background");
@@ -203,9 +237,9 @@ public class HistoryFrame extends JFrame implements ChangeListener {
             }
             row.setOpaque(true);
 
-            if (ignoreWords.contains(s)) {
+            if (ignoreWords.contains(rawText)) {
                 row.setNG(true);
-            } else if (goodWords.contains(s)) {
+            } else if (goodWords.contains(rawText)) {
                 row.setGood(true);
             }
             historyListPanel.add(row);
@@ -264,6 +298,33 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         float newBrightness = Math.max(0f, Math.min(1f, hsb[2] + factor));
         return Color.getHSBColor(hsb[0], hsb[1], newBrightness);
     }
+    public void refreshTalkControls() {
+        SwingUtilities.invokeLater(() -> {
+            adjustingTalkControls = true;
+            try {
+                String[] langOptions = mobMateWhisp.getTalkLanguageOptions();
+                talkLangCombo.removeAllItems();
+                for (String lang : langOptions) {
+                    talkLangCombo.addItem(lang);
+                }
+                String talkLang = mobMateWhisp.getTalkLanguage();
+                if (talkLangCombo.getItemCount() == 0) {
+                    talkLangCombo.addItem(talkLang);
+                }
+                talkLangCombo.setSelectedItem(talkLang);
+                if (talkLangCombo.getSelectedItem() == null && talkLangCombo.getItemCount() > 0) {
+                    talkLangCombo.setSelectedIndex(0);
+                }
+
+                talkTranslateTargetCombo.setSelectedItem(mobMateWhisp.getTalkTranslateTarget());
+                if (talkTranslateTargetCombo.getSelectedItem() == null) {
+                    talkTranslateTargetCombo.setSelectedItem("OFF");
+                }
+            } finally {
+                adjustingTalkControls = false;
+            }
+        });
+    }
     // ★ADD: Moonshine partial プレビュー更新（MobMateWhispから呼ばれる）
     public void setPartialPreview(String text) {
         SwingUtilities.invokeLater(() -> {
@@ -286,3 +347,4 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         });
     }
 }
+

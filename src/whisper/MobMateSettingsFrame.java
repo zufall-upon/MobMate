@@ -60,8 +60,6 @@ public class MobMateSettingsFrame extends JDialog {
     private JLabel vadLaughNoteLabel;          
     private JCheckBox lowGpuCheck;
     private JCheckBox altLaughCheck;
-    private JCheckBox whisperTranslateCheck;
-    private JLabel whisperTranslateNoteLabel; 
 
     private JCheckBox speakerEnabledCheck;
     private JComboBox<Choice<Integer>> speakerEnrollCombo;
@@ -75,8 +73,9 @@ public class MobMateSettingsFrame extends JDialog {
     private JComboBox<Choice<String>> voicegerLangCombo;
 
     // ===== Text / _outtts =====
-    private JTextField whisperLanguageField;
+    private JComboBox<String> whisperLanguageCombo;
     private JTextArea initialPromptArea;
+    private JTextArea hearingInitialPromptArea;
     private JTextField voicevoxExeField;
     private JTextField voicevoxApiField;
     private JTextField xttsApiField;
@@ -330,11 +329,9 @@ public class MobMateSettingsFrame extends JDialog {
 
         lowGpuCheck = new JCheckBox(tt("menu.lowGpuMode", "Low GPU mode"));
         altLaughCheck = new JCheckBox(tt("menu.vadLaugh", "VAD laugh detection"));
-        whisperTranslateCheck = new JCheckBox("Translate to English (Whisper)");
 
         gpuNoteLabel = new JLabel();
         vadLaughNoteLabel = new JLabel();
-        whisperTranslateNoteLabel = new JLabel(); 
 
         speakerEnabledCheck = new JCheckBox(tt("settings.speaker.enable", "Enable speaker filter"));
         speakerEnrollCombo = new JComboBox<>(new Choice[]{
@@ -363,8 +360,6 @@ public class MobMateSettingsFrame extends JDialog {
         addRow(form, row++, "", lowGpuCheck);
         addRow(form, row++, "", altLaughCheck);
         addRow(form, row++, "", vadLaughNoteLabel);
-        addRow(form, row++, "", whisperTranslateCheck);
-        addRow(form, row++, "", whisperTranslateNoteLabel); 
 
         form.add(sectionLabel(tt("settings.section.speaker", "Speaker Filter")), sectionGbc(row++));
         addRow(form, row++, "", speakerEnabledCheck);
@@ -453,10 +448,14 @@ public class MobMateSettingsFrame extends JDialog {
         JPanel form = formPanel();
         int row = 0;
 
-        whisperLanguageField = new JTextField();
+        whisperLanguageCombo = new JComboBox<>(LanguageOptions.whisperLangs());
+        whisperLanguageCombo.setRenderer(LanguageOptions.whisperRenderer());
         initialPromptArea = new JTextArea(4, 40);
         initialPromptArea.setLineWrap(true);
         initialPromptArea.setWrapStyleWord(true);
+        hearingInitialPromptArea = new JTextArea(3, 40);
+        hearingInitialPromptArea.setLineWrap(true);
+        hearingInitialPromptArea.setWrapStyleWord(true);
 
         voicevoxExeField = new JTextField();
         voicevoxApiField = new JTextField();
@@ -476,9 +475,11 @@ public class MobMateSettingsFrame extends JDialog {
         vadSensitivitySpinner = new JSpinner(new SpinnerNumberModel(50, 0, 100, 1)); 
         vadToleranceSpinner   = new JSpinner(new SpinnerNumberModel(5, 1, 10, 1));   
 
-        addRow(form, row++, tt("settings.label.whisperLang", "Whisper language hint"), whisperLanguageField);
+        addRow(form, row++, tt("settings.label.whisperLang", "Talk language (Whisper)"), whisperLanguageCombo);
         addRow(form, row++, tt("settings.label.initialPrompt", "Initial prompt"),
                 new JScrollPane(initialPromptArea), true);
+        addRow(form, row++, tt("settings.label.hearingInitialPrompt", "Hearing prompt (Whisper)"),
+                new JScrollPane(hearingInitialPromptArea), true);
 
         form.add(sectionLabel("VOICEVOX"), sectionGbc(row++));
         addRow(form, row++, "voicevox.exe", voicevoxExeField);
@@ -651,6 +652,12 @@ public class MobMateSettingsFrame extends JDialog {
         );
     }
 
+    public void refreshLinkedSelections() {
+        SwingUtilities.invokeLater(() -> {
+            selectChoice(voicegerLangCombo, MobMateWhisp.prefs.get("voiceger.tts.lang", "all_ja"));
+            selectStringComboValue(whisperLanguageCombo, app.getTalkLanguage(), app.getTalkLanguage());
+        });
+    }
     private void loadCurrentValues() {
         // ===== General =====
         selectChoice(actionCombo, MobMateWhisp.prefs.get("action", "nothing"));
@@ -702,7 +709,6 @@ public class MobMateSettingsFrame extends JDialog {
 
         lowGpuCheck.setSelected(MobMateWhisp.prefs.getBoolean("perf.low_gpu_mode", true));
         altLaughCheck.setSelected(MobMateWhisp.prefs.getBoolean("silence.alternate", false));
-        whisperTranslateCheck.setSelected(MobMateWhisp.prefs.getBoolean("whisper.translate_to_en", false));
 
         speakerEnabledCheck.setSelected(MobMateWhisp.prefs.getBoolean("speaker.enabled", false));
         selectChoice(speakerEnrollCombo, MobMateWhisp.prefs.getInt("speaker.enroll_samples", 5));
@@ -725,8 +731,9 @@ public class MobMateSettingsFrame extends JDialog {
         selectChoice(voicegerLangCombo, MobMateWhisp.prefs.get("voiceger.tts.lang", "all_ja"));
 
         // ===== Text / _outtts =====
-        whisperLanguageField.setText(Config.getString("language", "ja"));
+        selectStringComboValue(whisperLanguageCombo, app.getTalkLanguage(), app.getTalkLanguage());
         initialPromptArea.setText(Config.getString("initial_prompt", ""));
+        hearingInitialPromptArea.setText(MobMateWhisp.prefs.get("hearing.initial_prompt", ""));
         voicevoxExeField.setText(Config.getString("voicevox.exe", ""));
         voicevoxApiField.setText(Config.getString("voicevox.api", ""));
         xttsApiField.setText(Config.getString("xtts.api", ""));
@@ -975,6 +982,7 @@ public class MobMateSettingsFrame extends JDialog {
             String newMoonPath = moonDir.getAbsolutePath();
             if (!Objects.equals(oldMoonPath, newMoonPath)) {
                 MobMateWhisp.prefs.put("moonshine.model_path", newMoonPath);
+                MobMateWhisp.prefs.put("talk.lang", moonKey.toLowerCase(Locale.ROOT));
                 needSoftRestart = true;
             }
         }
@@ -994,29 +1002,42 @@ public class MobMateSettingsFrame extends JDialog {
         }
 
         MobMateWhisp.prefs.putBoolean("silence.alternate", altLaughCheck.isSelected());
-        MobMateWhisp.prefs.putBoolean("whisper.translate_to_en", whisperTranslateCheck.isSelected());
+        MobMateWhisp.prefs.remove("whisper.translate_to_en");
 
         MobMateWhisp.prefs.putBoolean("speaker.enabled", speakerEnabledCheck.isSelected());
+        Integer oldEnroll = MobMateWhisp.prefs.getInt("speaker.enroll_samples", 5);
         Integer enroll = selectedValue(speakerEnrollCombo);
-        if (enroll != null) MobMateWhisp.prefs.putInt("speaker.enroll_samples", enroll);
+        if (enroll != null) {
+            MobMateWhisp.prefs.putInt("speaker.enroll_samples", enroll);
+            if (!Objects.equals(oldEnroll, enroll)) needSoftRestart = true;
+        }
+        Float oldSpkTh = MobMateWhisp.prefs.getFloat("speaker.threshold_initial", 0.60f);
         Float spkTh = selectedValue(speakerThresholdCombo);
-        if (spkTh != null) MobMateWhisp.prefs.putFloat("speaker.threshold_initial", spkTh);
+        if (spkTh != null) {
+            MobMateWhisp.prefs.putFloat("speaker.threshold_initial", spkTh);
+            MobMateWhisp.prefs.putFloat("speaker.threshold_target", spkTh);
+            if (!Objects.equals(oldSpkTh, spkTh)) needSoftRestart = true;
+        }
 
         // ===== TTS =====
         String oldTtsEngine = MobMateWhisp.prefs.get("tts.engine", "auto");
         String newTtsEngine = selectedValue(ttsEngineCombo);
         MobMateWhisp.prefs.put("tts.engine", newTtsEngine);
 
-        String newWinVoice = Objects.toString(windowsVoiceCombo.getSelectedItem(), "auto");
-        MobMateWhisp.prefs.put("tts.windows.voice", newWinVoice);
+        if (ttsListsLoaded.get() && !ttsListsLoading.get()) {
+            String newWinVoice = Objects.toString(windowsVoiceCombo.getSelectedItem(), "auto");
+            if (!newWinVoice.isBlank() && !"loading...".equalsIgnoreCase(newWinVoice)) {
+                MobMateWhisp.prefs.put("tts.windows.voice", newWinVoice);
+            }
 
-        String vvSel = Objects.toString(voicevoxSpeakerCombo.getSelectedItem(), "");
-        String vvId = vvSel;
-        int colon = vvSel.indexOf(':');
-        if (colon > 0) vvId = vvSel.substring(0, colon).trim();
-        if (!vvId.isBlank()) {
-            MobMateWhisp.prefs.put("tts.voice", vvId);
-            writeOutttsKey("voicevox.speaker", vvId, false);
+            String vvSel = Objects.toString(voicevoxSpeakerCombo.getSelectedItem(), "");
+            String vvId = vvSel;
+            int colon = vvSel.indexOf(':');
+            if (colon > 0) vvId = vvSel.substring(0, colon).trim();
+            if (!vvId.isBlank() && vvId.chars().allMatch(Character::isDigit)) {
+                MobMateWhisp.prefs.put("tts.voice", vvId);
+                writeOutttsKey("voicevox.speaker", vvId, false);
+            }
         }
 
         MobMateWhisp.prefs.putBoolean("voicevox.auto_emotion", voicevoxAutoEmotionCheck.isSelected());
@@ -1042,8 +1063,17 @@ public class MobMateSettingsFrame extends JDialog {
         }
 
         // ===== Text / _outtts =====
-        writeOutttsKey("language", oneLine(whisperLanguageField.getText()), false);
+        if (!"moonshine".equalsIgnoreCase(selectedValue(recogEngineCombo))) {
+            String oldTalkLang = app.getTalkLanguage();
+            String newTalkLang = selectedStringOrFallback(whisperLanguageCombo, oldTalkLang);
+            if (!Objects.equals(oldTalkLang, newTalkLang) && app.applyTalkLanguageSelection(newTalkLang)) {
+                needSoftRestart = true;
+            }
+        }
+        writeOutttsKey("language", app.getTalkLanguage(), false);
         writeOutttsKey("initial_prompt", oneLine(initialPromptArea.getText()), false);
+        MobMateWhisp.prefs.put("hearing.initial_prompt", oneLine(hearingInitialPromptArea.getText()));
+        LocalWhisperCPP.markInitialPromptDirty();
 
         writeOutttsKey("voicevox.exe", voicevoxExeField.getText().trim(), true);
         writeOutttsKey("voicevox.api", voicevoxApiField.getText().trim(), false);
@@ -1221,10 +1251,7 @@ public class MobMateSettingsFrame extends JDialog {
     private void applyFontSizeNow(int fontSize) {
         MobMateWhisp.applyUIFont(fontSize);
         for (Window w : Window.getWindows()) {
-            SwingUtilities.updateComponentTreeUI(w);
-            w.invalidate();
-            w.validate();
-            w.repaint();
+            UiFontApplier.refreshAllUI(w);
         }
     }
 
@@ -1597,6 +1624,14 @@ public class MobMateSettingsFrame extends JDialog {
         combo.setSelectedItem(v);
     }
 
+    private String selectedStringOrFallback(JComboBox<String> combo, String fallback) {
+        if (combo == null) {
+            return LanguageOptions.normalizeWhisperLang(fallback, fallback);
+        }
+        Object selected = combo.getSelectedItem();
+        return LanguageOptions.normalizeWhisperLang(Objects.toString(selected, fallback), fallback);
+    }
+
     private void reloadGpuChoices() {
         if (gpuSelectCombo == null) return;
 
@@ -1662,7 +1697,7 @@ public class MobMateSettingsFrame extends JDialog {
 
         if (whisperModelCombo != null) whisperModelCombo.setEnabled(whisperMode);
         if (moonshineModelCombo != null) moonshineModelCombo.setEnabled(moonshineMode);
-        if (whisperTranslateCheck != null) whisperTranslateCheck.setEnabled(whisperMode);
+        if (whisperLanguageCombo != null) whisperLanguageCombo.setEnabled(whisperMode);
 
         if (gpuSelectCombo != null) {
             gpuSelectCombo.setEnabled(whisperMode && gpuSelectable);
@@ -1706,27 +1741,8 @@ public class MobMateSettingsFrame extends JDialog {
             );
         }
 
-        if (whisperTranslateNoteLabel != null) {
-            String noteText;
-            String noteColor;
-
-            if (moonshineMode) {
-                noteText = tt(
-                        "settings.whisperTranslate.note.moonshine",
-                        "Whisper-only feature. Disabled while Moonshine is selected."
-                );
-                noteColor = "#AAAAAA";
-            } else {
-                noteText = tt(
-                        "settings.whisperTranslate.note",
-                        "Whisper-only feature. Converts recognition result to English."
-                );
-                noteColor = "#888888";
-            }
-
-            whisperTranslateNoteLabel.setText(
-                    "<html><span style='color:" + noteColor + ";'>" + noteText + "</span></html>"
-            );
-        }
     }
 }
+
+
+

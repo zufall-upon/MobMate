@@ -140,12 +140,12 @@ public class FirstLaunchWizard extends JDialog {
                 try { prefs.sync(); } catch (Exception ignore) {}
             }
         });
-        addWindowListener(new WindowAdapter() {
-            @Override
-            public void windowClosed(WindowEvent e) {
-                onStepExit(step);
-            }
-        });
+//        addWindowListener(new WindowAdapter() {
+//            @Override
+//            public void windowClosed(WindowEvent e) {
+//                onStepExit(step);
+//            }
+//        });
         addWindowListener(new java.awt.event.WindowAdapter() {
             @Override
             public void windowClosing(java.awt.event.WindowEvent e) {

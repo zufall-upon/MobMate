@@ -46,6 +46,11 @@ public class SpeakerProfile {
     private static final double RESCUE_SCORE_MIN = 0.35;   // この以上なら「近い声」とみなす
 
     private final List<double[]> enrolledFeatures = new ArrayList<>();
+    private static final double MIN_RMS_FOR_SPEAKER_CHECK = 800.0;
+    private static final int SPEAKER_RMS_WINDOW_SAMPLES = 1600; // 100ms @ 16kHz
+    private static final double SOFT_MIN_RMS_FOR_SPEAKER_PASS = MIN_RMS_FOR_SPEAKER_CHECK * 0.90;
+    private static final double HARD_MIN_RMS_FOR_SPEAKER_PASS = MIN_RMS_FOR_SPEAKER_CHECK * 0.75;
+    private static final double LOW_ENERGY_SCORE_MARGIN = 0.12;
 
     public SpeakerProfile(int requiredSamples, double initialThreshold, double targetThreshold) {
         this.requiredSamples = Math.max(1, requiredSamples);
@@ -125,47 +130,7 @@ public class SpeakerProfile {
      * 話者判定
      * @return true = 話者一致（またはプロファイル未完成）
      */
-    // ★最小RMS閾値（16bit PCM基準: 正常な音声は1500以上が目安）
-    private static final double MIN_RMS_FOR_SPEAKER_CHECK = 800.0;
 
-    public synchronized boolean isMatchingSpeaker(byte[] pcm16le) {
-        if (!isReady()) return true;
-        if (pcm16le == null || pcm16le.length < FFT_SIZE * 2) return false;
-
-        // ★エネルギーゲート: 静寂・環境ノイズを早期リジェクト
-        double rms = computeRms(pcm16le);
-        if (rms < MIN_RMS_FOR_SPEAKER_CHECK) {
-            Config.logDebug(String.format("★Speaker: ENERGY_REJECT rms=%.1f < %.1f",
-                    rms, MIN_RMS_FOR_SPEAKER_CHECK));
-            totalRejected++;
-            return false;
-        }
-
-        double score = similarity(trimSilentTail(pcm16le));
-        boolean match = score >= threshold;
-
-        if (!match) {
-            totalRejected++;
-        }
-
-        if (match) {
-            consecutiveRejects = 0;
-        } else {
-            consecutiveRejects++;
-            // ★ADD: 長期デッドロック救済 — 連続REJECTが続き、かつスコアが「近い」なら強制PASS
-            if (consecutiveRejects >= RESCUE_REJECT_THRESHOLD && score >= RESCUE_SCORE_MIN) {
-                match = true;
-                consecutiveRejects = 0;
-                Config.logDebug(String.format("★Speaker: RESCUE PASS (consec=%d score=%.3f)",
-                        RESCUE_REJECT_THRESHOLD, score));
-            }
-        }
-
-        Config.logDebug(String.format("★Speaker: score=%.3f thr=%.3f spread=%.3f rms=%.1f %s (ok=%d ng=%d)",
-                score, threshold, enrollmentSpread, rms, match ? "PASS" : "REJECT",
-                totalAccepted, totalRejected));
-        return match;
-    }
     /** ★ADD: PCMバッファ末尾の無音（RMS < 300）をトリムする */
     private static byte[] trimSilentTail(byte[] pcm16le) {
         int frameSize = 800; // 50ms @ 16kHz
@@ -576,5 +541,96 @@ public class SpeakerProfile {
             Config.logDebug("★Speaker load failed: " + e.getMessage());
             return false;
         }
+    }
+
+    public synchronized boolean isMatchingSpeaker(byte[] pcm16le) {
+        if (!isReady()) return true;
+        if (pcm16le == null || pcm16le.length < FFT_SIZE * 2) return false;
+
+        byte[] voiced = trimSilentTail(pcm16le);
+        if (voiced.length < FFT_SIZE * 2) {
+            voiced = pcm16le;
+        }
+
+        double rms = computeRms(voiced);
+        double windowRms = computePeakWindowRms(voiced, SPEAKER_RMS_WINDOW_SAMPLES);
+        double effectiveRms = Math.max(rms, windowRms);
+        double score = similarity(voiced);
+        int voicedSamples = voiced.length / 2;
+        double voicedMs = (voicedSamples * 1000.0) / SAMPLE_RATE;
+        if (effectiveRms < MIN_RMS_FOR_SPEAKER_CHECK) {
+            boolean lowEnergyPass = false;
+            if (effectiveRms >= SOFT_MIN_RMS_FOR_SPEAKER_PASS
+                    && voicedMs >= 700.0
+                    && score >= (threshold + 0.05)) {
+                lowEnergyPass = true;
+            } else if (effectiveRms >= HARD_MIN_RMS_FOR_SPEAKER_PASS
+                    && voicedMs >= 1000.0
+                    && score >= (threshold + LOW_ENERGY_SCORE_MARGIN)) {
+                lowEnergyPass = true;
+            }
+            if (!lowEnergyPass) {
+                Config.logDebug(String.format("★Speaker: ENERGY_REJECT score=%.3f thr=%.3f rms=%.1f window=%.1f voicedMs=%.0f < %.1f",
+                        score, threshold, rms, windowRms, voicedMs, MIN_RMS_FOR_SPEAKER_CHECK));
+                totalRejected++;
+                return false;
+            }
+            consecutiveRejects = 0;
+            Config.logDebug(String.format("★Speaker: LOW_ENERGY_PASS score=%.3f thr=%.3f rms=%.1f window=%.1f voicedMs=%.0f",
+                    score, threshold, rms, windowRms, voicedMs));
+        }
+        boolean match = score >= threshold;
+
+        if (!match) {
+            totalRejected++;
+        }
+
+        if (match) {
+            consecutiveRejects = 0;
+        } else {
+            consecutiveRejects++;
+            if (consecutiveRejects >= RESCUE_REJECT_THRESHOLD && score >= RESCUE_SCORE_MIN) {
+                match = true;
+                consecutiveRejects = 0;
+                Config.logDebug(String.format("★Speaker: RESCUE PASS (consec=%d score=%.3f)",
+                        RESCUE_REJECT_THRESHOLD, score));
+            }
+        }
+
+        Config.logDebug(String.format("★Speaker: score=%.3f thr=%.3f spread=%.3f rms=%.1f window=%.1f %s (ok=%d ng=%d)",
+                score, threshold, enrollmentSpread, rms, windowRms, match ? "PASS" : "REJECT",
+                totalAccepted, totalRejected));
+        return match;
+    }
+
+    private static double computePeakWindowRms(byte[] pcm16le, int windowSamples) {
+        int numSamples = pcm16le.length / 2;
+        if (numSamples <= 0) return 0.0;
+
+        int win = Math.max(1, Math.min(windowSamples, numSamples));
+        double sum = 0.0;
+        for (int i = 0; i < win; i++) {
+            double s = sampleAt(pcm16le, i);
+            sum += s * s;
+        }
+
+        double maxSum = sum;
+        for (int i = win; i < numSamples; i++) {
+            double add = sampleAt(pcm16le, i);
+            double sub = sampleAt(pcm16le, i - win);
+            sum += add * add;
+            sum -= sub * sub;
+            if (sum > maxSum) {
+                maxSum = sum;
+            }
+        }
+        return Math.sqrt(maxSum / win);
+    }
+
+    private static short sampleAt(byte[] pcm16le, int sampleIndex) {
+        int off = sampleIndex * 2;
+        int lo = pcm16le[off] & 0xFF;
+        int hi = pcm16le[off + 1];
+        return (short) (lo | (hi << 8));
     }
 }

@@ -3,6 +3,9 @@ package whisper;
 import com.sun.jna.*;
 import com.sun.jna.ptr.PointerByReference;
 import java.util.function.Consumer;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Locale;
 
 public class LocalMoonshineSTT {
 
@@ -17,6 +20,7 @@ public class LocalMoonshineSTT {
     public static final int MOONSHINE_FLAG_FORCE_UPDATE        = (1 << 0);
 
     // ---- transcript_line_t の手動オフセット (64-bit Windows MSVC) ----
+    // Moonshine 0.0.51 で words / word_count が追加されたので 1行サイズは 80 bytes っす。
     // JNA Structure のアライメント問題を完全に回避するため手動計算
     private static final int LINE_OFF_TEXT             = 0;   // const char*  (8)
     private static final int LINE_OFF_AUDIO_DATA       = 8;   // const float* (8)
@@ -33,7 +37,9 @@ public class LocalMoonshineSTT {
     private static final int LINE_OFF_SPEAKER_ID       = 48;  // uint64_t     (8)
     private static final int LINE_OFF_SPEAKER_INDEX    = 56;  // uint32_t     (4)
     private static final int LINE_OFF_LATENCY_MS       = 60;  // uint32_t     (4)
-    private static final int LINE_SIZE                 = 64;  // total
+    private static final int LINE_OFF_WORDS            = 64;  // transcript_word_t* (8)
+    private static final int LINE_OFF_WORD_COUNT       = 72;  // uint64_t            (8)
+    private static final int LINE_SIZE                 = 80;  // total
 
     // transcript_t のオフセット
     private static final int TX_OFF_LINES      = 0;  // transcript_line_t* (8)
@@ -68,6 +74,50 @@ public class LocalMoonshineSTT {
         int  moonshine_transcribe_stream(
                 int handle, int stream,
                 int flags, PointerByReference out);
+    }
+
+    // ★Moonshine公式 options 用
+    public static class TranscriberOption extends Structure {
+        public String name;
+        public String value;
+
+        @Override
+        protected List<String> getFieldOrder() {
+            return Arrays.asList("name", "value");
+        }
+    }
+
+    // ★短い発話向けの攻め設定（MobMate側VADと二重なので少し攻める）
+    private double vadWindowDuration = 0.15;      // default 0.5 → 短発話向けに短縮
+    private int    vadLookBehindSamples = 20000;  // default 8192 → 文頭救済を増やす
+    private double vadThreshold = 0.30;           // default 0.5 → 少し感度を上げる
+
+    public void setVadWindowDuration(double sec) {
+        this.vadWindowDuration = Math.max(0.05, Math.min(1.00, sec));
+    }
+    public void setVadLookBehindSamples(int samples) {
+        this.vadLookBehindSamples = Math.max(0, Math.min(64000, samples));
+    }
+    public void setVadThreshold(double threshold) {
+        this.vadThreshold = Math.max(0.05, Math.min(0.95, threshold));
+    }
+
+    private TranscriberOption[] buildLoadOptions() {
+        TranscriberOption[] opts = (TranscriberOption[]) new TranscriberOption().toArray(3);
+
+        opts[0].name  = "vad_window_duration";
+        opts[0].value = String.format(Locale.ROOT, "%.3f", vadWindowDuration);
+
+        opts[1].name  = "vad_look_behind_sample_count";
+        opts[1].value = Integer.toString(vadLookBehindSamples);
+
+        opts[2].name  = "vad_threshold";
+        opts[2].value = String.format(Locale.ROOT, "%.3f", vadThreshold);
+
+        for (TranscriberOption opt : opts) {
+            opt.write();
+        }
+        return opts;
     }
 
     // ---- フィールド ----
@@ -145,10 +195,17 @@ public class LocalMoonshineSTT {
             Config.log("[Moonshine] step2: load model path=" + modelPath + " arch=" + arch);
 
             // C++側に投げるっす！
+            TranscriberOption[] opts = buildLoadOptions();
+
+            Config.log("[Moonshine] load options:"
+                    + " vad_window_duration=" + vadWindowDuration
+                    + ", vad_look_behind_sample_count=" + vadLookBehindSamples
+                    + ", vad_threshold=" + vadThreshold);
+
             int transcriberHandle = MoonshineLib.INSTANCE
                     .moonshine_load_transcriber_from_files(
                             modelPath, arch,
-                            Pointer.NULL, 0L,
+                            opts[0].getPointer(), opts.length,
                             MOONSHINE_HEADER_VERSION);
 
             if (transcriberHandle < 0) {
@@ -338,10 +395,17 @@ public class LocalMoonshineSTT {
 
             // 同じモデルパス・archで再ロード
             Config.log("[Moonshine] reloading transcriber from path=" + this.modelPath + " arch=" + this.arch);
+            TranscriberOption[] opts = buildLoadOptions();
+
+            Config.log("[Moonshine] reload options:"
+                    + " vad_window_duration=" + vadWindowDuration
+                    + ", vad_look_behind_sample_count=" + vadLookBehindSamples
+                    + ", vad_threshold=" + vadThreshold);
+
             int newHandle = MoonshineLib.INSTANCE
                     .moonshine_load_transcriber_from_files(
                             this.modelPath, this.arch,
-                            Pointer.NULL, 0L,
+                            opts[0].getPointer(), opts.length,
                             MOONSHINE_HEADER_VERSION);
             if (newHandle < 0) {
                 Config.log("[Moonshine] reload FAILED: " + newHandle);
@@ -436,15 +500,13 @@ public class LocalMoonshineSTT {
     private void injectSilencePadding() {
         if (transcriber < 0 || stream < 0) return;
         try {
-            // 1600 samples = 100ms @16kHz
-            // まずは 1.0秒 だけ入れて様子を見る
-            final int padSamples = 1600 * 6; // 1000ms at 16kHz
+            // ★FIX: 1000ms → 300ms（長すぎると文頭音声を食う）
+            final int padSamples = 1600 * 3; // 300ms at 16kHz
 
             float[] pad = new float[padSamples];
             MoonshineLib.INSTANCE.moonshine_transcribe_add_audio_to_stream(
                     transcriber, stream, pad, (long) padSamples, 16000, 0);
 
-            // ★重要: padding投入後もpoll側が即見に行けるように起こす
             synchronized (audioNotify) {
                 hasNewAudio = true;
                 audioNotify.notify();
@@ -459,10 +521,11 @@ public class LocalMoonshineSTT {
     private void injectTailSilencePadding() {
         if (transcriber < 0 || stream < 0) return;
         try {
-            float[] pad = new float[1600 * 6]; // 200ms at 16kHz
+            final int padSamples = 1600 * 3; // 300ms at 16kHz
+            float[] pad = new float[padSamples];
             MoonshineLib.INSTANCE.moonshine_transcribe_add_audio_to_stream(
-                    transcriber, stream, pad, (1600 * 6L), 16000, 0);
-            Config.logDebug("[Moonshine] tail silence injected: " + (1600 * 6) + " samples");
+                    transcriber, stream, pad, (long) padSamples, 16000, 0);
+            Config.logDebug("[Moonshine] tail silence injected: " + padSamples + " samples");
         } catch (Error e) {
             Config.logDebug("[Moonshine] tail silence error: " + e.getMessage());
         }
@@ -479,12 +542,14 @@ public class LocalMoonshineSTT {
             String bestPartial = null;
             int bestLatency = -1;
             long completedCountSnapshot = lastCompletedCount;
+            // ★FIX: pollThreadが既にCOMPLETEを発火済みならflushはCOMPLETE発火しない
+            boolean alreadyFiredComplete = (completedCountSnapshot > 0);
 
             // ★1回勝負をやめて、短い2パス確認にする
             for (int pass = 0; pass < 2; pass++) {
                 if (pass > 0) {
                     try {
-                        Thread.sleep(35); // 最小限のsettle wait
+                        Thread.sleep(35); // 語尾の着地を少し待つ
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                     }
@@ -539,16 +604,17 @@ public class LocalMoonshineSTT {
 
             lastCompletedCount = completedCountSnapshot;
 
+            // ★FIX: pollThreadが既にCOMPLETE発火済みならflushはCOMPLETE発火しない（二重発火防止）
             if (bestComplete != null) {
                 Config.log("[Moonshine] COMPLETE(flush): " + bestComplete
                         + " (latency=" + bestLatency + "ms)");
                 if (onCompleted != null) onCompleted.accept(bestComplete);
             } else if (bestPartial != null) {
-                Config.log("[Moonshine] partial(flush): " + bestPartial
-                        + " (" + bestLatency + "ms)");
-                if (onPartial != null) onPartial.accept(bestPartial);
+                // ★発話終了/reset直前のflushでは、partial止まりでも最終候補として確定扱いにする
+                Config.log("[Moonshine] COMPLETE(flush-promoted): " + bestPartial
+                        + " (latency=" + bestLatency + "ms)");
+                if (onCompleted != null) onCompleted.accept(bestPartial);
             }
-
         } catch (Error e) {
             Config.logDebug("[Moonshine] flushPendingTranscriptOnce ERROR: " + e.getMessage());
         }

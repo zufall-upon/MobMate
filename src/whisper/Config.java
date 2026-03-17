@@ -405,7 +405,7 @@ public final class Config {
                 if (line.startsWith(key + "=")) {
                     return line.substring((key + "=").length()).trim();
                 }
-                if (line.startsWith("---")) break;
+                if (line.contains("↑Settings↓Logs below")) break;
             }
         } catch (Exception e) {
             e.printStackTrace();

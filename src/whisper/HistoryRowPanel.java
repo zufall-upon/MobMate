@@ -13,16 +13,16 @@ public class HistoryRowPanel extends JPanel {
     private final String word;
     private final MobMateWhisp mob;
 
-    HistoryRowPanel(MobMateWhisp mobMateWhisp, String text) {
+    HistoryRowPanel(MobMateWhisp mobMateWhisp, String displayText, String rawText) {
         this.mob = mobMateWhisp;
-        this.word = text;
+        this.word = (rawText == null || rawText.isBlank()) ? displayText : rawText;
         setLayout(new BorderLayout());
         setAlignmentX(Component.LEFT_ALIGNMENT);
         setMaximumSize(
                 new Dimension(Integer.MAX_VALUE, getPreferredSize().height)
         );
 
-        label = new JLabel(text);
+        label = new JLabel(displayText);
         add(label, BorderLayout.CENTER);
 
         JButton ngButton = new JButton("NG");

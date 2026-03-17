@@ -24,15 +24,7 @@ public class HearingFrame extends JFrame {
     private JToggleButton toggle;
     private JComboBox<String> outputCombo;
     private JComboBox<String> langCombo;
-    // whisper.cpp(=OpenAI Whisper) の言語コード（ISO 639-1中心）
-    private static final String[] WHISPER_LANGS = new String[] {
-            "auto",
-            "en","ja","zh","de","fr","es","ru","ko","it","pt","nl","pl","tr","uk","vi","th","id","sv","fi","da","no","cs","hu","ro","el","he","hi","ar",
-            "af","am","as","az","ba","be","bg","bn","bo","br","bs","ca","cy","et","eu","fa","fo","gl","gu","ha","haw","hr","ht","hy","is","jw","ka","kk",
-            "km","kn","la","lb","ln","lo","lt","lv","mg","mi","mk","ml","mn","mr","ms","mt","my","ne","nn","oc","pa","ps","sa","sd","si","sk","sl","sn",
-            "so","sq","sr","su","sw","ta","te","tg","tk","tl","tt","ur","uz","yi","yo","yue"
-    };
-    private JCheckBox translateToEnCheck;
+    private JComboBox<String> translateTargetCombo;
 
     private GainMeter meter;
     private JButton prefButton;
@@ -71,6 +63,11 @@ public class HearingFrame extends JFrame {
     // PCMデバッグ用（1秒に1回だけログ）
     private Thread loopProcErrThread;
     private static final int HEARING_W = 380;
+    private static final int HEARING_METER_W = 108;
+    private static final int METER_H = 26;
+    private static final long SHORT_REPEAT_SUPPRESS_MS = 2500L;
+    private static final int SHORT_REPEAT_MAX_CP = 8;
+    private final java.util.LinkedHashMap<String, Long> recentShortCaptionMs = new java.util.LinkedHashMap<>();
 
     public HearingFrame(Preferences prefs, Image icon, MobMateWhisp host) {
         super("MobMate Hearing (WIP)");
@@ -92,6 +89,9 @@ public class HearingFrame extends JFrame {
     public void cleanup() {
         stopMonitor();
         saveBounds();
+        synchronized (recentShortCaptionMs) {
+            recentShortCaptionMs.clear();
+        }
         // ===== Overlay 破棄 =====
         if (overlay != null) {
             try {
@@ -128,6 +128,16 @@ public class HearingFrame extends JFrame {
             getRootPane().repaint();
         } catch (Exception ignore) {}
     }
+    private void applyMeterSize() {
+        if (meter == null) return;
+        Dimension meterSize = new Dimension(HEARING_METER_W, METER_H);
+        meter.setPreferredSize(meterSize);
+        meter.setMinimumSize(meterSize);
+        meter.setMaximumSize(meterSize);
+        meter.revalidate();
+        meter.repaint();
+    }
+
     private void buildUi() {
         // ★既に構築済みなら何もしない
         if (toggle != null) return;
@@ -138,10 +148,8 @@ public class HearingFrame extends JFrame {
         // 上段：メーター（メイン画面の GainMeter を流用）
         meter = new GainMeter();
         meter.setFont(root.getFont());
-        Dimension meterSize = new Dimension(170, 26);
-        meter.setPreferredSize(meterSize);
-        meter.setMinimumSize(meterSize);
-        meter.setMaximumSize(meterSize);
+        meter.setCompactLabels(true);
+        applyMeterSize();
         JPanel row1 = new JPanel();
         row1.setOpaque(true);
         row1.setLayout(new BoxLayout(row1, BoxLayout.X_AXIS));
@@ -199,10 +207,6 @@ public class HearingFrame extends JFrame {
 
 
 
-        row1.add(Box.createHorizontalGlue());
-        row1.add(Box.createHorizontalStrut(8));
-        row1.add(toggle);
-        root.add(row1);
 
         // Hearing専用 Prefs（共通PopupMenuは使わない）
         prefMenu.removeAll();
@@ -360,9 +364,15 @@ public class HearingFrame extends JFrame {
         prefButton = new JButton("Prefs");
         prefButton.setFocusable(false);
         prefButton.addActionListener(e -> prefMenu.show(prefButton, 0, prefButton.getHeight()));
+        row1.add(Box.createHorizontalGlue());
+        row1.add(toggle);
+        row1.add(Box.createHorizontalStrut(8));
+        row1.add(prefButton);
+        root.add(row1);
 
 
-        langCombo = new JComboBox<>(WHISPER_LANGS);
+        langCombo = new JComboBox<>(LanguageOptions.whisperLangs());
+        langCombo.setRenderer(LanguageOptions.whisperRenderer());
         langCombo.setFocusable(false);
         Dimension langSize = new Dimension(120, 26);
         langCombo.setPreferredSize(langSize);
@@ -394,25 +404,27 @@ public class HearingFrame extends JFrame {
 
         row2.add(Box.createHorizontalStrut(10));
 
-        translateToEnCheck = new JCheckBox("to EN");
-        translateToEnCheck.setFocusable(false);
-        translateToEnCheck.setOpaque(false);
+        row2.add(new JLabel("To:"));
+        row2.add(Box.createHorizontalStrut(6));
 
-        boolean tr = false;
-        try { tr = prefs.getBoolean("hearing.translate_to_en", false); } catch (Exception ignore) {}
-        translateToEnCheck.setSelected(tr);
+        translateTargetCombo = new JComboBox<>(LanguageOptions.translationTargets());
+        translateTargetCombo.setRenderer(LanguageOptions.translationRenderer());
+        translateTargetCombo.setFocusable(false);
+        Dimension translateSize = new Dimension(168, 26);
+        translateTargetCombo.setPreferredSize(translateSize);
+        translateTargetCombo.setMinimumSize(translateSize);
+        translateTargetCombo.setMaximumSize(translateSize);
+        translateTargetCombo.setSelectedItem(host.getHearingTranslateTarget());
 
-        translateToEnCheck.addActionListener(e -> {
-            boolean v = translateToEnCheck.isSelected();
-            prefs.putBoolean("hearing.translate_to_en", v);
-            try { prefs.sync(); } catch (Exception ignore) {}
-            host.setHearingTranslateToEn(v); // ★追加：Whisper側へ即反映
+        translateTargetCombo.addActionListener(e -> {
+            Object sel = translateTargetCombo.getSelectedItem();
+            String v = (sel == null) ? "OFF" : sel.toString();
+            host.setHearingTranslateTarget(v);
         });
 
-//        row2.add(translateToEnCheck);
+        row2.add(translateTargetCombo);
 
-        row2.add(Box.createHorizontalGlue());
-        row2.add(prefButton);
+
 
         root.add(Box.createVerticalStrut(6));
         root.add(row2);
@@ -664,6 +676,24 @@ public class HearingFrame extends JFrame {
                 return;
             }
         }
+        if (host.isHearingTranslateEnabled()) {
+            SwingUtilities.invokeLater(() -> {
+                if (meter != null) meter.setValue(0, -60.0, false, 1f, 1f, false);
+                setOverlayText("Loading filters...");
+            });
+            Thread preloadThread = new Thread(() -> {
+                host.preloadIgnoreForHearingStartIfNeeded();
+                SwingUtilities.invokeLater(() -> {
+                    if (toggle != null && toggle.isSelected()) {
+                        setOverlayText("Listening...");
+                        startWasapiLoopbackProc();
+                    }
+                });
+            }, "hearing-ignore-preload");
+            preloadThread.setDaemon(true);
+            preloadThread.start();
+            return;
+        }
         startWasapiLoopbackProc();
     }
 
@@ -745,6 +775,49 @@ public class HearingFrame extends JFrame {
     // ★Hearing: PCM chunk を Whisper に投げて、Overlay/Lbl を更新する共通処理
     // 直近partialを最大N件保持（古い→新しい）※Nはユーザー設定
     private final java.util.ArrayDeque<String> partialHistory = new java.util.ArrayDeque<>(10);
+
+    private static String normalizeShortCaptionKey(String text) {
+        if (text == null) return "";
+        String s = text.trim().toLowerCase(java.util.Locale.ROOT);
+        s = s.replaceAll("[\\s\\p{Punct}、。！？「」『』（）()\\[\\]{}【】…・~〜ー]+", "");
+        return s;
+    }
+
+    private static boolean isInlineRepeatSpamCaption(String text) {
+        String normalized = normalizeShortCaptionKey(text);
+        if (normalized.isEmpty()) return false;
+        int cp = normalized.codePointCount(0, normalized.length());
+        if (cp < 12) return false;
+        try {
+            return java.util.regex.Pattern.compile("(.{1,8})\\1{4,}").matcher(normalized).find();
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean shouldSuppressShortRepeatedCaption(String text) {
+        String normalized = normalizeShortCaptionKey(text);
+        if (normalized.isEmpty()) return false;
+        if (isInlineRepeatSpamCaption(text)) {
+            Config.logDebug("[Hearing][Filter] suppress inline repeat spam: " + text);
+            return true;
+        }
+        int cp = normalized.codePointCount(0, normalized.length());
+        if (cp <= 0 || cp > SHORT_REPEAT_MAX_CP) return false;
+
+        long now = System.currentTimeMillis();
+        synchronized (recentShortCaptionMs) {
+            recentShortCaptionMs.entrySet().removeIf(e -> now - e.getValue() > SHORT_REPEAT_SUPPRESS_MS);
+            Long prev = recentShortCaptionMs.get(normalized);
+            recentShortCaptionMs.put(normalized, now);
+            if (prev != null && now - prev <= SHORT_REPEAT_SUPPRESS_MS) {
+                Config.logDebug("[Hearing][Filter] suppress short repeated caption: " + text);
+                return true;
+            }
+        }
+        return false;
+    }
+
     private void pushPartialHistory(String s) {
         if (s == null) return;
         s = s.trim();
@@ -756,6 +829,36 @@ public class HearingFrame extends JFrame {
         if (partialHistory.size() >= maxSize) partialHistory.pollFirst();
         partialHistory.addLast(s);
     }
+    private void replaceLatestHistory(String sourceText, String displayText) {
+        if (sourceText == null || displayText == null) return;
+        sourceText = sourceText.trim();
+        displayText = displayText.trim();
+        if (sourceText.isEmpty() || displayText.isEmpty()) return;
+        java.util.ArrayList<String> items = new java.util.ArrayList<>(partialHistory);
+        for (int i = items.size() - 1; i >= 0; i--) {
+            if (sourceText.equals(items.get(i))) {
+                items.set(i, displayText);
+                partialHistory.clear();
+                for (String item : items) partialHistory.addLast(item);
+                return;
+            }
+        }
+        pushPartialHistory(displayText);
+    }
+
+    private void requestAsyncHearingTranslation(String sourceText) {
+        if (sourceText == null || sourceText.isBlank()) return;
+        if (!host.isHearingTranslateEnabled()) return;
+        host.translateHearingTextAsync(sourceText, translatedText -> SwingUtilities.invokeLater(() -> {
+            if (!running) return;
+            if (!host.isHearingTranslateEnabled()) return;
+            String caption = host.buildHearingTranslatedCaption(sourceText, translatedText);
+            if (shouldSuppressShortRepeatedCaption(caption)) return;
+            replaceLatestHistory(sourceText, caption);
+            setOverlayText(buildHistoryText() + " . ");
+        }));
+    }
+
     private void trimPartialHistory() {
         int maxSize = prefs.getInt("hearing.overlay.history_size", 6);
         while (partialHistory.size() > maxSize) {
@@ -779,7 +882,7 @@ public class HearingFrame extends JFrame {
             Config.logDebug("[Hearing][REC] main busy -> use main partial " + "LOOPBACK");
 
             String lp = MobMateWhisp.getLastPartial();
-            if (lp != null && !lp.isEmpty()) {
+            if (lp != null && !lp.isEmpty() && !shouldSuppressShortRepeatedCaption(lp)) {
                 pushPartialHistory(lp);
                 setOverlayText(buildHistoryText() + " . ");
             }
@@ -797,12 +900,17 @@ public class HearingFrame extends JFrame {
         if (!running) return;
 
         if (lastPartial != null && !lastPartial.isEmpty()) {
+            if (shouldSuppressShortRepeatedCaption(lastPartial)) {
+                return;
+            }
             pushPartialHistory(lastPartial);
             setOverlayText(buildHistoryText() + " . ");
+            requestAsyncHearingTranslation(lastPartial);
         } else {
             String lp = MobMateWhisp.getLastPartial();
             if (lp != null && !lp.isEmpty()
-                    && !LocalWhisperCPP.isIgnoredStatic(lp)) {   // ★追加
+                    && !LocalWhisperCPP.isIgnoredStatic(lp)
+                    && !shouldSuppressShortRepeatedCaption(lp)) {   // ★追加
                 pushPartialHistory(lp);
                 setOverlayText(buildHistoryText() + " . ");
             }
@@ -841,7 +949,7 @@ public class HearingFrame extends JFrame {
     }
 
     private void hideOverlay() {
-        if (overlay != null) overlay.setVisible(false);
+        if (overlay != null) overlay.hideWindow();
     }
 
     private void setOverlayText(String s) {
@@ -852,6 +960,7 @@ public class HearingFrame extends JFrame {
     private class HearingOverlayWindow extends JWindow {
         private final OutlineLabel label = new OutlineLabel();
         private final JPanel contentPanel;
+        private final Timer keepTopTimer;
 
         HearingOverlayWindow() {
             super();
@@ -867,6 +976,9 @@ public class HearingFrame extends JFrame {
             label.setText("");
             contentPanel.add(label, BorderLayout.CENTER);
 
+            keepTopTimer = new Timer(1500, e -> ensureTopMostNow());
+            keepTopTimer.setRepeats(true);
+            keepTopTimer.setCoalesce(true);
             setContentPane(contentPanel);
             pack();
         }
@@ -987,6 +1099,7 @@ public class HearingFrame extends JFrame {
             if (getWidth() != w) setSize(w, getHeight());
 
             updatePosition(); // ★位置も更新
+            ensureTopMostNow();
         }
 
         private String ellipsizeToFit(String s, FontMetrics fm, int maxPx) {
@@ -1013,6 +1126,33 @@ public class HearingFrame extends JFrame {
             pack();
             updatePosition(); // ★showAtBottomLeftから改名された処理を呼ぶ
             setVisible(true);
+            ensureTopMostNow();
+            if (!keepTopTimer.isRunning()) keepTopTimer.start();
+        }
+
+        void hideWindow() {
+            if (!SwingUtilities.isEventDispatchThread()) {
+                SwingUtilities.invokeLater(this::hideWindow);
+                return;
+            }
+            keepTopTimer.stop();
+            setVisible(false);
+        }
+
+        private void ensureTopMostNow() {
+            if (!SwingUtilities.isEventDispatchThread()) {
+                SwingUtilities.invokeLater(this::ensureTopMostNow);
+                return;
+            }
+            if (!isVisible()) return;
+            try {
+                if (isAlwaysOnTop()) {
+                    setAlwaysOnTop(false);
+                }
+                setAlwaysOnTop(true);
+                toFront();
+                repaint();
+            } catch (Exception ignore) {}
         }
 
     }
@@ -1333,3 +1473,5 @@ public class HearingFrame extends JFrame {
         return baos.toByteArray();
     }
 }
+
+

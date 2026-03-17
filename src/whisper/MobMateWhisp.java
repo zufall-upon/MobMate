@@ -51,10 +51,40 @@ public class MobMateWhisp implements NativeKeyListener {
 
     private static final AtomicBoolean shutdownHookOnce = new AtomicBoolean(false);
 
+    // ローカル翻訳
+    private LocalTranslator localTranslator = null;
+    private final Object talkTranslatorLock = new Object();
+    private volatile boolean talkTranslatorInitAttempted = false;
+    private volatile boolean talkTranslatorUnavailableLogged = false;
+    private PostProcessor talkPostProcessor = null;
+    private final Object talkPostProcessorLock = new Object();
+    private volatile boolean talkPostProcessorInitAttempted = false;
+    private final ExecutorService talkTranslateExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "mobmate-talk-translate");
+        t.setDaemon(true);
+        return t;
+    });
+    private static final boolean TALK_PARTIAL_TRANSLATION_ENABLED = false;
+    private final AtomicBoolean talkPartialTranslateBusy = new AtomicBoolean(false);
+    private final AtomicLong talkPartialPreviewSeq = new AtomicLong(0);
+    private static final long TALK_SHORT_REPEAT_SUPPRESS_MS = 2500L;
+    private static final int TALK_SHORT_REPEAT_MAX_CP = 12;
+    private final LinkedHashMap<String, Long> recentTalkShortCaptionMs = new LinkedHashMap<>();
+    private LocalTranslator hearingTranslator = null;
+    private final Object hearingTranslatorLock = new Object();
+    private volatile boolean hearingTranslatorInitAttempted = false;
+    private volatile boolean hearingTranslatorUnavailableLogged = false;
+    private final ExecutorService hearingTranslateExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "mobmate-hearing-translate");
+        t.setDaemon(true);
+        return t;
+    });
+    private final AtomicBoolean hearingTranslateBusy = new AtomicBoolean(false);
     private static final String PREF_WIN_X = "ui.window.x";
     private static final String PREF_WIN_Y = "ui.window.y";
     private static final String PREF_WIN_W = "ui.window.w";
     private static final String PREF_WIN_H = "ui.window.h";
+    static final int DEFAULT_UI_FONT_SIZE = 16;
 
     public static Preferences prefs;
     private String lastOutput = null;
@@ -71,6 +101,8 @@ public class MobMateWhisp implements NativeKeyListener {
     private static LocalMoonshineSTT moonshine;
     // Whisper
     volatile LocalWhisperCPP w;
+    private volatile LocalWhisperCPP moonshineFallbackWhisper;
+    private final Object moonshineFallbackWhisperLock = new Object();
     private volatile LocalWhisperCPP wHearing;
     private final Object hearingWhisperLock = new Object();
     private String model;
@@ -106,7 +138,24 @@ public class MobMateWhisp implements NativeKeyListener {
     private boolean transcribing;
 
     // History
-    public List<String> history = new ArrayList<>();
+    public static final class HistoryEntry {
+        private final String displayText;
+        private final String rawText;
+
+        public HistoryEntry(String displayText, String rawText) {
+            this.displayText = (displayText == null) ? "" : displayText;
+            this.rawText = (rawText == null || rawText.isBlank()) ? this.displayText : rawText;
+        }
+
+        public String displayText() {
+            return displayText;
+        }
+
+        public String rawText() {
+            return rawText;
+        }
+    }
+    public List<HistoryEntry> history = new ArrayList<>();
     private final List<ChangeListener> historyListeners = new ArrayList<>();
 
     // Hotkey for recording
@@ -138,6 +187,9 @@ public class MobMateWhisp implements NativeKeyListener {
     private Timer statusUpdateTimer;   // ステータスバー更新タイマー
     private long recordingStartTime2 = 0; // 録音開始時刻
     private JPanel statusBar;          // ★ステータスバー本体（再構築用）
+    private volatile boolean startupBusy = true;
+    private volatile String startupStatusText = "BOOT";
+    private volatile boolean ignorePreloadPending = false;
 
     private Process psProcess;
     private BufferedWriter psWriter;
@@ -191,6 +243,13 @@ public class MobMateWhisp implements NativeKeyListener {
     /** Moonshine連続無出力カウント（Partial/COMPLETEが来たら0リセット） */
     private volatile int moonshineNoOutputCount = 0;
     private volatile long moonshineLastOutputMs = 0L;
+    private volatile long lastMoonshineOutputUtteranceSeq = -1L;
+    private static final long MOONSHINE_NO_OUTPUT_FALLBACK_WAIT_MS = 650L;
+    private static final long MOONSHINE_CARRY_JOIN_WINDOW_MS = 1800L;
+    private static final int MOONSHINE_CARRY_JOIN_SILENCE_MS = 120;
+    private static final int MOONSHINE_CARRY_MAX_BYTES = 16000 * 2 * 6;
+    private volatile byte[] pendingMoonshineCarryPcm = new byte[0];
+    private volatile long pendingMoonshineCarryAtMs = 0L;
     // ★強制Final直後のfinal-only COMPLETE回収待ち
     private volatile long moonResetDeferredUntilMs = 0L;
     private static final long MOON_FINAL_DRAIN_MS = 220L;
@@ -217,7 +276,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile boolean primeAgain = false;
     // ★VADに入る前の短い笑い声バーストを Moonshine に先行投入するためのカウンタ
     private int preSpeechMoonFeedFrames = 0;
-    private static final int PRE_SPEECH_MOON_FEED_MAX = 4; // 約 4 * 128ms = 512ms まで
+    private static final int PRE_SPEECH_MOON_FEED_MAX = 12; // 約 16 * 128ms = 2048ms まで
 
     // ===== Voiceger HTTP (reuse) =====
     private static final HttpClient VG_HTTP = HttpClient.newBuilder()
@@ -313,7 +372,7 @@ public class MobMateWhisp implements NativeKeyListener {
         this.speakerProfile = new SpeakerProfile(
                 prefs.getInt("speaker.enroll_samples", 5),
                 prefs.getFloat("speaker.threshold_initial", 0.60f),
-                prefs.getFloat("speaker.threshold_target", 0.82f)
+                prefs.getFloat("speaker.threshold_target", prefs.getFloat("speaker.threshold_initial", 0.60f))
         );
         UiText.load(UiLang.resolveUiFile(prefs.get("ui.language", "en")));
         Config.syncAllFromCloud();
@@ -323,7 +382,7 @@ public class MobMateWhisp implements NativeKeyListener {
         this.button = new JButton(UiText.t("ui.main.start"));
         Config.logDebug("Locale=" + java.util.Locale.getDefault() + " / user.language=" + System.getProperty("user.language"));
 
-        int size = prefs.getInt("ui.font.size", 12);
+        int size = prefs.getInt("ui.font.size", DEFAULT_UI_FONT_SIZE);
         applyUIFont(size);
         lowGpuMode = prefs.getBoolean("perf.low_gpu_mode", true);
         useAlternateLaugh = prefs.getBoolean("silence.alternate", false);
@@ -447,6 +506,7 @@ public class MobMateWhisp implements NativeKeyListener {
             } else {
                 Config.log("★RecogEngine = Whisper (Moonshine skip)");
                 this.w = new LocalWhisperCPP(new File(dir, this.model), "");
+                try { this.w.setLanguage(getTalkLanguage()); } catch (Exception ignore) {}
                 Config.log("MobMateWhispTalk using WhisperCPP with " + this.model);
             }
         } else {
@@ -458,24 +518,713 @@ public class MobMateWhisp implements NativeKeyListener {
         if (cur != null) {
             // ★キャッシュでも毎回 prefs を反映（UI変更が即効く）
             try { cur.setLanguage(prefs.get("hearing.lang", "auto")); } catch (Exception ignore) {}
-            try { cur.setHearingTranslateToEn(prefs.getBoolean("hearing.translate_to_en", false)); } catch (Exception ignore) {}
+            try { cur.setHearingTranslateToEn(false); } catch (Exception ignore) {}
             return cur;
         }
         synchronized (hearingWhisperLock) {
             if (wHearing != null) {
                 // ★二重チェック側でも同様に反映
                 try { wHearing.setLanguage(prefs.get("hearing.lang", "auto")); } catch (Exception ignore) {}
-                try { wHearing.setHearingTranslateToEn(prefs.getBoolean("hearing.translate_to_en", false)); } catch (Exception ignore) {}
+                try { wHearing.setHearingTranslateToEn(false); } catch (Exception ignore) {}
                 return wHearing;
             }
             wHearing = new LocalWhisperCPP(new File(this.model_dir, this.model), "Hearing");
             try { wHearing.setLanguage(prefs.get("hearing.lang", "auto")); } catch (Exception ignore) {}
-            try { wHearing.setHearingTranslateToEn(prefs.getBoolean("hearing.translate_to_en", false)); } catch (Exception ignore) {}
+            try { wHearing.setHearingTranslateToEn(false); } catch (Exception ignore) {}
             return wHearing;
         }
     }
-    // Moonshine初期化
 
+    private LocalTranslator getOrCreateTalkTranslator() {
+        synchronized (talkTranslatorLock) {
+            if (localTranslator != null && localTranslator.isLoaded()) {
+                talkTranslatorUnavailableLogged = false;
+                return localTranslator;
+            }
+            if (talkTranslatorInitAttempted) {
+                return null;
+            }
+            talkTranslatorInitAttempted = true;
+            File exeDir = getExeDir();
+            File modelDir = null;
+            LocalTranslator translator = new LocalTranslator(modelDir, 2);
+            if (!translator.load(exeDir)) {
+                return null;
+            }
+            localTranslator = translator;
+            talkTranslatorUnavailableLogged = false;
+            return localTranslator;
+        }
+    }
+
+    private boolean isTalkTranslatorUnavailableForSession() {
+        synchronized (talkTranslatorLock) {
+            boolean unavailable = talkTranslatorInitAttempted
+                    && (localTranslator == null || !localTranslator.isLoaded());
+            if (unavailable && !talkTranslatorUnavailableLogged) {
+                Config.log("[Talk][Translator] disabled for this session because translator init failed");
+                talkTranslatorUnavailableLogged = true;
+            }
+            return unavailable;
+        }
+    }
+
+    public String getTalkTranslateTarget() {
+        String v = "OFF";
+        try {
+            if (prefs != null) v = prefs.get("talk.translate.target", "OFF");
+        } catch (Exception ignore) {}
+        return LanguageOptions.normalizeTranslationTarget(v);
+    }
+
+    public void setTalkTranslateTarget(String target) {
+        target = LanguageOptions.normalizeTranslationTarget(target);
+        try {
+            if (prefs != null) {
+                prefs.put("talk.translate.target", target);
+                try { prefs.sync(); } catch (Exception ignore) {}
+            }
+        } catch (Exception ignore) {}
+        talkPartialPreviewSeq.incrementAndGet();
+        syncVoicegerTtsLangWithTalkOutput();
+        LocalWhisperCPP.markIgnoreDirty();
+        if ("OFF".equals(target)) {
+            synchronized (talkTranslatorLock) {
+                try {
+                    if (localTranslator != null) localTranslator.unload();
+                } catch (Throwable ignore) {}
+                localTranslator = null;
+                talkTranslatorInitAttempted = false;
+                talkTranslatorUnavailableLogged = false;
+            }
+        }
+    }
+
+    public String getTalkOutputLanguage() {
+        String target = getTalkTranslateTarget();
+        if (!"OFF".equals(target)) {
+            return target.toLowerCase(Locale.ROOT);
+        }
+        return getTalkLanguage();
+    }
+
+    private String mapTalkLangToVoicegerPref(String lang) {
+        if (lang == null || lang.isBlank()) return null;
+        String normalized = lang.trim().toLowerCase(Locale.ROOT);
+        return switch (normalized) {
+            case "ja" -> "all_ja";
+            case "en" -> "en";
+            case "zh", "zh-cn", "zh-tw" -> "all_zh";
+            case "ko" -> "all_ko";
+            case "yue" -> "all_yue";
+            default -> null;
+        };
+    }
+
+    private void syncVoicegerTtsLangWithTalkOutput() {
+        String preferred = mapTalkLangToVoicegerPref(getTalkOutputLanguage());
+        if (preferred == null) {
+            Config.logDebug("[Talk][Voiceger] skip sync: unsupported output lang=" + getTalkOutputLanguage());
+            return;
+        }
+        try {
+            if (prefs != null) {
+                String current = prefs.get("voiceger.tts.lang", "all_ja");
+                if (!Objects.equals(current, preferred)) {
+                    prefs.put("voiceger.tts.lang", preferred);
+                    try { prefs.sync(); } catch (Exception ignore) {}
+                    Config.logDebug("[Talk][Voiceger] synced tts lang: " + current + " -> " + preferred);
+                }
+            }
+        } catch (Exception ignore) {}
+        if (settingsCenterFrame != null && settingsCenterFrame.isDisplayable()) {
+            settingsCenterFrame.refreshLinkedSelections();
+        }
+    }
+    public boolean isTalkTranslateEnabled() {
+        return !"OFF".equals(getTalkTranslateTarget());
+    }
+
+    private void preloadIgnoreForLangsIfNeeded(java.util.Collection<String> langs, String ownerTag) {
+        java.util.LinkedHashSet<String> normalizedLangs = new java.util.LinkedHashSet<>();
+        if (langs != null) {
+            for (String lang : langs) {
+                if (lang == null) continue;
+                String normalized = lang.trim().toLowerCase(Locale.ROOT);
+                if (normalized.isBlank() || "auto".equals(normalized)) continue;
+                normalizedLangs.add(normalized);
+            }
+        }
+        if (normalizedLangs.isEmpty()) {
+            return;
+        }
+        ignorePreloadPending = true;
+        updateIcon();
+        try {
+            LocalWhisperCPP.preloadIgnoreWordsForLangs(normalizedLangs);
+        } catch (Throwable t) {
+            Config.logError("[Ignore] preload failed (" + ownerTag + ")", t);
+        } finally {
+            ignorePreloadPending = false;
+            updateIcon();
+        }
+    }
+
+    public void preloadIgnoreForTalkStartIfNeeded() {
+        if (!isTalkTranslateEnabled()) {
+            return;
+        }
+        preloadIgnoreForLangsIfNeeded(java.util.Collections.singletonList(getTalkLanguage()), "talk");
+    }
+
+    public void preloadIgnoreForHearingStartIfNeeded() {
+        if (!isHearingTranslateEnabled()) {
+            return;
+        }
+        preloadIgnoreForLangsIfNeeded(java.util.Collections.singletonList(getHearingSourceLang()), "hearing");
+    }
+
+    public String[] getTalkLanguageOptions() {
+        if (!isEngineMoonshine()) {
+            return LanguageOptions.whisperLangs();
+        }
+        LinkedHashMap<String, File> modelMap = scanMoonshineModelMap();
+        if (modelMap.isEmpty()) {
+            return new String[]{"ja"};
+        }
+        return modelMap.keySet().toArray(new String[0]);
+    }
+
+    private static String normalizeDynamicLanguage(String value, String[] allowed, String fallback) {
+        String normalizedFallback = (fallback == null || fallback.isBlank()) ? "auto" : fallback.trim().toLowerCase(Locale.ROOT);
+        Set<String> allowedSet = new LinkedHashSet<>();
+        if (allowed != null) {
+            for (String s : allowed) {
+                if (s != null && !s.isBlank()) {
+                    allowedSet.add(s.trim().toLowerCase(Locale.ROOT));
+                }
+            }
+        }
+        if (!allowedSet.contains(normalizedFallback) && !allowedSet.isEmpty()) {
+            normalizedFallback = allowedSet.iterator().next();
+        }
+        if (value == null || value.isBlank()) {
+            return normalizedFallback;
+        }
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        return allowedSet.contains(normalized) ? normalized : normalizedFallback;
+    }
+
+    private String resolveMoonshineLanguageKey(LinkedHashMap<String, File> modelMap) {
+        String savedPath = "";
+        try {
+            if (prefs != null) savedPath = prefs.get("moonshine.model_path", "");
+        } catch (Exception ignore) {}
+        String key = findMoonshineModelKey(savedPath, modelMap);
+        if (key != null && !key.isBlank()) {
+            return key.trim().toLowerCase(Locale.ROOT);
+        }
+        if (!modelMap.isEmpty()) {
+            return modelMap.keySet().iterator().next().trim().toLowerCase(Locale.ROOT);
+        }
+        return "ja";
+    }
+
+    public String getTalkLanguage() {
+        String saved = "";
+        try {
+            if (prefs != null) saved = prefs.get("talk.lang", "");
+        } catch (Exception ignore) {}
+        if (isEngineMoonshine()) {
+            LinkedHashMap<String, File> modelMap = scanMoonshineModelMap();
+            String fallback = resolveMoonshineLanguageKey(modelMap);
+            return normalizeDynamicLanguage(saved, getTalkLanguageOptions(), fallback);
+        }
+        String fallback = LanguageOptions.normalizeWhisperLang(Config.loadSetting("language", "auto"), "auto");
+        String source = (saved == null || saved.isBlank()) ? fallback : saved;
+        return LanguageOptions.normalizeWhisperLang(source, fallback);
+    }
+
+    public boolean applyTalkLanguageSelection(String requestedLang) {
+        if (isEngineMoonshine()) {
+            LinkedHashMap<String, File> modelMap = scanMoonshineModelMap();
+            String lang = normalizeDynamicLanguage(requestedLang, getTalkLanguageOptions(), resolveMoonshineLanguageKey(modelMap));
+            File modelDir = modelMap.get(lang);
+            if (modelDir == null) {
+                return false;
+            }
+            try {
+                if (prefs != null) {
+                    prefs.put("talk.lang", lang);
+                    prefs.put("moonshine.model_path", modelDir.getAbsolutePath());
+                    try { prefs.sync(); } catch (Exception ignore) {}
+                }
+            } catch (Exception ignore) {}
+            upsertOutttsKey("language", lang);
+            syncVoicegerTtsLangWithTalkOutput();
+            return true;
+        }
+
+        String lang = LanguageOptions.normalizeWhisperLang(requestedLang, getTalkLanguage());
+        try {
+            if (prefs != null) {
+                prefs.put("talk.lang", lang);
+                try { prefs.sync(); } catch (Exception ignore) {}
+            }
+        } catch (Exception ignore) {}
+        upsertOutttsKey("language", lang);
+        try {
+            if (w != null) w.setLanguage(lang);
+        } catch (Exception ignore) {}
+        syncVoicegerTtsLangWithTalkOutput();
+        LocalWhisperCPP.markIgnoreDirty();
+        return true;
+    }
+
+    public boolean requestTalkLanguageChange(Component parent, String requestedLang) {
+        String current = getTalkLanguage();
+        String next = isEngineMoonshine()
+                ? normalizeDynamicLanguage(requestedLang, getTalkLanguageOptions(), current)
+                : LanguageOptions.normalizeWhisperLang(requestedLang, current);
+        if (Objects.equals(current, next)) {
+            return true;
+        }
+        String engineName = isEngineMoonshine() ? "Moonshine" : "Whisper";
+        int result = JOptionPane.showConfirmDialog(
+                parent,
+                "Changing Talk language for " + engineName + " requires a soft restart.\nApply this change now?",
+                "MobMate",
+                JOptionPane.OK_CANCEL_OPTION,
+                JOptionPane.PLAIN_MESSAGE
+        );
+        if (result != JOptionPane.OK_OPTION) {
+            return false;
+        }
+        if (!applyTalkLanguageSelection(next)) {
+            JOptionPane.showMessageDialog(
+                    parent,
+                    "Failed to apply Talk language: " + next,
+                    "MobMate",
+                    JOptionPane.WARNING_MESSAGE
+            );
+            return false;
+        }
+        softRestart();
+        return true;
+    }
+
+    private void upsertOutttsKey(String key, String value) {
+        try {
+            if (value == null) value = "";
+            Path file = Path.of(System.getProperty("user.dir"), "_outtts.txt");
+            List<String> lines = Files.exists(file)
+                    ? new ArrayList<>(Files.readAllLines(file, StandardCharsets.UTF_8))
+                    : new ArrayList<>();
+            int markerIndex = -1;
+            int keyIndex = -1;
+            for (int i = 0; i < lines.size(); i++) {
+                String line = lines.get(i);
+                if (line.contains("↑Settings↓Logs below")) {
+                    markerIndex = i;
+                    break;
+                }
+                if (line.startsWith(key + "=")) {
+                    keyIndex = i;
+                }
+            }
+            String newLine = key + "=" + value;
+            if (keyIndex >= 0) {
+                lines.set(keyIndex, newLine);
+            } else if (markerIndex >= 0) {
+                lines.add(markerIndex, newLine);
+            } else {
+                lines.add(newLine);
+            }
+            Files.write(file, lines, StandardCharsets.UTF_8);
+            try { Config.reload(); } catch (Exception ignore) {}
+        } catch (Exception ex) {
+            Config.logDebug("[Talk] failed to update _outtts key " + key + ": " + ex.getMessage());
+        }
+    }
+
+    private String getTalkSourceLang() {
+        String sourceLang = getTalkLanguage();
+        if (sourceLang == null) {
+            return "auto";
+        }
+        return sourceLang.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private String translateTalkTextNow(String text, String sourceLang, String targetLang) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        if (sourceLang == null || sourceLang.isBlank() || "auto".equalsIgnoreCase(sourceLang)) {
+            return null;
+        }
+        if (targetLang == null || targetLang.isBlank() || sourceLang.equalsIgnoreCase(targetLang)) {
+            return null;
+        }
+        synchronized (talkTranslatorLock) {
+            LocalTranslator translator = getOrCreateTalkTranslator();
+            if (translator == null || !translator.isLoaded()) {
+                return null;
+            }
+            String translated = translator.translate(text, sourceLang, targetLang);
+            if (translated == null) {
+                return null;
+            }
+            translated = translated.trim();
+            if (translated.isEmpty() || translated.equals(text.trim())) {
+                return null;
+            }
+            return translated;
+        }
+    }
+
+    private record TalkTextResult(String outputText, String historyText, String translatedText) {}
+
+    private TalkTextResult buildTalkTextResult(String originalText) {
+        String original = (originalText == null) ? "" : originalText.trim();
+        if (original.isEmpty()) {
+            return new TalkTextResult("", "", null);
+        }
+        String normalized = applyTalkPostProcess(original);
+        String translated = null;
+        String targetLang = getTalkTranslateTarget();
+        String sourceLang = getTalkSourceLang();
+        if (!"OFF".equals(targetLang) && !sourceLang.isBlank() && !"auto".equals(sourceLang)) {
+            translated = translateTalkTextNow(normalized, sourceLang, targetLang.toLowerCase(Locale.ROOT));
+        }
+        String output = (translated == null || translated.isBlank()) ? normalized : translated;
+        return new TalkTextResult(output, buildTranslatedCaption(normalized, translated), translated);
+    }
+
+    private PostProcessor getOrCreateTalkPostProcessor() {
+        synchronized (talkPostProcessorLock) {
+            if (talkPostProcessor != null && talkPostProcessor.isLoaded()) {
+                return talkPostProcessor;
+            }
+            if (talkPostProcessorInitAttempted) {
+                return null;
+            }
+            talkPostProcessorInitAttempted = true;
+            File exeDir = getExeDir();
+            File modelDir = new File(exeDir, "models" + File.separator + "mt5_onnx_int8");
+            PostProcessor processor = new PostProcessor(modelDir);
+            if (!processor.load(exeDir)) {
+                return null;
+            }
+            talkPostProcessor = processor;
+            return talkPostProcessor;
+        }
+    }
+
+    private String applyTalkPostProcess(String originalText) {
+        String original = (originalText == null) ? "" : originalText.trim();
+        if (original.isEmpty()) {
+            lastLatPostProcessMs.set(-1);
+            return original;
+        }
+        if (!TALK_POST_PROCESS_ENABLED) {
+            lastLatPostProcessMs.set(-1);
+            return original;
+        }
+        String promptLanguage = getTalkOutputLanguage();
+        try {
+            PostProcessor processor = getOrCreateTalkPostProcessor();
+            if (processor == null || !processor.isLoaded()) {
+                lastLatPostProcessMs.set(-1);
+                return original;
+            }
+            PostProcessor.ProcessResult result = processor.process(original, promptLanguage);
+            if (result == null) {
+                lastLatPostProcessMs.set(-1);
+                return original;
+            }
+            lastLatPostProcessMs.set(result.elapsedMs());
+            String processed = result.text();
+            return (processed == null || processed.isBlank()) ? original : processed.trim();
+        } catch (Throwable t) {
+            lastLatPostProcessMs.set(-1);
+            Config.logError("[Talk][PostProcessor] failed", t);
+            return original;
+        }
+    }
+
+    private void unloadTalkPostProcessor() {
+        synchronized (talkPostProcessorLock) {
+            try {
+                if (talkPostProcessor != null) {
+                    talkPostProcessor.unload();
+                }
+            } catch (Throwable ignore) {
+            } finally {
+                talkPostProcessor = null;
+                talkPostProcessorInitAttempted = false;
+            }
+        }
+    }
+
+    public void speakTalkTextForUi(String originalText) {
+        String original = (originalText == null) ? "" : originalText.trim();
+        if (original.isEmpty()) return;
+        TalkTextResult talkText = buildTalkTextResult(original);
+        String out = (talkText.outputText() == null || talkText.outputText().isBlank()) ? original : talkText.outputText();
+        String historyText = (talkText.historyText() == null || talkText.historyText().isBlank()) ? original : talkText.historyText();
+        speak(out);
+        String finalHistoryText = historyText;
+        SwingUtilities.invokeLater(() -> addHistory(finalHistoryText));
+        Config.appendOutTts(out);
+        Config.logDebug("speak(radio/ui): " + out);
+    }
+
+    public String buildTranslatedCaption(String originalText, String translatedText) {
+        if (translatedText == null || translatedText.isBlank()) {
+            return originalText;
+        }
+        String original = (originalText == null) ? "" : originalText.trim();
+        String translated = translatedText.trim();
+        if (original.isEmpty()) {
+            return translated;
+        }
+        return translated + " (" + original + ")";
+    }
+
+    private static String normalizeTalkShortCaptionKey(String text) {
+        if (text == null) return "";
+        String s = text.trim().toLowerCase(Locale.ROOT);
+        s = s.replaceAll("[\\s\\p{Punct}、。！？「」『』（）()\\[\\]{}【】…・~〜ー]+", "");
+        return s;
+    }
+
+    private boolean shouldSuppressTalkPartialPreview(String text) {
+        String normalized = normalizeTalkShortCaptionKey(text);
+        if (normalized.isEmpty()) return false;
+        int cp = normalized.codePointCount(0, normalized.length());
+        if (cp <= 0 || cp > TALK_SHORT_REPEAT_MAX_CP) return false;
+
+        long now = System.currentTimeMillis();
+        synchronized (recentTalkShortCaptionMs) {
+            recentTalkShortCaptionMs.entrySet().removeIf(e -> now - e.getValue() > TALK_SHORT_REPEAT_SUPPRESS_MS);
+            Long prev = recentTalkShortCaptionMs.get(normalized);
+            recentTalkShortCaptionMs.put(normalized, now);
+            if (prev != null && now - prev <= TALK_SHORT_REPEAT_SUPPRESS_MS) {
+                Config.logDebug("[Talk][Filter] suppress short repeated preview: " + text);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void updateTalkPartialPreview(String text) {
+        long seq = talkPartialPreviewSeq.incrementAndGet();
+        if (historyFrame == null) {
+            return;
+        }
+        if (text == null || text.isBlank()) {
+            historyFrame.setPartialPreview("");
+            return;
+        }
+        final String original = text.trim();
+        if (shouldSuppressTalkPartialPreview(original)) {
+            historyFrame.setPartialPreview("");
+            return;
+        }
+        historyFrame.setPartialPreview(original);
+
+        String targetLang = getTalkTranslateTarget();
+        String sourceLang = getTalkSourceLang();
+        if ("OFF".equals(targetLang) || sourceLang.isBlank() || "auto".equals(sourceLang) || sourceLang.equalsIgnoreCase(targetLang)) {
+            return;
+        }
+        if (!TALK_PARTIAL_TRANSLATION_ENABLED) {
+            return;
+        }
+        if (isTalkTranslatorUnavailableForSession()) {
+            return;
+        }
+        if (!talkPartialTranslateBusy.compareAndSet(false, true)) {
+            Config.logDebug("[Talk][Translator] skip partial because previous async translation is still running");
+            return;
+        }
+        Config.logDebug("[Talk][Translator] partial async start: src=" + sourceLang + " tgt=" + targetLang + " text=" + original);
+        talkTranslateExecutor.execute(() -> {
+            try {
+                String translated = translateTalkTextNow(original, sourceLang, targetLang.toLowerCase(Locale.ROOT));
+                Config.logDebug("[Talk][Translator] partial async done: " + ((translated == null) ? "<null>" : translated));
+                if (translated != null && !translated.isBlank() && talkPartialPreviewSeq.get() == seq && historyFrame != null) {
+                    String caption = buildTranslatedCaption(original, translated);
+                    if (!shouldSuppressTalkPartialPreview(caption)) {
+                        historyFrame.setPartialPreview(caption);
+                    }
+                }
+            } catch (Throwable t) {
+                Config.logError("[Talk][Translator] partial async translate failed", t);
+            } finally {
+                talkPartialTranslateBusy.set(false);
+            }
+        });
+    }
+    private LocalTranslator getOrCreateHearingTranslator() {
+        synchronized (hearingTranslatorLock) {
+            if (hearingTranslator != null && hearingTranslator.isLoaded()) {
+                hearingTranslatorUnavailableLogged = false;
+                return hearingTranslator;
+            }
+            if (hearingTranslatorInitAttempted) {
+                return null;
+            }
+            hearingTranslatorInitAttempted = true;
+            File exeDir = getExeDir();
+            File modelDir = null;
+            LocalTranslator translator = new LocalTranslator(modelDir, 2);
+            if (!translator.load(exeDir)) {
+                return null;
+            }
+            hearingTranslator = translator;
+            hearingTranslatorUnavailableLogged = false;
+            return hearingTranslator;
+        }
+    }
+
+    private boolean isHearingTranslatorUnavailableForSession() {
+        synchronized (hearingTranslatorLock) {
+            boolean unavailable = hearingTranslatorInitAttempted
+                    && (hearingTranslator == null || !hearingTranslator.isLoaded());
+            if (unavailable && !hearingTranslatorUnavailableLogged) {
+                Config.log("[Hearing][Translator] disabled for this session because translator init failed");
+                hearingTranslatorUnavailableLogged = true;
+            }
+            return unavailable;
+        }
+    }
+
+    public String getHearingTranslateTarget() {
+        String v = "OFF";
+        try {
+            if (prefs != null) v = prefs.get("hearing.translate.target", "");
+        } catch (Exception ignore) {}
+        if (v == null || v.isBlank()) {
+            boolean legacy = false;
+            try { if (prefs != null) legacy = prefs.getBoolean("hearing.translate_to_en", false); } catch (Exception ignore) {}
+            v = legacy ? "EN" : "OFF";
+        }
+        v = LanguageOptions.normalizeTranslationTarget(v);
+        return v;
+    }
+
+    private String getHearingSourceLang() {
+        String sourceLang = "auto";
+        try {
+            if (prefs != null) sourceLang = prefs.get("hearing.lang", "auto");
+        } catch (Exception ignore) {}
+        if (sourceLang == null) {
+            return "auto";
+        }
+        return sourceLang.trim().toLowerCase(Locale.ROOT);
+    }
+
+    private String translateHearingTextNow(String text, String sourceLang, String targetLang) {
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        synchronized (hearingTranslatorLock) {
+            LocalTranslator translator = getOrCreateHearingTranslator();
+            if (translator == null || !translator.isLoaded()) {
+                return null;
+            }
+            String translated = translator.translate(text, sourceLang, targetLang);
+            if (translated == null) {
+                return null;
+            }
+            translated = translated.trim();
+            if (translated.isEmpty() || translated.equals(text.trim())) {
+                return null;
+            }
+            return translated;
+        }
+    }
+
+    public void translateHearingTextAsync(String text, java.util.function.Consumer<String> onTranslated) {
+        if (text == null || text.isBlank() || onTranslated == null) {
+            return;
+        }
+        String targetLang = getHearingTranslateTarget();
+        if ("OFF".equals(targetLang)) {
+            return;
+        }
+        String sourceLang = getHearingSourceLang();
+        if (sourceLang.isBlank() || "auto".equals(sourceLang)) {
+            Config.logDebug("[Hearing][Translator] skip because source language is auto");
+            return;
+        }
+        if (isHearingTranslatorUnavailableForSession()) {
+            return;
+        }
+        if (!hearingTranslateBusy.compareAndSet(false, true)) {
+            Config.logDebug("[Hearing][Translator] skip because previous async translation is still running");
+            return;
+        }
+        Config.logDebug("[Hearing][Translator] async start: src=" + sourceLang + " tgt=" + targetLang + " text=" + text);
+        hearingTranslateExecutor.execute(() -> {
+            try {
+                String translated = translateHearingTextNow(
+                        text,
+                        sourceLang,
+                        targetLang.toLowerCase(Locale.ROOT)
+                );
+                Config.logDebug("[Hearing][Translator] async done: " + ((translated == null) ? "<null>" : translated));
+                if (translated != null && !translated.isBlank()) {
+                    onTranslated.accept(translated);
+                }
+                if (translated == null || translated.isBlank()) {
+                    Config.logDebug("[Hearing][Translator] async no update");
+                }
+            } catch (Throwable t) {
+                Config.logError("[Hearing][Translator] async translate failed", t);
+            } finally {
+                hearingTranslateBusy.set(false);
+            }
+        });
+    }
+
+    public boolean isHearingTranslateEnabled() {
+        return !"OFF".equals(getHearingTranslateTarget());
+    }
+
+    public String buildHearingTranslatedCaption(String originalText, String translatedText) {
+        if (translatedText == null || translatedText.isBlank()) {
+            return originalText;
+        }
+        String original = (originalText == null) ? "" : originalText.trim();
+        String translated = translatedText.trim();
+        if (original.isEmpty()) {
+            return translated;
+        }
+        return translated + " (" + original + ")";
+    }
+
+
+    // 翻訳モデル初期化
+    private void initTranslator() {
+        if (localTranslator != null && localTranslator.isLoaded()) {
+            return;
+        }
+        File exeDir = getExeDir();
+        File modelDir = null;
+        LocalTranslator translator = new LocalTranslator(modelDir, 2);
+        if (translator.load(exeDir)) {
+            localTranslator = translator;
+            talkTranslatorInitAttempted = true;
+            talkTranslatorUnavailableLogged = false;
+        } else {
+            localTranslator = null;
+            talkTranslatorInitAttempted = true;
+        }
+    }
+
+    // Moonshine初期化
     private void initMoonshine() {
         //TODO test
 //        String path = "M:\\_work\\moonshine\\_model\\base-ja\\quantized\\base-ja";
@@ -493,6 +1242,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 // Whisperにフォールバック
                 try {
                     this.w = new LocalWhisperCPP(new File(model_dir, this.model), "");
+                    try { this.w.setLanguage(getTalkLanguage()); } catch (Exception ignore) {}
                     Config.log("[Moonshine] fallback: Whisper loaded OK");
                 } catch (Exception ex) {
                     Config.logError("[Moonshine] fallback: Whisper load FAILED", ex);
@@ -558,17 +1308,6 @@ public class MobMateWhisp implements NativeKeyListener {
             return;
         }
 
-        // ★アクション解決
-        final String strAction = prefs.get("action", "nothing");
-        Action action;
-        if ("paste".equals(strAction)) {
-            action = Action.COPY_TO_CLIPBOARD_AND_PASTE;
-        } else if ("type".equals(strAction)) {
-            action = Action.TYPE_STRING;
-        } else {
-            action = Action.NOTHING;
-        }
-
         // ★v1.5.0: onPartial → UIタイトル更新 + lastPartialResult更新
         moonshine.setOnPartial(text -> {
             if (text == null || text.isBlank()) return;
@@ -576,6 +1315,7 @@ public class MobMateWhisp implements NativeKeyListener {
             long nowMs = System.currentTimeMillis();
             moonshineNoOutputCount = 0;   // 出力ありでリセット
             moonshineLastOutputMs = nowMs;
+            lastMoonshineOutputUtteranceSeq = currentUtteranceSeq;
 
             String trimmed = text.trim();
             trimmed = removeCjkSpaces(trimmed);  // ★v1.5.0: CJK間スペース除去
@@ -598,13 +1338,17 @@ public class MobMateWhisp implements NativeKeyListener {
                 clamped = clamped.substring(0, 100) + "…";
             }
             markFirstPartialNow(nowMs);
-            MobMateWhisp.setLastPartial(clamped);
+            String bestPartial = choosePreferredUtteranceText(MobMateWhisp.getLastPartial(), clamped);
+            MobMateWhisp.setLastPartial(bestPartial);
             lastPartialUpdateMs = nowMs;
             setTranscribing(true);  // ★ADD: partial到達時にtranscribing開始（全フレームではなく）
-            Config.logDebug("★Partial: " + clamped);
-            final String forUi = clamped;
+            if (!bestPartial.equals(clamped)) {
+                Config.logDebug("★Partial merged: new=[" + clamped + "] keep=[" + bestPartial + "]");
+            }
+            Config.logDebug("★Partial: " + bestPartial);
+            final String forUi = bestPartial;
             // ★ADD: HistoryFrameにpartialをリアルタイム表示
-            if (historyFrame != null) historyFrame.setPartialPreview(clamped);
+            updateTalkPartialPreview(bestPartial);
             SwingUtilities.invokeLater(() -> {
                 if (window != null) {
                     window.setTitle("[TRANS]:" + forUi);
@@ -620,6 +1364,7 @@ public class MobMateWhisp implements NativeKeyListener {
             long nowMs = System.currentTimeMillis();
             moonshineNoOutputCount = 0;   // 出力ありでリセット
             moonshineLastOutputMs = nowMs;
+            lastMoonshineOutputUtteranceSeq = currentUtteranceSeq;
 
             String trimmed = text.trim();
             trimmed = removeCjkSpaces(trimmed);
@@ -629,34 +1374,57 @@ public class MobMateWhisp implements NativeKeyListener {
             }
             setTranscribing(false);
             // ★ADD: COMPLETE確定時にpartialプレビューをクリア
-            if (historyFrame != null) historyFrame.setPartialPreview("");
+            updateTalkPartialPreview("");
 
             if (isSpeaking) {
-                // ★COMPLETEをpartialとして保持（VAD Finalブロックのrescue経路用）
-                MobMateWhisp.setLastPartial(trimmed);
-                lastPartialUpdateMs = nowMs; // ★FIX: rescueのstale判定を正確化
-                if (containsLaughTokenByConfig(trimmed)) {
+                // ★発話中の COMPLETE は「候補保存だけ」にする
+                //   rescue の stale clock と trans 状態は partial 側に任せる
+                String best = cacheMoonshineCompleteCandidate(currentUtteranceSeq, trimmed);
+
+                // ★重要:
+                // lastPartial は更新してよいが、lastPartialUpdateMs は触らない
+                // setTranscribing(true) もしない
+                String cur = MobMateWhisp.getLastPartial();
+                if (cur == null || !best.equals(cur.trim())) {
+                    MobMateWhisp.setLastPartial(best);
+                    updateTalkPartialPreview(best);
+                }
+
+                if (containsLaughTokenByConfig(best)) {
                     laughPartialCount = 0;
                     lastLaughPartialMs = 0;
                 }
-                // ★FIX: isSpeaking=trueでも直接handleFinalTextを呼ぶ（400ms pollのレース条件対策）
-                // VAD FinalブロックはlastSpeakStrの重複チェックで二重発声を防ぐ
-                handleFinalText(trimmed, action, false);
+
+                Config.logDebug("★Moon COMPLETE cached only (speaking): " + best);
                 return;
             }
 
             // isSpeaking=false（VADがFinal処理済み or 無音確定後）
+            setTranscribing(false);
+            updateTalkPartialPreview("");
+
+            long uttSeq = currentUtteranceSeq;
+            if (shouldSuppressMoonshineComplete(trimmed, uttSeq)) {
+                MobMateWhisp.setLastPartial("");
+                clearMoonshineCompleteCandidate(uttSeq);
+                return;
+            }
+
+            String cached = consumeMoonshineCompleteCandidate(uttSeq);
+            String candidate = combineCompleteSegments(cached, trimmed);
             String lastP = MobMateWhisp.getLastPartial();
             boolean partialExtendsComplete = lastP != null && !lastP.isBlank()
-                    && lastP.startsWith(trimmed)
-                    && lastP.length() > trimmed.length();
+                    && lastP.startsWith(candidate)
+                    && lastP.length() > candidate.length();
+
             if (partialExtendsComplete) {
                 Config.logDebug("★Instant FINAL (partial extends complete): " + lastP);
-                handleFinalText(lastP, action, true);
+                handleFinalText(lastP, getActionFromPrefs(), true);
             } else {
-                handleFinalText(trimmed, action, false);
+                handleFinalText(candidate, getActionFromPrefs(), false);
             }
             MobMateWhisp.setLastPartial("");
+            clearMoonshineCompleteCandidate(uttSeq);
         });
 
         moonshine.start();
@@ -675,6 +1443,309 @@ public class MobMateWhisp implements NativeKeyListener {
                 moonshine = null;
             }
         }
+    }
+    private String normForNearDup(String s) {
+        if (s == null) return "";
+        s = removeCjkSpaces(s);
+        s = s.replaceAll("[\\p{Punct}、。！？「」（）\\[\\]{}]", "");
+        s = s.replaceAll("\\s+", "");
+        return s.trim().toLowerCase(Locale.ROOT);
+    }
+    private boolean areUtteranceVariants(String current, String candidate) {
+        String curNorm = normForNearDup(current);
+        String candNorm = normForNearDup(candidate);
+        if (curNorm.isEmpty() || candNorm.isEmpty()) return false;
+        if (curNorm.equals(candNorm)) return true;
+        if (candNorm.startsWith(curNorm) || curNorm.startsWith(candNorm)) return true;
+        if (candNorm.endsWith(curNorm) || curNorm.endsWith(candNorm)) return true;
+        return similarityRatio(curNorm, candNorm) >= 0.88;
+    }
+    private boolean shouldInsertSegmentSpace(String left, String right) {
+        if (left == null || right == null) return false;
+        if (left.isEmpty() || right.isEmpty()) return false;
+        char lc = left.charAt(left.length() - 1);
+        char rc = right.charAt(0);
+        Character.UnicodeScript ls = Character.UnicodeScript.of(lc);
+        Character.UnicodeScript rs = Character.UnicodeScript.of(rc);
+        boolean leftCjk = ls == Character.UnicodeScript.HAN
+                || ls == Character.UnicodeScript.HIRAGANA
+                || ls == Character.UnicodeScript.KATAKANA
+                || ls == Character.UnicodeScript.HANGUL;
+        boolean rightCjk = rs == Character.UnicodeScript.HAN
+                || rs == Character.UnicodeScript.HIRAGANA
+                || rs == Character.UnicodeScript.KATAKANA
+                || rs == Character.UnicodeScript.HANGUL;
+        return !leftCjk && !rightCjk;
+    }
+    private boolean endsWithSentencePunctuation(String text) {
+        if (text == null || text.isEmpty()) return false;
+        char c = text.charAt(text.length() - 1);
+        return c == '。' || c == '！' || c == '!' || c == '？' || c == '?' || c == '.' || c == '…';
+    }
+    private boolean containsClausePunctuation(String text) {
+        if (text == null || text.isEmpty()) return false;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '、' || c == '，' || c == ',' || c == '；' || c == ';' || c == '：' || c == ':') {
+                return true;
+            }
+        }
+        return false;
+    }
+    private boolean looksSuspiciousShortComplete(String text) {
+        if (text == null) return false;
+        String s = removeCjkSpaces(text).trim();
+        if (s.isEmpty()) return false;
+        int cp = s.codePointCount(0, s.length());
+        boolean hasDigit = false;
+        boolean hasReplacement = s.contains("??") || s.indexOf('\uFFFD') >= 0;
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (Character.isDigit(c)) {
+                hasDigit = true;
+                break;
+            }
+        }
+        char first = s.charAt(0);
+        boolean oddStart = Character.isDigit(first)
+                || first == '「'
+                || first == '」'
+                || first == '?'
+                || first == '？';
+        return hasReplacement || ((hasDigit || oddStart) && cp <= 12);
+    }
+    private boolean shouldPreferLastPartialOverComplete(String partial, String complete) {
+        String p = (partial == null) ? "" : removeCjkSpaces(partial).trim();
+        String c = (complete == null) ? "" : removeCjkSpaces(complete).trim();
+        if (p.isEmpty() || c.isEmpty()) return false;
+        if (looksSuspiciousShortComplete(p)) return false;
+        String pn = normForNearDup(p);
+        String cn = normForNearDup(c);
+        if (pn.isEmpty() || cn.isEmpty()) return false;
+        int pCp = p.codePointCount(0, p.length());
+        int cCp = c.codePointCount(0, c.length());
+        if (pCp + 1 < cCp) return false;
+        if ((pCp - cCp) > 4) return false;
+        if (pn.equals(cn)) return true;
+        if (pn.endsWith(cn) || cn.endsWith(pn)) return pCp >= cCp;
+        double sim = similarityRatio(pn, cn);
+        if (sim >= 0.88 && pCp >= cCp) return true;
+        return sim >= 0.83 && pCp > cCp;
+    }
+    private boolean shouldAppendCompleteSegment(String current, String candidate) {
+        String cur = (current == null) ? "" : removeCjkSpaces(current).trim();
+        String cand = (candidate == null) ? "" : removeCjkSpaces(candidate).trim();
+        if (cur.isEmpty() || cand.isEmpty()) return true;
+        if (areUtteranceVariants(cur, cand)) return true;
+
+        int curCp = cur.codePointCount(0, cur.length());
+        int candCp = cand.codePointCount(0, cand.length());
+        if (candCp <= 4 && !endsWithSentencePunctuation(cand)) return false;
+        if (curCp >= 14) return false;
+        if (containsClausePunctuation(cand) && candCp >= 6) return true;
+        if (endsWithSentencePunctuation(cur) && endsWithSentencePunctuation(cand) && curCp <= 10 && candCp >= 5) return true;
+        if (endsWithSentencePunctuation(cur) && candCp >= 6) return true;
+        return curCp <= 8 && candCp >= 8;
+    }
+    private String appendUtteranceSegment(String current, String candidate) {
+        String cur = (current == null) ? "" : removeCjkSpaces(current).trim();
+        String cand = (candidate == null) ? "" : removeCjkSpaces(candidate).trim();
+        if (cur.isEmpty()) return cand;
+        if (cand.isEmpty()) return cur;
+        if (areUtteranceVariants(cur, cand)) {
+            return choosePreferredUtteranceText(cur, cand);
+        }
+        String sep = shouldInsertSegmentSpace(cur, cand) ? " " : "";
+        return cur + sep + cand;
+    }
+    private String combineCompleteSegments(String current, String candidate) {
+        String cur = (current == null) ? "" : removeCjkSpaces(current).trim();
+        String cand = (candidate == null) ? "" : removeCjkSpaces(candidate).trim();
+        if (cur.isEmpty()) return cand;
+        if (cand.isEmpty()) return cur;
+        if (looksSuspiciousShortComplete(cur) && !looksSuspiciousShortComplete(cand)) {
+            return cand;
+        }
+        if (!looksSuspiciousShortComplete(cur) && looksSuspiciousShortComplete(cand)) {
+            return cur;
+        }
+        if (areUtteranceVariants(cur, cand)) {
+            return choosePreferredUtteranceText(cur, cand);
+        }
+        if (!shouldAppendCompleteSegment(cur, cand)) {
+            // Distinct complete sentences in the same utterance sequence should stay together.
+            // Replacing here made "直した。送った。" collapse to only the latter sentence too often.
+            if (endsWithSentencePunctuation(cur)
+                    && endsWithSentencePunctuation(cand)
+                    && !areUtteranceVariants(cur, cand)) {
+                return appendUtteranceSegment(cur, cand);
+            }
+            return cur;
+        }
+        return appendUtteranceSegment(cur, cand);
+    }
+    private String choosePreferredUtteranceText(String current, String candidate) {
+        String cur = (current == null) ? "" : removeCjkSpaces(current).trim();
+        String cand = (candidate == null) ? "" : removeCjkSpaces(candidate).trim();
+        if (cur.isEmpty()) return cand;
+        if (cand.isEmpty()) return cur;
+        if (cur.equals(cand)) return cand;
+
+        String curNorm = normForNearDup(cur);
+        String candNorm = normForNearDup(cand);
+        if (curNorm.isEmpty()) return cand;
+        if (candNorm.isEmpty()) return cur;
+        if (curNorm.equals(candNorm)) {
+            return (cand.length() >= cur.length()) ? cand : cur;
+        }
+        if (candNorm.startsWith(curNorm)) return cand;
+        if (curNorm.startsWith(candNorm)) {
+            return ((curNorm.length() - candNorm.length()) <= 2) ? cur : cand;
+        }
+        if (curNorm.endsWith(candNorm)) {
+            return (candNorm.length() <= 4) ? cur : cand;
+        }
+        if (candNorm.endsWith(curNorm)) {
+            return ((candNorm.length() - curNorm.length()) <= 2) ? cur : cand;
+        }
+
+        double sim = similarityRatio(curNorm, candNorm);
+        if (sim >= 0.88 && Math.abs(candNorm.length() - curNorm.length()) <= 1) {
+            if (endsWithSentencePunctuation(cur) && !endsWithSentencePunctuation(cand)) return cur;
+            return cur;
+        }
+        if (sim >= 0.80) {
+            if (candNorm.length() > curNorm.length() + 1) return cand;
+            return cur;
+        }
+        return cand;
+    }
+    private String cacheMoonshineCompleteCandidate(long utteranceSeq, String text) {
+        if (utteranceSeq <= 0 || text == null || text.isBlank()) return "";
+        String candidate = removeCjkSpaces(text).trim();
+        String lastP = MobMateWhisp.getLastPartial();
+        if (shouldPreferLastPartialOverComplete(lastP, candidate)) {
+            candidate = removeCjkSpaces(lastP).trim();
+        }
+        String best = combineCompleteSegments(pendingMoonshineCompleteText, candidate);
+        pendingMoonshineCompleteUtteranceSeq = utteranceSeq;
+        pendingMoonshineCompleteText = best;
+        return best;
+    }
+    private String consumeMoonshineCompleteCandidate(long utteranceSeq) {
+        if (utteranceSeq <= 0) return "";
+        if (pendingMoonshineCompleteUtteranceSeq != utteranceSeq) return "";
+        String text = pendingMoonshineCompleteText;
+        pendingMoonshineCompleteUtteranceSeq = -1L;
+        pendingMoonshineCompleteText = "";
+        return (text == null) ? "" : text.trim();
+    }
+    private void clearMoonshineCompleteCandidate(long utteranceSeq) {
+        if (utteranceSeq > 0 && pendingMoonshineCompleteUtteranceSeq != utteranceSeq) return;
+        pendingMoonshineCompleteUtteranceSeq = -1L;
+        pendingMoonshineCompleteText = "";
+    }
+    private boolean hasMoonshineOutputForUtterance(long utteranceSeq) {
+        if (utteranceSeq <= 0) return false;
+        if (lastMoonshineOutputUtteranceSeq == utteranceSeq) return true;
+        return pendingMoonshineCompleteUtteranceSeq == utteranceSeq
+                && pendingMoonshineCompleteText != null
+                && !pendingMoonshineCompleteText.isBlank();
+    }
+    private LocalWhisperCPP getOrCreateMoonshineFallbackWhisper() {
+        LocalWhisperCPP cur = moonshineFallbackWhisper;
+        if (cur != null) return cur;
+        synchronized (moonshineFallbackWhisperLock) {
+            cur = moonshineFallbackWhisper;
+            if (cur != null) return cur;
+            if (model_dir == null || model_dir.isBlank() || model == null || model.isBlank()) {
+                Config.logDebug("★Moon fallback Whisper unavailable: model path missing");
+                return null;
+            }
+            try {
+                cur = new LocalWhisperCPP(new File(model_dir, model), "");
+                moonshineFallbackWhisper = cur;
+                Config.logDebug("★Moon fallback Whisper loaded: " + new File(model_dir, model).getAbsolutePath());
+            } catch (Throwable t) {
+                Config.logError("★Moon fallback Whisper load failed", t);
+                return null;
+            }
+            return cur;
+        }
+    }
+    private String runWhisperFallbackForMoonshine(byte[] pcm16le, Action action, boolean commitFinal) {
+        if (pcm16le == null || pcm16le.length == 0) return "";
+        LocalWhisperCPP fallback = getOrCreateMoonshineFallbackWhisper();
+        if (fallback == null) return "";
+        try {
+            String raw = fallback.transcribeRaw(pcm16le, action, this, true);
+            String out = (raw == null) ? "" : raw.trim();
+            if (commitFinal && !out.isBlank()) {
+                Config.logDebug("★Moon no-output fallback -> handleFinalText: " + out);
+                handleFinalText(out, action, true);
+                MobMateWhisp.setLastPartial("");
+            } else if (!out.isBlank()) {
+                Config.logDebug("★Moon no-output fallback raw: " + out);
+            }
+            return out;
+        } catch (Throwable t) {
+            Config.logError("★Moon fallback Whisper transcribe failed", t);
+            return "";
+        }
+    }
+    private void maybeFallbackMoonshineAcceptedUtterance(byte[] pcm16le, Action action, long utteranceSeq) {
+        if (!isEngineMoonshine() || utteranceSeq <= 0 || pcm16le == null || pcm16le.length == 0) return;
+        if (!cliWavTestMode && !prefs.getBoolean("moonshine.no_output_whisper_fallback", false)) {
+            return;
+        }
+        executorService.submit(() -> {
+            try {
+                Thread.sleep(MOONSHINE_NO_OUTPUT_FALLBACK_WAIT_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            if (hasMoonshineOutputForUtterance(utteranceSeq)) return;
+            Config.logDebug("★Moon no-output fallback armed: utt=" + utteranceSeq + " bytes=" + pcm16le.length);
+            runWhisperFallbackForMoonshine(pcm16le, action, true);
+        });
+    }
+    private int levenshtein(String a, String b) {
+        int n = a.length(), m = b.length();
+        if (n == 0) return m;
+        if (m == 0) return n;
+
+        int[] prev = new int[m + 1];
+        int[] curr = new int[m + 1];
+
+        for (int j = 0; j <= m; j++) prev[j] = j;
+
+        for (int i = 1; i <= n; i++) {
+            curr[0] = i;
+            char ca = a.charAt(i - 1);
+            for (int j = 1; j <= m; j++) {
+                int cost = (ca == b.charAt(j - 1)) ? 0 : 1;
+                curr[j] = Math.min(
+                        Math.min(curr[j - 1] + 1, prev[j] + 1),
+                        prev[j - 1] + cost
+                );
+            }
+            int[] tmp = prev;
+            prev = curr;
+            curr = tmp;
+        }
+        return prev[m];
+    }
+    private double similarityRatio(String a, String b) {
+        String x = normForNearDup(a);
+        String y = normForNearDup(b);
+        if (x.isEmpty() || y.isEmpty()) return 0.0;
+
+        int maxLen = Math.max(x.length(), y.length());
+        if (maxLen == 0) return 1.0;
+
+        int dist = levenshtein(x, y);
+        return 1.0 - (dist / (double) maxLen);
     }
 
     private Preferences getPrefs() {
@@ -1194,7 +2265,7 @@ public class MobMateWhisp implements NativeKeyListener {
         Font awtFont = new Font(
                 UIManager.getFont("Menu.font").getFamily(),
                 Font.PLAIN,
-                prefs.getInt("ui.font.size", 12)
+                prefs.getInt("ui.font.size", DEFAULT_UI_FONT_SIZE)
         );
         applyAwtFontRecursive(popup, awtFont);
 
@@ -1281,10 +2352,7 @@ public class MobMateWhisp implements NativeKeyListener {
             while (true) {
                 try {
                     String s = radioSpeakQueue.take();
-                    speak(s);
-                    SwingUtilities.invokeLater(() -> {
-                        addHistory(s);
-                    });
+                    speakTalkTextForUi(s);
                 } catch (Exception ex) {
                     Config.logError("RadioSpeak worker error: " + ex.getMessage(), ex);
                 }
@@ -1971,7 +3039,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
 
     public int getUIFontSize() {
-        return prefs.getInt("ui.font.size", 16); // default 16
+        return prefs.getInt("ui.font.size", DEFAULT_UI_FONT_SIZE);
     }
     public static void applyUIFont(int size) {
         Font base = UIManager.getFont("Label.font");
@@ -2157,6 +3225,7 @@ public class MobMateWhisp implements NativeKeyListener {
             return;
         }
         isPriming = true;
+        setStartupStatus(true, "INIT");
         try {
             Config.reload();
             prefs.sync();
@@ -2192,6 +3261,7 @@ public class MobMateWhisp implements NativeKeyListener {
                         button.setEnabled(true);
                         button.setText(UiText.t("ui.main.start"));
                         isCalibrationComplete = true;
+                        setStartupStatus(false, "READY");
                     });
                     return;
                 }
@@ -2268,6 +3338,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     button.setText(UiText.t("ui.main.start"));
                     window.setTitle(UiText.t("ui.calibrating.complete"));
                     updateToolTip();
+                    setStartupStatus(false, "READY");
                 });
             } catch (Exception e) {
                 Config.log("Calibration failed: " + e.getMessage());
@@ -2276,6 +3347,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     button.setEnabled(true);
                     button.setText(UiText.t("ui.main.start"));
                     isCalibrationComplete = true;
+                    setStartupStatus(false, "READY");
                 });
             } finally {
                 isPriming = false;
@@ -2309,7 +3381,10 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile long lastRescueUtteranceSeq = -1L;
     private volatile long lastRescueAtMs = 0L;
     private volatile String lastRescueNorm = "";
+    private volatile long pendingMoonshineCompleteUtteranceSeq = -1L;
+    private volatile String pendingMoonshineCompleteText = "";
     volatile boolean isSpeaking = false;
+    private volatile boolean cliWavTestMode = false;
     long speechStartTime = 0;
     long lastSpeechEndTime = 0;
     // ===== Latency meter (VAD->P1 / VAD->Final / Final->TTS start) =====
@@ -2319,6 +3394,10 @@ public class MobMateWhisp implements NativeKeyListener {
     private final AtomicInteger lastLatVadToP1Ms = new AtomicInteger(-1);
     private final AtomicInteger lastLatVadToFinalMs = new AtomicInteger(-1);
     private final AtomicInteger lastLatFinalToTtsMs = new AtomicInteger(-1);
+    private final AtomicInteger lastLatPostProcessMs = new AtomicInteger(-1);
+    // Disabled for now because mt5-small currently returns span-masking tokens such as <extra_id_0>
+    // too often for this realtime talk path.
+    private static final boolean TALK_POST_PROCESS_ENABLED = false;
 
     // speak() が「今回のFinalの読み上げ」かを判定するための印っす
     private final AtomicReference<String> pendingLatencyTtsText = new AtomicReference<>(null);
@@ -2331,16 +3410,6 @@ public class MobMateWhisp implements NativeKeyListener {
 
         if (!isCalibrationComplete) {
             Config.log("Recording blocked - calibration not complete");
-            return;
-        }
-
-        Config.log("MobMateWhispTalk.startRecording()" + action);
-
-        // すでに録音中 or 開始処理中なら何もしない（固まり防止）
-        if (isRecording() || isStartingRecording.get()) {
-            if (isRecording()) {
-                stopRecording();
-            }
             return;
         }
         if (!isStartingRecording.compareAndSet(false, true)) {
@@ -2358,19 +3427,18 @@ public class MobMateWhisp implements NativeKeyListener {
             MobMateWhisp.this.window.setIconImage(imageInactive);
         });
 
-        javax.swing.Timer watchdog = new javax.swing.Timer(2500, ev -> {
-            if (isStartingRecording.get() && !isRecording()) {
-                isStartingRecording.set(false);
-                button.setEnabled(true);
-                button.setText(UiText.t("ui.main.start"));
-                window.setTitle(UiText.t("ui.title.idle"));
-                SwingUtilities.invokeLater(() -> {
-                    // ★録音開始できたので Stop を押せるように戻す
-                    button.setEnabled(true);
-                });
+        javax.swing.Timer watchdog = new javax.swing.Timer(800, ev -> {
+            if (!isStartingRecording.get() || isRecording()) {
+                ((javax.swing.Timer) ev.getSource()).stop();
+                return;
             }
+            if (ignorePreloadPending || LocalWhisperCPP.isIgnoreExpansionBusy()) {
+                return;
+            }
+            Config.logDebug("[Start] waiting for actual recording start...");
         });
-        watchdog.setRepeats(false);
+        watchdog.setInitialDelay(2500);
+        watchdog.setRepeats(true);
         watchdog.start();
 
         final String audioDevice = prefs.get("audio.device", "");
@@ -2378,6 +3446,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
         try {
             this.audioService.execute(() -> {
+                preloadIgnoreForTalkStartIfNeeded();
                 final ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
                 final ByteArrayOutputStream laughBuffer = new ByteArrayOutputStream();
                 final int LAUGH_WINDOW_BYTES = 16000 / 2;
@@ -2440,6 +3509,11 @@ public class MobMateWhisp implements NativeKeyListener {
                             // 既存プロファイルがあれば復元を試みる
                             File spkFile = new File("speaker_profile.dat");
                             if (spkFile.exists() && speakerProfile.loadFromFile(spkFile)) {
+                                speakerProfile.updateSettings(
+                                        prefs.getInt("speaker.enroll_samples", 5),
+                                        prefs.getFloat("speaker.threshold_initial", 0.60f),
+                                        prefs.getFloat("speaker.threshold_target", prefs.getFloat("speaker.threshold_initial", 0.60f))
+                                );
                                 Config.log("★Speaker profile restored from file");
                                 updateSpeakerStatus();
                             } else {
@@ -2542,7 +3616,8 @@ public class MobMateWhisp implements NativeKeyListener {
                             Config.logDebug("★調整後 SILENCE_FRAMES_FOR_FINAL: " + SILENCE_FRAMES_FOR_FINAL);
 
                             boolean firstPartialSent = false;
-                            final int PREROLL_BYTES = (int) (16000 * 5 / 10);
+                            // 16kHz / 16bit / mono = 1秒あたり 32000 bytes
+                            final int PREROLL_BYTES = (int) (audioFormat.getSampleRate() * audioFormat.getFrameSize() * 1.5);
                             final int MIN_AUDIO_DATA_LENGTH = 16000;
                             long lastFinalMs = 0;
                             final long FINAL_COOLDOWN_MS = 200;
@@ -2727,6 +3802,11 @@ public class MobMateWhisp implements NativeKeyListener {
                                             peak >= Math.max((int)(peakTh * 0.90), strongPeakMin) &&
                                                     avg  >= Math.max(120, (int)(avgTh * 0.35));
 
+                                    boolean reactionInput =
+                                            !np.isLowGainMic &&
+                                                    peak >= Math.max(900, (int)(peakTh * 0.65)) &&
+                                                    avg  >= Math.max(160, (int)(avgTh * 0.55));
+
                                     if (!speech && strongInput) {
                                         strongNoSpeechFrames++;
                                     } else {
@@ -2740,8 +3820,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                                 np.isLowGainMic, ((ImprovedVAD) vad).looksLikeBGM(peak, avg)
                                         ));
                                     }
-                                    // VADがまだspeech=trueに出来ていなくても、
-                                    // 強い短音だけはMoonshineへ先行投入して poll を起こす
+
                                     if (!speech
                                             && !isSpeaking
                                             && strongInput
@@ -2758,12 +3837,14 @@ public class MobMateWhisp implements NativeKeyListener {
                                                 + " peak=" + peak + " avg=" + avg);
                                     }
 
-                                    // 4096 bytes/frame ≒ 128ms なので、2フレームで約256ms
-                                    // 笑い声の入口救済としてはこのくらいがちょうどいい
                                     if (strongNoSpeechFrames >= 2) {
                                         speech = true;
                                         Config.logDebug("★VAD override: strongNoSpeechFrames>=2 -> speech=true");
                                         strongNoSpeechFrames = 0;
+                                    } else if (!speech && !isSpeaking && reactionInput) {
+                                        speech = true;
+                                        Config.logDebug("★VAD reaction rescue: peak=" + peak + " avg=" + avg
+                                                + " peakTh=" + peakTh + " avgTh=" + avgTh);
                                     }
 
                                     if (speech || !strongInput) {
@@ -2860,6 +3941,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                         forceFinalizePending = false;
                                         currentUtteranceSeq = ++utteranceSeqGen;
                                         MobMateWhisp.setLastPartial("");
+                                        clearMoonshineCompleteCandidate(-1L);
                                         lastPartialUpdateMs = 0L; // partial更新時刻もリセット
                                         preSpeechMoonFeedFrames = 0;
                                         Config.logDebug("★発話開始");
@@ -3170,6 +4252,23 @@ public class MobMateWhisp implements NativeKeyListener {
                                                     }
 
                                                     if (speakerOk) {
+                                                        if (isEngineMoonshine()) {
+                                                            String cachedComplete = consumeMoonshineCompleteCandidate(uttSeq);
+                                                            if (cachedComplete != null && !cachedComplete.isBlank()) {
+                                                                String candidate = removeCjkSpaces(cachedComplete).trim();
+                                                                String lastP = MobMateWhisp.getLastPartial();
+                                                                if (shouldPreferLastPartialOverComplete(lastP, candidate)) {
+                                                                    candidate = removeCjkSpaces(lastP).trim();
+                                                                }
+                                                                if (!candidate.isBlank()) {
+                                                                    Config.logDebug("★Moon final commit from cached COMPLETE: " + candidate);
+                                                                    handleFinalText(candidate, action, false);
+                                                                    MobMateWhisp.setLastPartial("");
+                                                                    return;
+                                                                }
+                                                            }
+                                                        }
+
                                                         Config.logDebug("★Final send");
                                                         transcribe(finalProcChunk, action, true, uttSeq);
 
@@ -3188,6 +4287,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                                                 moonshineNoOutputCount = 0;
                                                                 moonshineLastOutputMs = System.currentTimeMillis();
                                                             }
+                                                            maybeFallbackMoonshineAcceptedUtterance(finalProcChunk, action, uttSeq);
                                                         }
 
                                                         // ★話者プロファイル微調整＆定期保存
@@ -3459,13 +4559,13 @@ public class MobMateWhisp implements NativeKeyListener {
         if (p != null && !p.isBlank()) {
             setTranscribing(true);
             final String show = p;
-            if (historyFrame != null) historyFrame.setPartialPreview(show); // ★ADD
+            updateTalkPartialPreview(show);
             SwingUtilities.invokeLater(() -> {
                 window.setTitle("[TRANS]:" + show);
                 MobMateWhisp.this.window.setIconImage(imageTranscribing);
             });
         } else {
-            if (historyFrame != null) historyFrame.setPartialPreview("");   // ★ADD
+            updateTalkPartialPreview("");
             SwingUtilities.invokeLater(() -> window.setTitle(UiText.t("ui.title.rec")));
         }
     }
@@ -3501,8 +4601,9 @@ public class MobMateWhisp implements NativeKeyListener {
         });
     }
     // === Final確定の共通処理（rescueでも必ずここを通す） ===
-    private String lastSpeakStr = "";
-    private long lastSpeakMs = 0;
+    private volatile String lastSpeakStr = "";
+    private volatile long lastSpeakMs = 0;
+    private final Object talkFinalDedupeLock = new Object();
     private void handleFinalText(String finalStr, Action action, boolean flgRescue) {
         if (finalStr == null) return;
         String s = finalStr.replace('\n',' ').replace('\r',' ').replace('\t',' ').trim();
@@ -3527,31 +4628,59 @@ public class MobMateWhisp implements NativeKeyListener {
             return;
         }
 
-        // ★同一文の連続を捨てすぎない(内部二重発火だけ潰す)
-        // ★★修正: 前回発話と同じ、または前回発話で始まる場合もブロック
-        long now = System.currentTimeMillis();
-        if (!lastSpeakStr.isEmpty() && (now - lastSpeakMs) <= 1200) {  // 秒以内
-            // 完全一致 → 捨てる
-            if (lastSpeakStr.equals(s)) {
-                Config.logDebug("★Final skip (exact dup <3s): " + s);
-                return;
-            }
-            // 前回が今回で始まる(前回の方が短い) → 前回を上書きして今回を処理
-            if (lastSpeakStr.startsWith(s)) {
-                Config.logDebug("★Final skip (shorter <3s): prev=[" + lastSpeakStr + "] new=[" + s + "]");
-                return;
-            }
-            // 今回が前回で始まる(今回の方が長い) → 前回を上書きして今回を処理
-            if (s.startsWith(lastSpeakStr)) {
-                Config.logDebug("★Final update (longer <3s): prev=[" + lastSpeakStr + "] new=[" + s + "]");
-                // ここでは return しない → 下で lastSpeakStr を更新して処理続行
-            }
-        }
-        lastSpeakMs = now;
-        lastSpeakStr = s;
-        latFinalMs.compareAndSet(0, now);
+        TalkTextResult talkText = buildTalkTextResult(s);
+        final String out = talkText.outputText();
+        final String historyText = talkText.historyText();
+        String dedupeText = (out == null || out.isBlank()) ? s : out;
 
-        final String out = s;
+        // ★同一文の連続を捨てすぎない(内部二重発火だけ潰す)
+        // ★翻訳ON時は翻訳後テキストで重複を見るっす
+        long now = System.currentTimeMillis();
+        synchronized (talkFinalDedupeLock) {
+            if (!lastSpeakStr.isEmpty() && (now - lastSpeakMs) <= 1200) {
+                String prev = lastSpeakStr;
+                String prevNorm = normForNearDup(prev);
+                String curNorm  = normForNearDup(dedupeText);
+
+                if (prevNorm.equals(curNorm)) {
+                    Config.logDebug("★Final skip (exact dup <1.2s): " + dedupeText);
+                    lastSpeakMs = now;
+                    lastSpeakStr = dedupeText;
+                    return;
+                }
+
+                if (prevNorm.startsWith(curNorm)) {
+                    Config.logDebug("★Final skip (shorter prefix <1.2s): prev=[" + prev + "] new=[" + dedupeText + "]");
+                    lastSpeakMs = now;
+                    lastSpeakStr = dedupeText;
+                    return;
+                }
+
+                double sim = similarityRatio(prevNorm, curNorm);
+                if (curNorm.startsWith(prevNorm)) {
+                    int grow = curNorm.length() - prevNorm.length();
+                    if (grow <= 4 || sim >= 0.88) {
+                        Config.logDebug(String.format(
+                                "★Final skip (longer near-dup %.2f <1.2s): prev=[%s] new=[%s]",
+                                sim, prev, dedupeText));
+                        lastSpeakMs = now;
+                        lastSpeakStr = dedupeText;
+                        return;
+                    }
+                    Config.logDebug("★Final update (longer prefix <1.2s): prev=[" + prev + "] new=[" + dedupeText + "]");
+                } else if (sim >= 0.80) {
+                    Config.logDebug(String.format(
+                            "★Final skip (near-dup %.2f <1.2s): prev=[%s] new=[%s]",
+                            sim, prev, dedupeText));
+                    lastSpeakMs = now;
+                    lastSpeakStr = dedupeText;
+                    return;
+                }
+            }
+            lastSpeakMs = now;
+            lastSpeakStr = dedupeText;
+        }
+        latFinalMs.compareAndSet(0, now);
 
         boolean willSpeak = (action != Action.NOTHING_NO_SPEAK);
         markFinalAcceptedNow(now, willSpeak, out);
@@ -3584,7 +4713,7 @@ public class MobMateWhisp implements NativeKeyListener {
         // ★読み上げ(Hearing経路だけ抑制)
         if (action != Action.NOTHING_NO_SPEAK) {
             // 履歴
-            SwingUtilities.invokeLater(() -> addHistory(out));
+            SwingUtilities.invokeLater(() -> addHistory(historyText, s));
 
             CompletableFuture.runAsync(() -> {
                 long ttsStart = System.currentTimeMillis();
@@ -3657,6 +4786,9 @@ public class MobMateWhisp implements NativeKeyListener {
             ThreadLocal.withInitial(() -> -1L);
     private volatile long lastPartialUpdateMs = 0L;
     private volatile long lastRescueSpeakMs = 0L;
+    private volatile long lastMoonshineCompleteUtteranceSeq = -1L;
+    private volatile String lastMoonshineCompleteNorm = "";
+    private volatile long lastMoonshineCompleteAtMs = 0L;
     private static final long PARTIAL_RESCUE_STALE_MS = 90;      // partial更新が止まった判
     private static final long PARTIAL_RESCUE_MIN_SILENCE_MS = 40; // 無音が続いてる判定
     private static final long PARTIAL_RESCUE_COOLDOWN_MS = 400;    // 連発防止
@@ -3664,7 +4796,11 @@ public class MobMateWhisp implements NativeKeyListener {
         // ★ADD: Final処理中はrescueしない（セーフティネット）
         if (isProcessingFinal.get()) return;
 
-        String p = MobMateWhisp.getLastPartial();
+        String pendingComplete = (pendingMoonshineCompleteUtteranceSeq == utteranceSeq)
+                ? pendingMoonshineCompleteText : "";
+        String p = (pendingComplete != null && !pendingComplete.isBlank())
+                ? pendingComplete
+                : MobMateWhisp.getLastPartial();
         if (p == null) return;
         String s = p.trim();
         if (s.isEmpty()) return;
@@ -3673,6 +4809,7 @@ public class MobMateWhisp implements NativeKeyListener {
         if (utteranceSeq != currentUtteranceSeq) {
             Config.logDebug("★Partial rescue blocked (utterance changed): old=" + currentUtteranceSeq + " new=" + utteranceSeq);
             MobMateWhisp.setLastPartial(""); // 古いpartialをクリア
+            clearMoonshineCompleteCandidate(utteranceSeq);
             return;
         }
 
@@ -3685,6 +4822,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 && (nowMs - lastRescueSpeakMs) >= 500) {
             lastRescueSpeakMs = nowMs;
             MobMateWhisp.setLastPartial("");
+            clearMoonshineCompleteCandidate(utteranceSeq);
             Config.logDebug("★Instant short partial speak (lowGain): " + s);
             if (utteranceSeq > 0) {
                 lastRescueUtteranceSeq = utteranceSeq;
@@ -3712,6 +4850,7 @@ public class MobMateWhisp implements NativeKeyListener {
         // ここで確定発話
         lastRescueSpeakMs = nowMs;
         MobMateWhisp.setLastPartial("");
+        clearMoonshineCompleteCandidate(utteranceSeq);
 
         Config.logDebug("★Partial rescue -> handleFinalText: " + s);
 
@@ -3768,6 +4907,25 @@ public class MobMateWhisp implements NativeKeyListener {
         if (s.length() <= 6) return true;              // ちょっと / こっち
         if (s.split("[ 　]").length <= 2) return true; // 単語2つまで
 
+        return false;
+    }
+    private boolean shouldSuppressMoonshineComplete(String finalStr, long uttSeq) {
+        if (isDuplicateFinalOfRescue(finalStr, uttSeq)) {
+            Config.logDebug("★Moon COMPLETE suppressed (dup of partial rescue): " + finalStr);
+            return true;
+        }
+        String norm = normForNearDup(finalStr);
+        if (norm.isEmpty()) return false;
+        long now = System.currentTimeMillis();
+        if (uttSeq > 0 && uttSeq == lastMoonshineCompleteUtteranceSeq
+                && norm.equals(lastMoonshineCompleteNorm)
+                && (now - lastMoonshineCompleteAtMs) <= 10000) {
+            Config.logDebug("★Moon COMPLETE suppressed (same utterance duplicate): " + finalStr);
+            return true;
+        }
+        lastMoonshineCompleteUtteranceSeq = uttSeq;
+        lastMoonshineCompleteNorm = norm;
+        lastMoonshineCompleteAtMs = now;
         return false;
     }
     private boolean isDuplicateFinalOfRescue(String finalStr, long uttSeq) {
@@ -4025,9 +5183,6 @@ public class MobMateWhisp implements NativeKeyListener {
                         }, 120, TimeUnit.MILLISECONDS);
                     }
                 }
-                if (isEndOfCapture) {
-                    instantFinalFromWhisper(finalStr, action);
-                }
             }
         });
 
@@ -4041,6 +5196,14 @@ public class MobMateWhisp implements NativeKeyListener {
 
         setTranscribing(false);
         return finalStr;
+    }
+
+    private void setStartupStatus(boolean busy, String text) {
+        this.startupBusy = busy;
+        if (text != null && !text.isBlank()) {
+            this.startupStatusText = text.trim().toUpperCase(Locale.ROOT);
+        }
+        updateIcon();
     }
 
     protected synchronized void setTranscribing(boolean b) {
@@ -4068,9 +5231,11 @@ public class MobMateWhisp implements NativeKeyListener {
             boolean rec = isRecording();
             boolean tr  = isTranscribing();
 
+            boolean loadingIgnore = ignorePreloadPending || LocalWhisperCPP.isIgnoreExpansionBusy();
+
             // ★ここが本命：Start押下でdisableしたままにならないよう復帰させる
-            //   キャリブ中(!isCalibrationComplete) と開始準備中(isStartingRecording)だけ無効化
-            boolean enableMainButton = isCalibrationComplete && !isStartingRecording.get();
+            //   キャリブ中・開始準備中・ignore preload中は無効化
+            boolean enableMainButton = isCalibrationComplete && !isStartingRecording.get() && !loadingIgnore;
             if (MobMateWhisp.this.button != null) {
                 MobMateWhisp.this.button.setEnabled(enableMainButton);
             }
@@ -4080,6 +5245,8 @@ public class MobMateWhisp implements NativeKeyListener {
                     MobMateWhisp.this.button.setText(UiText.t("ui.main.stop"));
                     LocalWhisperCPP.markInitialPromptDirty();
 
+                } else if (isStartingRecording.get() || loadingIgnore) {
+                    MobMateWhisp.this.button.setText("Starting...");
                 } else {
                     MobMateWhisp.this.button.setText(UiText.t("ui.main.start"));
                     LocalWhisperCPP.markInitialPromptDirty();
@@ -4095,7 +5262,15 @@ public class MobMateWhisp implements NativeKeyListener {
 
                 // ★ステータスバーも更新
                 if (statusLabel != null) {
-                    if (tr) {
+                    if (startupBusy) {
+                        String bootText = (startupStatusText == null || startupStatusText.isBlank()) ? "BOOT" : startupStatusText;
+                        statusLabel.setText("● " + bootText);
+                        statusLabel.setForeground(new Color(220, 53, 69)); // 赤
+                    } else if (ignorePreloadPending || LocalWhisperCPP.isIgnoreExpansionBusy()) {
+                        int pct = LocalWhisperCPP.getIgnoreExpansionProgressPct();
+                        statusLabel.setText(pct >= 0 ? ("● NGLOAD " + pct + "%") : "● NGLOAD");
+                        statusLabel.setForeground(new Color(255, 105, 180)); // ピンク
+                    } else if (tr) {
                         statusLabel.setText("◉ TRANS");
                         statusLabel.setForeground(new Color(255, 152, 0)); // オレンジ
                     } else if (rec) {
@@ -4185,14 +5360,17 @@ public class MobMateWhisp implements NativeKeyListener {
             l.stateChanged(new ChangeEvent(this));
         }
     }
-    public List<String> getHistory() {
+    public List<HistoryEntry> getHistory() {
         return this.history;
     }
     public void addHistory(String s) {
-        if (s == null) return;
-        s = s.trim();
-        if (s.isEmpty()) return;
-        this.history.add(s);
+        addHistory(s, s);
+    }
+    public void addHistory(String displayText, String rawText) {
+        if (displayText == null) return;
+        displayText = displayText.trim();
+        if (displayText.isEmpty()) return;
+        this.history.add(new HistoryEntry(displayText, rawText));
         // ★古い順に捨てる
         int over = this.history.size() - HistoryFrame.HISTORY_MAX_LINES;
         if (over > 0) {
@@ -4236,6 +5414,7 @@ public class MobMateWhisp implements NativeKeyListener {
             FontBootstrap.registerBundledFonts();
             String suffix = p.get("ui.language", "en");
             UiFontApplier.applyDefaultUIFontBySuffix(suffix);
+            applyUIFont(p.getInt("ui.font.size", DEFAULT_UI_FONT_SIZE));
             if (!new File("_radiocmd.txt").exists()) {
                 copyPreset("libs/preset/_radiocmd_" + suffix + ".txt", "_radiocmd.txt");
             }
@@ -4245,6 +5424,8 @@ public class MobMateWhisp implements NativeKeyListener {
                 boolean debug = false;
                 String url = null;
                 boolean forceOpenWindow = false;
+                String wavTestPath = null;
+                String speakerCheckWavPath = null;
                 for (int i = 0; i < args.length; i++) {
                     final String arg = args[i];
                     if (!arg.startsWith("-D")) {
@@ -4254,11 +5435,61 @@ public class MobMateWhisp implements NativeKeyListener {
                             forceOpenWindow = true;
                         } else if (arg.equals("--debug")) {
                             debug = true;
+                        } else if (arg.equals("--wav-test") && (i + 1) < args.length) {
+                            wavTestPath = args[++i];
+                        } else if (arg.equals("--speaker-check-wav") && (i + 1) < args.length) {
+                            speakerCheckWavPath = args[++i];
                         }
                     }
                 }
                 final MobMateWhisp r = new MobMateWhisp(url);
                 r.debug = debug;
+                if (speakerCheckWavPath != null && !speakerCheckWavPath.isBlank()) {
+                    final String wavPathFinal = speakerCheckWavPath;
+                    Thread speakerCheckThread = new Thread(() -> {
+                        int exitCode = 0;
+                        try {
+                            String result = r.runCliSpeakerCheck(new File(wavPathFinal));
+                            Config.log("[SPEAKER-CHECK-CLI] RESULT=" + result);
+                            System.out.println("[SPEAKER-CHECK-CLI] RESULT=" + result);
+                        } catch (Throwable t) {
+                            exitCode = 1;
+                            Config.logError("[SPEAKER-CHECK-CLI] failed", t);
+                            t.printStackTrace();
+                        } finally {
+                            try { if (hearingFrame != null) hearingFrame.shutdownForExit(); } catch (Throwable ignore) {}
+                            try { shutdownMoonshine(); } catch (Throwable ignore) {}
+                            try { SteamHelper.shutdown(); } catch (Throwable ignore) {}
+                            System.exit(exitCode);
+                        }
+                    }, "speaker-check-cli");
+                    speakerCheckThread.setDaemon(false);
+                    speakerCheckThread.start();
+                    return;
+                }
+                if (wavTestPath != null && !wavTestPath.isBlank()) {
+                    final String wavPathFinal = wavTestPath;
+                    Thread wavTestThread = new Thread(() -> {
+                        int exitCode = 0;
+                        try {
+                            String result = r.runCliWavTest(new File(wavPathFinal));
+                            Config.log("[WAV-TEST-CLI] FINAL=" + result);
+                            System.out.println("[WAV-TEST-CLI] FINAL=" + result);
+                        } catch (Throwable t) {
+                            exitCode = 1;
+                            Config.logError("[WAV-TEST-CLI] failed", t);
+                            t.printStackTrace();
+                        } finally {
+                            try { if (hearingFrame != null) hearingFrame.shutdownForExit(); } catch (Throwable ignore) {}
+                            try { shutdownMoonshine(); } catch (Throwable ignore) {}
+                            try { SteamHelper.shutdown(); } catch (Throwable ignore) {}
+                            System.exit(exitCode);
+                        }
+                    }, "wav-test-cli");
+                    wavTestThread.setDaemon(false);
+                    wavTestThread.start();
+                    return;
+                }
                 r.autoStartVoiceVox();
                 r.startPsServer();
 
@@ -4444,14 +5675,16 @@ public class MobMateWhisp implements NativeKeyListener {
         this.label.setText(UiText.t("ui.main.transcribing"));
 
         this.window.pack();
+        Dimension packedSize = this.window.getSize();
         this.window.setMinimumSize(
-                new Dimension(510, this.window.getHeight())
+                new Dimension(Math.max(510, packedSize.width), packedSize.height)
         );
         this.label.setText(UiText.t("ui.main.stop"));
         this.window.setResizable(false);
 
         Rectangle fallback = new Rectangle(15, 15, this.window.getWidth(), this.window.getHeight());
         restoreBounds(this.window, "ui.main", fallback);
+        UiFontApplier.ensureWindowFitsPreferredSize(this.window);
         installBoundsSaver(this.window, "ui.main");
 
         window.setVisible(true);
@@ -4679,16 +5912,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private void transcribeWavFile(File wavFile) {
         Config.log("[WAV-TEST] Loading: " + wavFile.getName());
         try {
-            javax.sound.sampled.AudioInputStream in =
-                    javax.sound.sampled.AudioSystem.getAudioInputStream(wavFile);
-            javax.sound.sampled.AudioFormat targetFmt =
-                    new javax.sound.sampled.AudioFormat(16000f, 16, 1, true, false);
-            javax.sound.sampled.AudioInputStream converted =
-                    javax.sound.sampled.AudioSystem.getAudioInputStream(targetFmt, in);
-
-            byte[] pcm = converted.readAllBytes();
-            converted.close();
-            in.close();
+            byte[] pcm = loadWavAs16kMonoPcm(wavFile);
 
             double seconds = pcm.length / 32000.0;
             if (seconds > 30.0) {
@@ -4714,7 +5938,157 @@ public class MobMateWhisp implements NativeKeyListener {
             Config.logError("[WAV-TEST] error: " + ex.getMessage(), ex);
         }
     }
+    private byte[] loadWavAs16kMonoPcm(File wavFile) throws Exception {
+        javax.sound.sampled.AudioInputStream in =
+                javax.sound.sampled.AudioSystem.getAudioInputStream(wavFile);
+        javax.sound.sampled.AudioFormat targetFmt =
+                new javax.sound.sampled.AudioFormat(16000f, 16, 1, true, false);
+        javax.sound.sampled.AudioInputStream converted =
+                javax.sound.sampled.AudioSystem.getAudioInputStream(targetFmt, in);
+        try {
+            return converted.readAllBytes();
+        } finally {
+            try { converted.close(); } catch (Exception ignore) {}
+            try { in.close(); } catch (Exception ignore) {}
+        }
+    }
+    private void awaitEdtIdle() {
+        if (SwingUtilities.isEventDispatchThread()) return;
+        try {
+            SwingUtilities.invokeAndWait(() -> {});
+        } catch (Exception ignore) {}
+    }
+    private HistoryEntry getLatestHistoryEntry() {
+        if (history.isEmpty()) return null;
+        return history.get(history.size() - 1);
+    }
+    private String runCliWavTest(File wavFile) throws Exception {
+        cliWavTestMode = true;
+        try {
+            Config.log("[WAV-TEST-CLI] file=" + wavFile.getAbsolutePath()
+                    + " engine=" + (isEngineMoonshine() ? "moonshine" : "whisper"));
+            byte[] pcm = loadWavAs16kMonoPcm(wavFile);
+
+            awaitEdtIdle();
+            SwingUtilities.invokeAndWait(() -> history.clear());
+
+            if (isEngineMoonshine()) {
+                return runMoonshineCliWavTest(pcm);
+            }
+
+            String raw = transcribe(pcm, Action.NOTHING, true);
+            awaitEdtIdle();
+            HistoryEntry latest = getLatestHistoryEntry();
+            if (latest != null && latest.rawText() != null && !latest.rawText().isBlank()) {
+                return latest.rawText().trim();
+            }
+            return (raw == null) ? "" : raw.trim();
+        } finally {
+            cliWavTestMode = false;
+        }
+    }
+    private String runCliSpeakerCheck(File wavFile) throws Exception {
+        Config.log("[SPEAKER-CHECK-CLI] file=" + wavFile.getAbsolutePath());
+        File spkFile = new File("speaker_profile.dat");
+        if (!speakerProfile.isReady() && spkFile.exists()) {
+            boolean loaded = speakerProfile.loadFromFile(spkFile);
+            if (loaded) {
+                speakerProfile.updateSettings(
+                        prefs.getInt("speaker.enroll_samples", 5),
+                        prefs.getFloat("speaker.threshold_initial", 0.60f),
+                        prefs.getFloat("speaker.threshold_target",
+                                prefs.getFloat("speaker.threshold_initial", 0.60f))
+                );
+            }
+            Config.log("[SPEAKER-CHECK-CLI] profileLoaded=" + loaded + " file=" + spkFile.getAbsolutePath());
+        }
+        if (!speakerProfile.isReady()) {
+            return "PROFILE_NOT_READY";
+        }
+
+        byte[] pcm = loadWavAs16kMonoPcm(wavFile);
+        AudioFormat fmt = new AudioFormat(16000f, 16, 1, true, false);
+        byte[] trimmed = trimPcmSilence16le(pcm, fmt, 300, 120);
+        boolean match = speakerProfile.isMatchingSpeaker(trimmed);
+        return match ? "PASS" : "REJECT";
+    }
+    private String runMoonshineCliWavTest(byte[] pcm) throws Exception {
+        if (moonshine == null || !moonshine.isLoaded()) {
+            throw new IllegalStateException("Moonshine not loaded");
+        }
+
+        lastSpeakStr = "";
+        lastSpeakMs = 0L;
+        lastRescueUtteranceSeq = -1L;
+        lastRescueAtMs = 0L;
+        lastRescueNorm = "";
+        MobMateWhisp.setLastPartial("");
+        clearMoonshineCompleteCandidate(-1L);
+
+        long uttSeq = ++utteranceSeqGen;
+        currentUtteranceSeq = uttSeq;
+        isSpeaking = true;
+        speechStartTime = System.currentTimeMillis();
+        lastSpeechEndTime = 0L;
+        lastPartialUpdateMs = 0L;
+
+        moonshine.resetStream();
+
+        final int chunkBytes = 640; // 20ms at 16kHz/16bit/mono
+        Config.log("[WAV-TEST-CLI] Moonshine feed start bytes=" + pcm.length + " chunkBytes=" + chunkBytes);
+        for (int off = 0; off < pcm.length; off += chunkBytes) {
+            int len = Math.min(chunkBytes, pcm.length - off);
+            byte[] chunk = Arrays.copyOfRange(pcm, off, off + len);
+            float[] fpcm = pcm16leToFloat(chunk, len);
+            moonshine.addAudio(fpcm, 16000);
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+
+        moonshine.addAudio(new float[1600 * 6], 16000); // 600ms tail silence
+        try {
+            Thread.sleep(250);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+
+        isSpeaking = false;
+        lastSpeechEndTime = System.currentTimeMillis() - PARTIAL_RESCUE_MIN_SILENCE_MS;
+        moonshine.resetStream();
+
+        try {
+            Thread.sleep(700);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+        awaitEdtIdle();
+
+        HistoryEntry latest = getLatestHistoryEntry();
+        if (latest != null && latest.rawText() != null && !latest.rawText().isBlank()) {
+            return latest.rawText().trim();
+        }
+        if (!hasMoonshineOutputForUtterance(uttSeq)) {
+            String fallback = runWhisperFallbackForMoonshine(pcm, Action.NOTHING, false);
+            if (fallback != null && !fallback.isBlank()) {
+                return fallback.trim();
+            }
+            awaitEdtIdle();
+            latest = getLatestHistoryEntry();
+            if (latest != null && latest.rawText() != null && !latest.rawText().isBlank()) {
+                return latest.rawText().trim();
+            }
+        }
+        String partial = MobMateWhisp.getLastPartial();
+        return (partial == null) ? "" : partial.trim();
+    }
     private Action getActionFromPrefs() {
+        if (cliWavTestMode) {
+            return Action.NOTHING;
+        }
         String strAction = prefs.get("action", "noting");
         return switch (strAction) {
             case "paste"     -> Action.COPY_TO_CLIPBOARD_AND_PASTE;
@@ -4802,8 +6176,10 @@ public class MobMateWhisp implements NativeKeyListener {
         engineLabel.setFont(engineLabel.getFont().deriveFont(11f));
 
         // 状態表示
-        statusLabel = new JLabel("▪ Ready");
+        statusLabel = new JLabel("● BOOT");
         statusLabel.setFont(statusLabel.getFont().deriveFont(11f));
+        statusLabel.setForeground(new Color(220, 53, 69));
+        statusLabel.setToolTipText("Startup / initialization status");
 
         // ★LAT表示
         latencyLabel = new JLabel(buildLatencyText());
@@ -4957,6 +6333,7 @@ public class MobMateWhisp implements NativeKeyListener {
         lastLatVadToP1Ms.set(-1);
         lastLatVadToFinalMs.set(-1);
         lastLatFinalToTtsMs.set(-1);
+        lastLatPostProcessMs.set(-1);
     }
 
     private void markFirstPartialNow(long nowMs) {
@@ -5013,6 +6390,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
         Config.logDebug("[LAT] vad->p1=" + lastLatVadToP1Ms.get()
                 + "ms vad->final=" + lastLatVadToFinalMs.get()
+                + "ms post=" + lastLatPostProcessMs.get()
                 + "ms final->tts=" + dt + "ms");
     }
 
@@ -5033,6 +6411,7 @@ public class MobMateWhisp implements NativeKeyListener {
         int p1  = lastLatVadToP1Ms.get();
         int fin = lastLatVadToFinalMs.get();
         int tts = lastLatFinalToTtsMs.get();
+        int post = lastLatPostProcessMs.get();
 
         // “ぱっと見”用：基本は VAD->Final。TTSが取れてるなら足す。
         long total = -1;
@@ -5043,16 +6422,18 @@ public class MobMateWhisp implements NativeKeyListener {
         if (total > Integer.MAX_VALUE) total = Integer.MAX_VALUE;
 
         String label = isJaUi() ? "Proc" : "Proc";
-        return label + ": " + fmtMs((int) total) + "ms";
+        String postSuffix = (post >= 0) ? " (PP " + post + "ms)" : "";
+        return label + ": " + fmtMs((int) total) + "ms" + postSuffix;
     }
 
     private String buildLatencyTooltip() {
         int p1  = lastLatVadToP1Ms.get();
         int fin = lastLatVadToFinalMs.get();
         int tts = lastLatFinalToTtsMs.get();
+        int post = lastLatPostProcessMs.get();
 
         return "Breakdown: VAD->1stPartial " + fmtMs(p1) + "ms / VAD->Final " + fmtMs(fin)
-                + "ms / Final->TTS start " + fmtMs(tts) + "ms";
+                + "ms / PostProcess " + fmtMs(post) + "ms / Final->TTS start " + fmtMs(tts) + "ms";
     }
 
     private void updateStatusBar() {
@@ -5098,6 +6479,30 @@ public class MobMateWhisp implements NativeKeyListener {
             if (latencyLabel != null) {
                 latencyLabel.setText(buildLatencyText());
                 latencyLabel.setToolTipText(buildLatencyTooltip());
+            }
+            if (statusLabel != null) {
+                boolean rec = isRecording();
+                boolean tr = isTranscribing();
+                boolean loadingIgnore = ignorePreloadPending || LocalWhisperCPP.isIgnoreExpansionBusy();
+                if (startupBusy) {
+                    String bootText = (startupStatusText == null || startupStatusText.isBlank()) ? "BOOT" : startupStatusText;
+                    statusLabel.setText("● " + bootText);
+                    statusLabel.setForeground(new Color(220, 53, 69));
+                } else if (loadingIgnore) {
+                    int pct = LocalWhisperCPP.getIgnoreExpansionProgressPct();
+                    statusLabel.setText(pct >= 0 ? ("● NGLOAD " + pct + "%") : "● NGLOAD");
+                    statusLabel.setForeground(new Color(255, 105, 180));
+                    statusLabel.setToolTipText("Loading / translating ignore words");
+                } else if (tr) {
+                    statusLabel.setText("◉ TRANS");
+                    statusLabel.setForeground(new Color(255, 152, 0));
+                } else if (rec) {
+                    statusLabel.setText("● [REC]");
+                    statusLabel.setForeground(new Color(220, 53, 69));
+                } else {
+                    statusLabel.setText("▪ Ready");
+                    statusLabel.setForeground(UIManager.getColor("Label.foreground"));
+                }
             }
             // ★GPU VRAM推定使用量を更新
 //            if (gpuMemLabel != null) {
@@ -5206,6 +6611,7 @@ public class MobMateWhisp implements NativeKeyListener {
             if (prefs != null) prefs.put("hearing.lang", lang);
         } catch (Exception ignore) {}
 
+        LocalWhisperCPP.markIgnoreDirty();
         // 既にHearing用Whisperが居れば即反映
         try {
             LocalWhisperCPP cur = wHearing;
@@ -5213,15 +6619,34 @@ public class MobMateWhisp implements NativeKeyListener {
         } catch (Exception ignore) {}
     }
     public void setHearingTranslateToEn(boolean v) {
+        setHearingTranslateTarget(v ? "EN" : "OFF");
+    }
+    public void setHearingTranslateTarget(String target) {
+        target = LanguageOptions.normalizeTranslationTarget(target);
         try {
-            if (prefs != null) prefs.putBoolean("hearing.translate_to_en", v);
+            if (prefs != null) {
+                prefs.put("hearing.translate.target", target);
+                prefs.putBoolean("hearing.translate_to_en", !"OFF".equals(target));
+            }
             try { prefs.sync(); } catch (Exception ignore) {}
         } catch (Exception ignore) {}
 
-        // 既にHearing用Whisperが居れば即反映
+        syncVoicegerTtsLangWithTalkOutput();
+        if ("OFF".equals(target)) {
+            synchronized (hearingTranslatorLock) {
+                try {
+                    if (hearingTranslator != null) hearingTranslator.unload();
+                } catch (Throwable ignore) {}
+                hearingTranslator = null;
+                hearingTranslatorInitAttempted = false;
+                hearingTranslatorUnavailableLogged = false;
+            }
+        }
+
+        // HearingのWhisper本体翻訳は使わず、独立translatorに寄せる
         try {
             LocalWhisperCPP cur = wHearing;
-            if (cur != null) cur.setHearingTranslateToEn(v);
+            if (cur != null) cur.setHearingTranslateToEn(false);
         } catch (Exception ignore) {}
     }
     private final java.util.concurrent.Semaphore hearingSem = new java.util.concurrent.Semaphore(1);
@@ -5233,7 +6658,8 @@ public class MobMateWhisp implements NativeKeyListener {
                 hw = getOrCreateHearingWhisper();
             }
             if (hw == null) return "";
-            return hw.transcribeRawHearing(pcm16k16mono, Action.NOTHING_NO_SPEAK, this);
+            String hearingText = hw.transcribeRawHearing(pcm16k16mono, Action.NOTHING_NO_SPEAK, this);
+            return hearingText;
         } catch (Exception ex) {
             Config.logError("[Hearing] transcribe failed", ex);
             return "";
@@ -5242,8 +6668,9 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
 
-    // ★FIX: short laugh after long silence gets ENERGY_REJECT because RMS is diluted by silence/preRoll.
-// Trim leading/trailing near-silence from 16-bit PCM (LE) before speaker gate/transcribe.
+    // ★FIX: 長い無音後の発話頭を落とさないよう、前方トリムはかなり保守的にする。
+    // short laugh after long silence gets ENERGY_REJECT because RMS is diluted by silence/preRoll.
+    // Trim leading/trailing near-silence from 16-bit PCM (LE) before speaker gate/transcribe.
     static byte[] trimPcmSilence16le(byte[] pcm16le, AudioFormat fmt, int absThr, int padMs) {
         if (pcm16le == null || pcm16le.length < 4) return pcm16le;
         if (fmt == null) return pcm16le;
@@ -5253,7 +6680,8 @@ public class MobMateWhisp implements NativeKeyListener {
         float srF = fmt.getSampleRate();
         int sampleRate = (srF > 0) ? (int) srF : 16000;
 
-        int padSamples = Math.max(0, (sampleRate * padMs) / 1000);
+        int tailPadSamples = Math.max(0, (sampleRate * padMs) / 1000);
+        int leadPadSamples = Math.max(tailPadSamples, (sampleRate * 500) / 1000);
         int totalSamples = pcm16le.length / bytesPerSample;
 
         int first = -1;
@@ -5273,8 +6701,8 @@ public class MobMateWhisp implements NativeKeyListener {
         }
         if (last < 0 || last <= first) return pcm16le;
 
-        int start = Math.max(0, first - padSamples);
-        int end = Math.min(totalSamples - 1, last + padSamples);
+        int start = Math.max(0, first - leadPadSamples);
+        int end = Math.min(totalSamples - 1, last + tailPadSamples);
 
         int bStart = start * 2;
         int bEndExcl = (end + 1) * 2;
@@ -5284,6 +6712,15 @@ public class MobMateWhisp implements NativeKeyListener {
         int minBytes = (sampleRate * 120 / 1000) * 2;
         if ((bEndExcl - bStart) < minBytes && pcm16le.length >= minBytes) {
             return pcm16le;
+        }
+        if (bStart > 0 || bEndExcl < pcm16le.length) {
+            int leadTrimMs = (first * 1000) / sampleRate;
+            int keptLeadMs = ((first - start) * 1000) / sampleRate;
+            int keptTailMs = ((end - last) * 1000) / sampleRate;
+            Config.logDebug("★PCM trim: leadTrimMs=" + leadTrimMs
+                    + " keptLeadMs=" + keptLeadMs
+                    + " keptTailMs=" + keptTailMs
+                    + " bytes=" + pcm16le.length + " -> " + (bEndExcl - bStart));
         }
         return java.util.Arrays.copyOfRange(pcm16le, bStart, bEndExcl);
     }
@@ -5300,6 +6737,11 @@ public class MobMateWhisp implements NativeKeyListener {
         // prefsから都度読む（UI表示用）
         boolean autoGainEnabledNow = prefs.getBoolean("audio.autoGain", false);
         float userGain = prefs.getFloat("audio.inputGainMultiplier", 1.0f);
+
+        if (ignorePreloadPending || LocalWhisperCPP.isIgnoreExpansionBusy()) {
+            gainMeter.setValue(0, -60.0, autoGainEnabledNow, autoGainMultiplier, userGain, false);
+            return;
+        }
 
         // 「最近喋ってたか？」判定：ここが無音で0へ戻すコア
         long now = System.currentTimeMillis();
@@ -5429,6 +6871,24 @@ public class MobMateWhisp implements NativeKeyListener {
             w.setLocationRelativeTo(null);
         }
     }
+    private void normalizeUtilityWindowBoundsOnce(Window w, String prefix, Rectangle fallback) {
+        if (w == null || fallback == null) return;
+        String fixedKey = k(prefix, "autofit_reset_done");
+        if (prefs.getBoolean(fixedKey, false)) return;
+
+        Rectangle b = w.getBounds();
+        int width = Math.min(b.width, fallback.width);
+        int height = Math.min(b.height, fallback.height);
+        if (width != b.width || height != b.height) {
+            w.setBounds(b.x, b.y, width, height);
+            prefs.putInt(k(prefix, "x"), b.x);
+            prefs.putInt(k(prefix, "y"), b.y);
+            prefs.putInt(k(prefix, "w"), width);
+            prefs.putInt(k(prefix, "h"), height);
+        }
+        prefs.putBoolean(fixedKey, true);
+        try { prefs.sync(); } catch (Exception ignore) {}
+    }
     private void installBoundsSaver(Window w, String prefix) {
         w.addComponentListener(new ComponentAdapter() {
             private long lastSaveMs = 0;
@@ -5498,6 +6958,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 }
 
                 restoreBounds(dlg, "ui.settings", fb);
+                normalizeUtilityWindowBoundsOnce(dlg, "ui.settings", fb);
                 installBoundsSaver(dlg, "ui.settings");
 
                 settingsCenterFrame = dlg;
@@ -5529,12 +6990,14 @@ public class MobMateWhisp implements NativeKeyListener {
     public void showHistory() {
         if (historyFrame != null && historyFrame.isShowing()) {
             setHistoryStartupPref(true);
+            historyFrame.refreshTalkControls();
             historyFrame.toFront();
             historyFrame.requestFocus();
             return;
         }
 
         historyFrame = new HistoryFrame(this);
+        historyFrame.refreshTalkControls();
         historyFrame.setMinimumSize(new Dimension(510, 200));
         historyFrame.setSize(510, 400);
         SwingUtilities.updateComponentTreeUI(historyFrame);
@@ -5546,6 +7009,7 @@ public class MobMateWhisp implements NativeKeyListener {
             fb = new Rectangle(15, 80, 510, 400);
         }
         restoreBounds(historyFrame, "ui.history", fb);
+        normalizeUtilityWindowBoundsOnce(historyFrame, "ui.history", fb);
         installBoundsSaver(historyFrame, "ui.history");
 
         historyFrame.addWindowListener(new WindowAdapter() {
@@ -7262,6 +8726,7 @@ public class MobMateWhisp implements NativeKeyListener {
         Config.log("[SOFT_RESTART] inference drained=" + drained + ", nulling whisper refs");
         // ★v1.5.0: Moonshine解放
         shutdownMoonshine();
+        unloadTalkPostProcessor();
         LocalWhisperCPP old = this.w;
         this.w = null;
         try {
@@ -7353,7 +8818,7 @@ public class MobMateWhisp implements NativeKeyListener {
         FontBootstrap.registerBundledFonts();
         String suffix = prefs.get("ui.language", "en");
         UiFontApplier.applyDefaultUIFontBySuffix(suffix);  // family設定（size=12固定）
-        int fontSize = prefs.getInt("ui.font.size", 14);   // ★デフォルト16に修正
+        int fontSize = prefs.getInt("ui.font.size", DEFAULT_UI_FONT_SIZE);
         applyUIFont(fontSize);                              // ★ユーザーサイズで上書き
 
         // (4) ★v1.5.0: エンジン選択に応じて再初期化
@@ -7377,6 +8842,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 Config.log("[SOFT_RESTART] Model : " + model);
                 try {
                     MobMateWhisp.this.w = new LocalWhisperCPP(modelFile, "");
+                    try { MobMateWhisp.this.w.setLanguage(getTalkLanguage()); } catch (Exception ignore) {}
                     Config.log("[SOFT_RESTART] Whisper model reloaded: " + model);
                 } catch (FileNotFoundException e1) {
                     Config.logError("[SOFT_RESTART] Model not found: " + modelFile, null);
@@ -7390,7 +8856,7 @@ public class MobMateWhisp implements NativeKeyListener {
         this.speakerProfile = new SpeakerProfile(
                 prefs.getInt("speaker.enroll_samples", 5),
                 prefs.getFloat("speaker.threshold_initial", 0.60f),
-                prefs.getFloat("speaker.threshold_target", 0.82f)
+                prefs.getFloat("speaker.threshold_target", prefs.getFloat("speaker.threshold_initial", 0.60f))
         );
 
         // (6) 各種設定再読み込み
@@ -7553,6 +9019,7 @@ class GainMeter extends JComponent {
     private long speakerPeakHoldAt = 0;
 
     private final Timer animTimer;
+    private boolean compactLabels = false;
 
     // ===== Waveform overlay (pixel-column ring) =====
     private final Object waveLock = new Object();
@@ -7574,6 +9041,11 @@ class GainMeter extends JComponent {
         animTimer.setCoalesce(true);
         animTimer.start();
     }
+    public void setCompactLabels(boolean compactLabels) {
+        this.compactLabels = compactLabels;
+        repaint();
+    }
+
 
     /**
      * 16bit little-endian PCM を受け取り、波形表示用に min/max をリングへ溜める
@@ -7806,38 +9278,40 @@ class GainMeter extends JComponent {
             g2.setColor(new Color(255, 255, 255, 60));
             g2.drawRoundRect(0, 0, w - 1, h - 1, 10, 10);
 
-            // ★マイク入力のdB + gain（左側）
-            String micDbStr = String.format("%+.1f dB", dispDb);
-            float effective = userMul * autoMul;
-            String gainStr;
-            if (auto) {
-                gainStr = String.format("A-x%.2f", effective);
+            // ★dBテキスト（compactLabels時は Hearing 用にかなり短くする）
+            String micText;
+            String speakerText;
+            if (compactLabels) {
+                int micDb = (int) Math.round(Math.max(-20.0, dispDb));
+                int spDb = (int) Math.round(Math.max(-20.0, dispSpeakerDb));
+                micText = String.format(Locale.ROOT, "%+ddB", micDb);
+                speakerText = String.format(Locale.ROOT, "%+ddB", spDb);
             } else {
-                gainStr = (userMul > 1.01f) ? String.format("x%.1f", userMul) : "";
+                String micDbStr = String.format(Locale.ROOT, "%+.1f dB", dispDb);
+                float effective = userMul * autoMul;
+                String gainStr;
+                if (auto) {
+                    gainStr = String.format(Locale.ROOT, "A-x%.2f", effective);
+                } else {
+                    gainStr = (userMul > 1.01f) ? String.format(Locale.ROOT, "x%.1f", userMul) : "";
+                }
+                micText = gainStr.isEmpty() ? micDbStr : (micDbStr + " " + gainStr);
+                speakerText = String.format(Locale.ROOT, "%+.1f dB", dispSpeakerDb);
             }
-            String micText = gainStr.isEmpty() ? micDbStr : (micDbStr + " " + gainStr);
 
-            // ★スピーカー出力のdB（右側）
-            String speakerText = String.format("%+.1f dB", dispSpeakerDb);
-
-            g2.setFont(getFont().deriveFont(Font.BOLD, Math.max(11f, h * 0.55f)));
-
-            // ★dBテキスト：左下寄せ＆一回り小さく
             Font base = getFont();
-            Font small = base.deriveFont(Math.max(9f, base.getSize2D() * 0.75f)); // さらに小さめ
+            Font small = base.deriveFont(compactLabels ? Math.max(8f, base.getSize2D() * 0.70f) : Math.max(9f, base.getSize2D() * 0.75f));
             g2.setFont(small);
 
             FontMetrics fm = g2.getFontMetrics();
-            int ty = pad + barH - 4; // 下寄せ
+            int ty = pad + barH - 4;
 
-            // ★マイク入力テキスト（左下）
             int micTx = pad + 4;
             g2.setColor(new Color(0, 0, 0, 140));
             g2.drawString(micText, micTx + 1, ty + 1);
             g2.setColor(new Color(235, 235, 235, 220));
             g2.drawString(micText, micTx, ty);
 
-            // ★スピーカー出力テキスト（右下）
             int speakerTextW = fm.stringWidth(speakerText);
             int speakerTx = pad + barW - speakerTextW - 4;
             g2.setColor(new Color(0, 0, 0, 140));
@@ -7901,7 +9375,7 @@ final class UiFontApplier {
             default      -> null;
         };
 
-        int size = 12;
+        int size = MobMateWhisp.DEFAULT_UI_FONT_SIZE;
         Font base = pickByPrefixOrFallback(prefix, size);
         setAllUIDefaultFonts(base);
 
@@ -7935,10 +9409,64 @@ final class UiFontApplier {
 
     /** 既に作ったUIへ反映（Frame作成後に呼ぶ） */
     public static void refreshAllUI(Window root) {
+        if (root == null) return;
         SwingUtilities.updateComponentTreeUI(root);
         root.invalidate();
         root.validate();
         root.repaint();
+    }
+
+    public static void ensureWindowFitsPreferredSize(Window root) {
+        if (root == null) return;
+
+        Dimension preferred = root.getPreferredSize();
+        Dimension minimum = root.getMinimumSize();
+        if (preferred == null) return;
+
+        Rectangle bounds = root.getBounds();
+        int width = Math.max(bounds.width, Math.max(preferred.width, minimum.width));
+        int height = Math.max(bounds.height, Math.max(preferred.height, minimum.height));
+
+        Rectangle usable = findUsableScreenBounds(bounds);
+        int x = bounds.x;
+        int y = bounds.y;
+        if (usable != null) {
+            width = Math.min(width, usable.width);
+            height = Math.min(height, usable.height);
+            x = Math.max(usable.x, Math.min(x, usable.x + usable.width - width));
+            y = Math.max(usable.y, Math.min(y, usable.y + usable.height - height));
+        }
+
+        if (x != bounds.x || y != bounds.y || width != bounds.width || height != bounds.height) {
+            root.setBounds(x, y, width, height);
+        }
+        root.validate();
+    }
+
+    private static Rectangle findUsableScreenBounds(Rectangle target) {
+        GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
+        Rectangle best = null;
+        long bestArea = Long.MIN_VALUE;
+
+        for (GraphicsDevice gd : ge.getScreenDevices()) {
+            GraphicsConfiguration gc = gd.getDefaultConfiguration();
+            Rectangle raw = gc.getBounds();
+            Insets insets = Toolkit.getDefaultToolkit().getScreenInsets(gc);
+            Rectangle usable = new Rectangle(
+                    raw.x + insets.left,
+                    raw.y + insets.top,
+                    Math.max(1, raw.width - insets.left - insets.right),
+                    Math.max(1, raw.height - insets.top - insets.bottom)
+            );
+            Rectangle inter = usable.intersection(target);
+            long area = (long) Math.max(0, inter.width) * Math.max(0, inter.height);
+            if (area > bestArea) {
+                bestArea = area;
+                best = usable;
+            }
+        }
+
+        return best;
     }
 
     // ---- internal helpers ----
@@ -8438,3 +9966,25 @@ final class VoicegerManager {
         return miss;
     }
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

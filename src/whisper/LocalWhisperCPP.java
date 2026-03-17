@@ -42,6 +42,14 @@ public class LocalWhisperCPP {
     private static volatile String cachedIgnoreModeStatic = "simple";
     private static volatile List<String> cachedIgnoreWordsStatic = new ArrayList<>();
     private static volatile List<Pattern> cachedIgnorePatternsStatic = new ArrayList<>();
+    private static final Object IGNORE_TRANSLATION_LOCK = new Object();
+    private static volatile LocalTranslator ignoreTranslator;
+    private static final Map<String, String> ignoreTranslationCache = new HashMap<>();
+    private static final Map<String, List<String>> ignoreExpandedWordsCache = new HashMap<>();
+    private static final String IGNORE_EXPANDED_CACHE_FILE_NAME = "_ignore_expanded_cache.properties";
+    private static volatile boolean ignoreExpandedWordsDiskLoaded = false;
+    private static final java.util.concurrent.atomic.AtomicInteger ignoreExpansionBusyCount = new java.util.concurrent.atomic.AtomicInteger(0);
+    private static final java.util.concurrent.atomic.AtomicInteger ignoreExpansionProgressPct = new java.util.concurrent.atomic.AtomicInteger(-1);
 
 
     public synchronized void setHearingTranslateToEn(boolean v) {
@@ -99,9 +107,9 @@ public class LocalWhisperCPP {
         // ★Hearingモードは言語自動検出、プロンプトなし
         if (isHearingMode) {
             this.language = "auto"; // 自動検出
-            this.initialPrompt = ""; // プロンプトなし
-            this.cachedInitialPrompt = "";
-            initialPromptDirty = false;
+            this.initialPrompt = (prefs != null) ? prefs.get("hearing.initial_prompt", "") : "";
+            this.cachedInitialPrompt = null;
+            initialPromptDirty = true;
         } else {
             // 通常モード（MobMate本体）
             this.language = Config.loadSetting("language", "en");
@@ -222,7 +230,7 @@ public class LocalWhisperCPP {
         p.language = lang;
 //        p.detect_language = auto ? CBool.TRUE : CBool.FALSE;
 
-        p.initial_prompt = ""; // ★Hearing用はプロンプトなし
+        p.initial_prompt = buildInitialPrompt(); // ★Hearing用も専用promptを許可
         // ★翻訳時は言語を明示的に設定
         if (this.hearingTranslateToEn) {
             p.translate = CBool.TRUE;
@@ -235,28 +243,20 @@ public class LocalWhisperCPP {
 
 
     private static void applyTranslatePref(WhisperFullParams p) {
-        boolean on = false;
-        try {
-            on = (MobMateWhisp.prefs != null) &&
-                    MobMateWhisp.prefs.getBoolean("whisper.translate_to_en", false);
-        } catch (Exception ignore) {}
-
-        // ★重要：ON/OFFどっちでも必ず反映する（OFF時に false を書く）
         try {
             java.lang.reflect.Field f = p.getClass().getField("translate");
             Class<?> t = f.getType();
 
             if (t == boolean.class) {
-                f.setBoolean(p, on);
+                f.setBoolean(p, false);
             } else if (t == Boolean.class) {
-                f.set(p, on);
+                f.set(p, false);
             } else if (t == int.class) {
-                f.setInt(p, on ? 1 : 0);
+                f.setInt(p, 0);
             } else if (t.getSimpleName().equals("CBool")) {
-                f.set(p, on ? CBool.TRUE : CBool.FALSE);
+                f.set(p, CBool.FALSE);
             } else {
-                // last resort
-                f.set(p, on);
+                f.set(p, false);
             }
         } catch (Exception ignore) {
             // bindingsにフィールドが無い場合は何もしない
@@ -267,11 +267,11 @@ public class LocalWhisperCPP {
 
 
     private String buildInitialPrompt() {
-        // ★Hearingモードは常に空
+        // ★Hearing用は専用promptを使う（Whisper backendのみ有効）
         if (isHearingMode) {
-            return "";
+            String hearingPrompt = (prefs != null) ? prefs.get("hearing.initial_prompt", "") : "";
+            return (hearingPrompt == null) ? "" : hearingPrompt.trim();
         }
-
         if (!initialPromptDirty && cachedInitialPrompt != null) {
             return cachedInitialPrompt;
         }
@@ -296,6 +296,265 @@ public class LocalWhisperCPP {
         initialPromptDirty = true;
     }
 
+    private static String normalizeIgnoreTranslationLang(String lang) {
+        if (lang == null || lang.isBlank()) return null;
+        String normalized = lang.trim().toLowerCase(Locale.ROOT);
+        if ("auto".equals(normalized) || "off".equals(normalized)) return null;
+        if ("zh-cn".equals(normalized) || "zh-tw".equals(normalized)) normalized = "zh";
+        return LanguageOptions.isTranslationLangSupported(normalized) ? normalized : null;
+    }
+
+    private static boolean shouldTranslateIgnoreRule(String rule) {
+        if (rule == null) return false;
+        String text = rule.trim();
+        if (text.isEmpty()) return false;
+        int cp = text.codePointCount(0, text.length());
+        if (cp < 2 || cp > 40) return false;
+        return !text.matches(".*[\\\\^$.*+?()\\\\[\\\\]{}|].*");
+    }
+
+    private static String guessIgnoreSourceLang(String text) {
+        if (text == null || text.isBlank()) return null;
+        boolean hasHiraganaKatakana = false;
+        boolean hasHangul = false;
+        boolean hasHan = false;
+        boolean hasLatin = false;
+        for (int i = 0; i < text.length(); i++) {
+            char ch = text.charAt(i);
+            Character.UnicodeBlock block = Character.UnicodeBlock.of(ch);
+            if (block == Character.UnicodeBlock.HIRAGANA || block == Character.UnicodeBlock.KATAKANA
+                    || block == Character.UnicodeBlock.KATAKANA_PHONETIC_EXTENSIONS) {
+                hasHiraganaKatakana = true;
+            } else if (block == Character.UnicodeBlock.HANGUL_SYLLABLES
+                    || block == Character.UnicodeBlock.HANGUL_JAMO
+                    || block == Character.UnicodeBlock.HANGUL_COMPATIBILITY_JAMO) {
+                hasHangul = true;
+            } else if (block == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS
+                    || block == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_A
+                    || block == Character.UnicodeBlock.CJK_UNIFIED_IDEOGRAPHS_EXTENSION_B
+                    || block == Character.UnicodeBlock.CJK_COMPATIBILITY_IDEOGRAPHS) {
+                hasHan = true;
+            } else if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) {
+                hasLatin = true;
+            }
+        }
+        if (hasHangul) return "ko";
+        if (hasHiraganaKatakana) return "ja";
+        if (hasHan) return "zh";
+        if (hasLatin) return "en";
+        return null;
+    }
+
+    private static LocalTranslator getOrCreateIgnoreTranslator() {
+        synchronized (IGNORE_TRANSLATION_LOCK) {
+            if (ignoreTranslator != null && ignoreTranslator.isLoaded()) return ignoreTranslator;
+            File exeDir = new File(System.getProperty("user.dir", "."));
+            File modelDir = new File(exeDir, "models" + File.separator + "translation");
+            if (!modelDir.isDirectory()) return null;
+            LocalTranslator translator = new LocalTranslator(modelDir, 1);
+            if (!translator.load(exeDir)) return null;
+            ignoreTranslator = translator;
+            return ignoreTranslator;
+        }
+    }
+
+    private static String translateIgnoreRule(String rule, String srcLang, String targetLang) {
+        if (!shouldTranslateIgnoreRule(rule)) return null;
+        String src = normalizeIgnoreTranslationLang(srcLang);
+        String tgt = normalizeIgnoreTranslationLang(targetLang);
+        if (src == null || tgt == null || src.equals(tgt)) return null;
+        String cacheKey = src + "->" + tgt + "|" + rule.trim();
+        synchronized (IGNORE_TRANSLATION_LOCK) {
+            if (ignoreTranslationCache.containsKey(cacheKey)) {
+                return ignoreTranslationCache.get(cacheKey);
+            }
+        }
+        LocalTranslator translator = getOrCreateIgnoreTranslator();
+        if (translator == null) return null;
+        String translated = translator.translate(rule.trim(), src, tgt);
+        if (translated != null) translated = translated.trim();
+        if (translated != null && translated.equalsIgnoreCase(rule.trim())) translated = null;
+        synchronized (IGNORE_TRANSLATION_LOCK) {
+            ignoreTranslationCache.put(cacheKey, translated);
+        }
+        return translated;
+    }
+
+    private static List<String> expandIgnoreWords(List<String> baseWords, Collection<String> targetLangs) {
+        LinkedHashSet<String> expanded = new LinkedHashSet<>();
+        if (baseWords == null || baseWords.isEmpty()) return new ArrayList<>();
+        ignoreExpansionBusyCount.incrementAndGet();
+        java.util.List<String> targets = (targetLangs == null) ? java.util.Collections.emptyList() : new java.util.ArrayList<>(targetLangs);
+        int totalSteps = Math.max(1, baseWords.size() + (targets.size() * Math.max(1, baseWords.size())));
+        int doneSteps = 0;
+        ignoreExpansionProgressPct.set(0);
+        try {
+            for (String word : baseWords) {
+                if (word != null) {
+                    String trimmed = word.trim();
+                    if (!trimmed.isEmpty()) expanded.add(trimmed);
+                }
+                doneSteps++;
+                ignoreExpansionProgressPct.set(Math.min(99, (doneSteps * 100) / totalSteps));
+            }
+            if (targets.isEmpty()) {
+                ignoreExpansionProgressPct.set(100);
+                return new ArrayList<>(expanded);
+            }
+
+            for (String targetLang : targets) {
+                String normalizedTarget = normalizeIgnoreTranslationLang(targetLang);
+                if (normalizedTarget == null) {
+                    doneSteps += baseWords.size();
+                    ignoreExpansionProgressPct.set(Math.min(99, (doneSteps * 100) / totalSteps));
+                    continue;
+                }
+                for (String word : baseWords) {
+                    if (word != null) {
+                        String trimmed = word.trim();
+                        if (!trimmed.isEmpty()) {
+                            String src = guessIgnoreSourceLang(trimmed);
+                            if (src != null && !normalizedTarget.equals(src)) {
+                                String translated = translateIgnoreRule(trimmed, src, normalizedTarget);
+                                if (translated != null && !translated.isBlank()) expanded.add(translated);
+                            }
+                        }
+                    }
+                    doneSteps++;
+                    ignoreExpansionProgressPct.set(Math.min(99, (doneSteps * 100) / totalSteps));
+                }
+            }
+            ignoreExpansionProgressPct.set(100);
+            return new ArrayList<>(expanded);
+        } finally {
+            if (ignoreExpansionBusyCount.decrementAndGet() <= 0) {
+                ignoreExpansionProgressPct.set(-1);
+            }
+        }
+    }
+
+    private static String sha256Hex(String text) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(digest.length * 2);
+            for (byte b : digest) {
+                sb.append(String.format(java.util.Locale.ROOT, "%02x", b));
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return Integer.toHexString(text.hashCode());
+        }
+    }
+
+    private static String buildIgnoreExpandedCacheKey(List<String> baseWords, Collection<String> targetLangs) {
+        java.util.List<String> normalizedTargets = new java.util.ArrayList<>();
+        if (targetLangs != null) {
+            for (String lang : targetLangs) {
+                String normalized = normalizeIgnoreTranslationLang(lang);
+                if (normalized != null && !normalizedTargets.contains(normalized)) {
+                    normalizedTargets.add(normalized);
+                }
+            }
+        }
+        java.util.Collections.sort(normalizedTargets);
+        return "v1:" + sha256Hex(baseWords.toString() + "||" + String.join(",", normalizedTargets));
+    }
+
+    private static File getIgnoreExpandedCacheFile() {
+        File exeDir = new File(System.getProperty("user.dir", "."));
+        return new File(exeDir, IGNORE_EXPANDED_CACHE_FILE_NAME);
+    }
+
+    private static void ensureIgnoreExpandedCacheDiskLoaded() {
+        synchronized (IGNORE_TRANSLATION_LOCK) {
+            if (ignoreExpandedWordsDiskLoaded) return;
+            ignoreExpandedWordsDiskLoaded = true;
+            File cacheFile = getIgnoreExpandedCacheFile();
+            if (!cacheFile.isFile()) return;
+            Properties props = new Properties();
+            try (InputStream in = new FileInputStream(cacheFile)) {
+                props.load(in);
+                for (String key : props.stringPropertyNames()) {
+                    String encoded = props.getProperty(key, "");
+                    if (encoded == null || encoded.isBlank()) continue;
+                    byte[] decoded = Base64.getDecoder().decode(encoded);
+                    String joined = new String(decoded, java.nio.charset.StandardCharsets.UTF_8);
+                    java.util.List<String> words = new java.util.ArrayList<>();
+                    for (String line : joined.split("\\n")) {
+                        String trimmed = line.trim();
+                        if (!trimmed.isEmpty()) words.add(trimmed);
+                    }
+                    ignoreExpandedWordsCache.put(key, words);
+                }
+            } catch (Exception e) {
+                Config.logDebug("[Ignore] cache load skipped: " + e.getMessage());
+            }
+        }
+    }
+
+    private static void persistIgnoreExpandedCacheToDisk() {
+        synchronized (IGNORE_TRANSLATION_LOCK) {
+            Properties props = new Properties();
+            for (Map.Entry<String, List<String>> entry : ignoreExpandedWordsCache.entrySet()) {
+                String joined = String.join("\n", entry.getValue());
+                String encoded = Base64.getEncoder().encodeToString(joined.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                props.setProperty(entry.getKey(), encoded);
+            }
+            try (OutputStream out = new FileOutputStream(getIgnoreExpandedCacheFile())) {
+                props.store(out, "MobMate ignore expanded cache");
+            } catch (Exception e) {
+                Config.logDebug("[Ignore] cache save skipped: " + e.getMessage());
+            }
+        }
+    }
+
+    private static List<String> getExpandedIgnoreWordsCached(List<String> baseWords, Collection<String> targetLangs) {
+        if (baseWords == null || baseWords.isEmpty()) return new ArrayList<>();
+        ensureIgnoreExpandedCacheDiskLoaded();
+        String cacheKey = buildIgnoreExpandedCacheKey(baseWords, targetLangs);
+        synchronized (IGNORE_TRANSLATION_LOCK) {
+            List<String> cached = ignoreExpandedWordsCache.get(cacheKey);
+            if (cached != null) {
+                return new ArrayList<>(cached);
+            }
+        }
+        List<String> expanded = expandIgnoreWords(baseWords, targetLangs);
+        synchronized (IGNORE_TRANSLATION_LOCK) {
+            ignoreExpandedWordsCache.put(cacheKey, new ArrayList<>(expanded));
+        }
+        persistIgnoreExpandedCacheToDisk();
+        return new ArrayList<>(expanded);
+    }
+    public static boolean isIgnoreExpansionBusy() {
+        return ignoreExpansionBusyCount.get() > 0;
+    }
+
+    public static int getIgnoreExpansionProgressPct() {
+        return ignoreExpansionProgressPct.get();
+    }
+
+    public static void preloadIgnoreWordsForLangs(Collection<String> targetLangs) {
+        String mode = Config.get("ignore.mode", "simple");
+        if ("regex".equalsIgnoreCase(mode)) return;
+        List<String> baseWords = Config.loadIgnoreWords();
+        if (baseWords == null || baseWords.isEmpty()) return;
+        getExpandedIgnoreWordsCached(baseWords, targetLangs);
+    }
+
+    private static List<String> getStaticIgnoreTargetLangs() {
+        LinkedHashSet<String> langs = new LinkedHashSet<>();
+        try {
+            if (prefs != null) {
+                String talkTarget = LanguageOptions.normalizeTranslationTarget(prefs.get("talk.translate.target", "OFF"));
+                if (!"OFF".equals(talkTarget)) {
+                    langs.add(prefs.get("talk.lang", "auto"));
+                }
+            }
+        } catch (Exception ignore) {}
+        return new ArrayList<>(langs);
+    }
+
     public static void markDictionaryDirty() {
         dictionaryDirty = true;
     }
@@ -303,7 +562,9 @@ public class LocalWhisperCPP {
     private void reloadIgnoreIfNeeded() {
         if (!ignoreDirty && instanceIgnoreLoaded) return;   // ★変更
         cachedIgnoreMode = Config.get("ignore.mode", "simple");
-        cachedIgnoreWords = Config.loadIgnoreWords();
+        cachedIgnoreWords = "regex".equalsIgnoreCase(cachedIgnoreMode)
+                ? Config.loadIgnoreWords()
+                : getExpandedIgnoreWordsCached(Config.loadIgnoreWords(), java.util.Collections.singletonList(this.language));
         cachedIgnorePatterns.clear();
         if ("regex".equalsIgnoreCase(cachedIgnoreMode)) {
             for (String rule : cachedIgnoreWords) {
@@ -318,6 +579,26 @@ public class LocalWhisperCPP {
         ignoreDirty = false;
     }
 
+    private static String normalizeIgnoreSimpleMatch(String text) {
+        if (text == null) return "";
+        String s = text.trim().toLowerCase(Locale.ROOT);
+        s = MobMateWhisp.removeCjkSpaces(s);
+        s = s.replaceAll("[\\s\\p{Punct}、。！？「」『』（）()\\[\\]{}【】…・~〜ー]+", "");
+        return s;
+    }
+
+    private static boolean matchesIgnoreSimple(String text, String normalizedText, String rule) {
+        if (text == null || text.isEmpty() || rule == null || rule.isEmpty()) return false;
+        if (text.contains(rule)) return true;
+        String normalizedRule = normalizeIgnoreSimpleMatch(rule);
+        if (normalizedRule.isEmpty() || normalizedText.isEmpty()) return false;
+        String trimmedRule = rule.trim();
+        boolean hasPunctuation = !trimmedRule.equals(trimmedRule.replaceAll("[\\s\\p{Punct}、。！？「」『』（）()\\[\\]{}【】…・~〜ー]+", ""));
+        int normalizedCp = normalizedRule.codePointCount(0, normalizedRule.length());
+        if (hasPunctuation && normalizedCp <= 3) return false;
+        return normalizedText.contains(normalizedRule);
+    }
+
     public boolean isIgnored(String text) {
         if (text == null || text.isEmpty()) return false;
         reloadIgnoreIfNeeded();
@@ -328,8 +609,9 @@ public class LocalWhisperCPP {
                 }
             }
         } else {
+            String normalizedText = normalizeIgnoreSimpleMatch(text);
             for (String w : cachedIgnoreWords) {
-                if (!w.isEmpty() && text.contains(w)) {
+                if (matchesIgnoreSimple(text, normalizedText, w)) {
                     return true;
                 }
             }
@@ -343,7 +625,9 @@ public class LocalWhisperCPP {
             if (!ignoreStaticDirty) return;
 
             String mode = Config.get("ignore.mode", "simple");
-            List<String> words = Config.loadIgnoreWords();
+            List<String> words = "regex".equalsIgnoreCase(mode)
+                    ? Config.loadIgnoreWords()
+                    : getExpandedIgnoreWordsCached(Config.loadIgnoreWords(), getStaticIgnoreTargetLangs());
 
             List<Pattern> pats = new ArrayList<>();
             if ("regex".equalsIgnoreCase(mode)) {
@@ -379,8 +663,9 @@ public class LocalWhisperCPP {
             return false;
         }
 
+        String normalizedText = normalizeIgnoreSimpleMatch(text);
         for (String w : cachedIgnoreWordsStatic) {
-            if (w != null && !w.isEmpty() && text.contains(w)) return true;
+            if (matchesIgnoreSimple(text, normalizedText, w)) return true;
         }
         return false;
     }
@@ -388,6 +673,11 @@ public class LocalWhisperCPP {
     public static void markIgnoreDirty() {
         ignoreDirty = true;
         ignoreStaticDirty = true;
+        synchronized (IGNORE_TRANSLATION_LOCK) {
+            ignoreTranslationCache.clear();
+            ignoreExpandedWordsCache.clear();
+            ignoreExpandedWordsDiskLoaded = false;
+        }
     }
 
     public static void applySoftwareGain(short[] samples, float gain) {
@@ -1381,3 +1671,14 @@ class LaughDetector {
         }
     }
 }
+
+
+
+
+
+
+
+
+
+
+
