@@ -20,6 +20,8 @@ public class HistoryFrame extends JFrame implements ChangeListener {
     private final JLabel partialLabel = new JLabel(" ");
     private final JComboBox<String> talkLangCombo = new JComboBox<>();
     private final JComboBox<String> talkTranslateTargetCombo = new JComboBox<>(LanguageOptions.translationTargets());
+    private final JButton approvePendingButton = new JButton(UiText.t("ui.history.confirm.approve"));
+    private final JButton cancelPendingButton = new JButton(UiText.t("ui.history.confirm.cancel"));
     private boolean adjustingTalkControls = false;
     public static final int HISTORY_MAX_LINES = 100;
     private final java.util.concurrent.BlockingQueue<String> radioSpeakQueue =
@@ -30,7 +32,7 @@ public class HistoryFrame extends JFrame implements ChangeListener {
     private void updateTitle() {
         String mode = mobMateWhisp.getCpuGpuMode(); // "Vulkan MODE" or "CPU MODE"
         String demo = SteamHelper.isDemoMode() ? " [TRIAL]" : "";
-        setTitle("History [" + ((mode.equals(""))? "CPU MODE": mode) + "]" + demo);
+        setTitle("MobMate Talk [" + ((mode.equals("")) ? "CPU MODE" : mode) + "]" + demo);
     }
     public HistoryFrame(final MobMateWhisp mobMateWhisp) {
         this.mobMateWhisp = mobMateWhisp;
@@ -107,12 +109,16 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         buttonPanel.add(openDict);
         buttonPanel.add(openGood);
         buttonPanel.add(openRadio);
+        buttonPanel.add(approvePendingButton);
+        buttonPanel.add(cancelPendingButton);
 
         openOutTts.addActionListener(e -> openTextFile("_outtts.txt"));
         openIgnore.addActionListener(e -> openTextFile("_ignore.txt"));
         openDict.addActionListener(e -> openTextFile("_dictionary.txt"));
         openGood.addActionListener(e -> openTextFile("_initprmpt_add.txt"));
         openRadio.addActionListener(e -> openTextFile("_radiocmd.txt"));
+        approvePendingButton.addActionListener(e -> mobMateWhisp.approvePendingConfirm());
+        cancelPendingButton.addActionListener(e -> mobMateWhisp.cancelPendingConfirm());
 
         clearButton.addActionListener(e -> mobMateWhisp.clearHistory());
 
@@ -166,6 +172,7 @@ public class HistoryFrame extends JFrame implements ChangeListener {
 
         // ===== Listeners =====
         refreshTalkControls();
+        refreshConfirmControls();
         mobMateWhisp.addHistoryListener(this);
 
         this.addWindowListener(new WindowAdapter() {
@@ -249,6 +256,7 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         historyListPanel.add(Box.createVerticalGlue());
         historyListPanel.revalidate();
         historyListPanel.repaint();
+        refreshConfirmControls();
     }
 
     public void refresh() {
@@ -323,6 +331,18 @@ public class HistoryFrame extends JFrame implements ChangeListener {
             } finally {
                 adjustingTalkControls = false;
             }
+        });
+    }
+    public void refreshConfirmControls() {
+        SwingUtilities.invokeLater(() -> {
+            boolean enabled = mobMateWhisp.isTtsConfirmModeEnabled() && mobMateWhisp.hasPendingConfirm();
+            String tooltip = String.join("\n", mobMateWhisp.getPendingConfirmPreviewList(4));
+            approvePendingButton.setEnabled(enabled);
+            cancelPendingButton.setEnabled(enabled);
+            approvePendingButton.setVisible(mobMateWhisp.isTtsConfirmModeEnabled());
+            cancelPendingButton.setVisible(mobMateWhisp.isTtsConfirmModeEnabled());
+            approvePendingButton.setToolTipText(tooltip);
+            cancelPendingButton.setToolTipText(tooltip);
         });
     }
     // ★ADD: Moonshine partial プレビュー更新（MobMateWhispから呼ばれる）

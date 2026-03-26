@@ -50,7 +50,9 @@ public class SpeakerProfile {
     private static final int SPEAKER_RMS_WINDOW_SAMPLES = 1600; // 100ms @ 16kHz
     private static final double SOFT_MIN_RMS_FOR_SPEAKER_PASS = MIN_RMS_FOR_SPEAKER_CHECK * 0.90;
     private static final double HARD_MIN_RMS_FOR_SPEAKER_PASS = MIN_RMS_FOR_SPEAKER_CHECK * 0.75;
+    private static final double SHORT_PHRASE_MIN_RMS_FOR_SPEAKER_PASS = MIN_RMS_FOR_SPEAKER_CHECK * 0.65;
     private static final double LOW_ENERGY_SCORE_MARGIN = 0.12;
+    private static final double SHORT_PHRASE_SCORE_MARGIN = 0.22;
 
     public SpeakerProfile(int requiredSamples, double initialThreshold, double targetThreshold) {
         this.requiredSamples = Math.max(1, requiredSamples);
@@ -567,6 +569,10 @@ public class SpeakerProfile {
             } else if (effectiveRms >= HARD_MIN_RMS_FOR_SPEAKER_PASS
                     && voicedMs >= 1000.0
                     && score >= (threshold + LOW_ENERGY_SCORE_MARGIN)) {
+                lowEnergyPass = true;
+            } else if (effectiveRms >= SHORT_PHRASE_MIN_RMS_FOR_SPEAKER_PASS
+                    && voicedMs >= 1200.0
+                    && score >= (threshold + SHORT_PHRASE_SCORE_MARGIN)) {
                 lowEnergyPass = true;
             }
             if (!lowEnergyPass) {

@@ -78,6 +78,8 @@ public class FirstLaunchWizard extends JDialog {
     private volatile boolean inputMeterRunning = false;
     private Thread inputMeterThread;
     private javax.sound.sampled.TargetDataLine inputMeterLine;
+    private JComboBox<String> wizardMicList;
+    private JProgressBar wizardMicLevelBar;
 
     // --- Step 5 Voiceger UI ---
     private JTextField vgDirField;
@@ -183,12 +185,15 @@ public class FirstLaunchWizard extends JDialog {
 
     private void onStepEnter(int s) {
         if (s == STEP_INPUT) {
-            // mic monitor を開始（選択中デバイス）
-            String cur = prefs.get("audio.device", "");
-            if (!cur.isEmpty()) {
-                // Step1 パネル内の bar は rebuild しないので、monitorは step1内で開始済み。
-                // ここでは何もしない（リソースリーク防止のため exit 側で止める）
-            }
+            SwingUtilities.invokeLater(() -> {
+                String selected = wizardMicList != null
+                        ? Objects.toString(wizardMicList.getSelectedItem(), "")
+                        : prefs.get("audio.device", "");
+                if (!selected.isBlank() && wizardMicLevelBar != null) {
+                    stopMicMonitor();
+                    startMicMonitorByName(selected, wizardMicLevelBar);
+                }
+            });
         }
         if (s == STEP_OUTPUT) {
 //            if (outputTestBar != null) startOutputSpeakTest(outputTestBar);
@@ -522,18 +527,19 @@ public class FirstLaunchWizard extends JDialog {
         p.add(title("wizard.step1.title"));
         p.add(text("wizard.step1.desc"));
 
-        JLabel okHint = new JLabel("Success: the meter should move while you speak.");
+        JLabel okHint = new JLabel(UiText.t("wizard.step1.okHint"));
         okHint.setForeground(new Color(76, 175, 80));
         okHint.setBorder(BorderFactory.createEmptyBorder(0, 0, 8, 0));
         p.add(okHint);
 
         JComboBox<String> micList = new JComboBox<>();
+        wizardMicList = micList;
 
         List<String> mixers = mobmatewhisp.getInputsMixerNames();
         Collections.sort(mixers);
 
         if (mixers.isEmpty()) {
-            JLabel err = new JLabel("No input device found. Check Windows microphone settings.");
+            JLabel err = new JLabel(UiText.t("wizard.step1.errNoInput"));
             err.setForeground(new Color(220, 80, 80));
             p.add(err);
             return p;
@@ -560,11 +566,12 @@ public class FirstLaunchWizard extends JDialog {
         p.add(micList);
 
         JProgressBar level = new JProgressBar(0, 100);
+        wizardMicLevelBar = level;
         level.setStringPainted(true);
-        level.setString("Speak now");
+        level.setString(UiText.t("wizard.step1.levelPrompt"));
         p.add(level);
 
-        JLabel subHint = new JLabel("If the meter does not move: check Windows mic level / boost / default device.");
+        JLabel subHint = new JLabel(UiText.t("wizard.step1.subHint"));
         subHint.setForeground(Color.GRAY);
         subHint.setBorder(BorderFactory.createEmptyBorder(8, 0, 0, 0));
         p.add(subHint);
@@ -585,7 +592,6 @@ public class FirstLaunchWizard extends JDialog {
             startMicMonitorByName(name, level);
         });
 
-        startMicMonitorByName(currentAudioDevice, level);
         return p;
     }
 
@@ -654,7 +660,7 @@ public class FirstLaunchWizard extends JDialog {
         p.add(title("wizard.step2.title"));
         p.add(text("wizard.step2.desc"));
 
-        JLabel okHint = new JLabel("Success: click Play test voice, hear \"test now.\", then click Next.");
+        JLabel okHint = new JLabel(UiText.t("wizard.step2.okHint"));
         okHint.setForeground(new Color(76, 175, 80));
         okHint.setBorder(BorderFactory.createEmptyBorder(0, 0, 8, 0));
         p.add(okHint);
@@ -664,7 +670,7 @@ public class FirstLaunchWizard extends JDialog {
         Collections.sort(outputMixers);
 
         if (outputMixers.isEmpty()) {
-            JLabel err = new JLabel("No output device found.");
+            JLabel err = new JLabel(UiText.t("wizard.step2.errNoOutput"));
             err.setForeground(new Color(220, 80, 80));
             p.add(err);
             return p;
@@ -693,20 +699,20 @@ public class FirstLaunchWizard extends JDialog {
         JPanel testRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
         testRow.setOpaque(false);
 
-        JButton testBtn = new JButton("Play test voice");
+        JButton testBtn = new JButton(UiText.t("wizard.step2.testButton"));
         JLabel testStatus = new JLabel(" ");
         testStatus.setForeground(Color.GRAY);
 
         testBtn.addActionListener(e -> {
-            testStatus.setText("Playing...");
+            testStatus.setText(UiText.t("wizard.step2.testPlaying"));
             new Thread(() -> {
                 try {
                     mobmatewhisp.speakWindows("test now.");
                     SwingUtilities.invokeLater(() ->
-                            testStatus.setText("Played. If you heard it, click Next."));
+                            testStatus.setText(UiText.t("wizard.step2.testPlayed")));
                 } catch (Throwable ex) {
                     SwingUtilities.invokeLater(() ->
-                            testStatus.setText("Failed. Check output device."));
+                            testStatus.setText(UiText.t("wizard.step2.testFailed")));
                 }
             }, "WizardOutputTestOnce").start();
         });
@@ -715,7 +721,10 @@ public class FirstLaunchWizard extends JDialog {
         testRow.add(testStatus);
         p.add(testRow);
 
-        JLabel nextHint = new JLabel("Next step: hold Push-to-Talk in the main window and speak until captions appear.");
+        p.add(Box.createVerticalStrut(10));
+        p.add(buildVirtualAudioInstallPanel(outputList));
+
+        JLabel nextHint = new JLabel(UiText.t("wizard.step2.nextHint"));
         nextHint.setForeground(Color.GRAY);
         nextHint.setBorder(BorderFactory.createEmptyBorder(8, 0, 0, 0));
         p.add(nextHint);
@@ -734,6 +743,185 @@ public class FirstLaunchWizard extends JDialog {
         });
 
         return p;
+    }
+
+    private JPanel buildVirtualAudioInstallPanel(JComboBox<String> outputList) {
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        panel.setOpaque(false);
+        panel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createTitledBorder(UiText.t("wizard.virtual.title")),
+                BorderFactory.createEmptyBorder(6, 8, 6, 8)
+        ));
+
+        JTextArea hint = new JTextArea(UiText.t("wizard.virtual.desc"));
+        hint.setEditable(false);
+        hint.setOpaque(false);
+        hint.setLineWrap(true);
+        hint.setWrapStyleWord(true);
+        hint.setBorder(BorderFactory.createEmptyBorder(0, 0, 8, 0));
+        panel.add(hint);
+
+        JLabel status = new JLabel(" ");
+        status.setForeground(Color.DARK_GRAY);
+        JPanel btnRow1 = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        btnRow1.setOpaque(false);
+        JPanel btnRow2 = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        btnRow2.setOpaque(false);
+
+        JButton installBtn = new JButton(UiText.t("wizard.virtual.installBtn"));
+        JButton rescanBtn = new JButton(UiText.t("wizard.virtual.rescanBtn"));
+        JButton useBtn = new JButton(UiText.t("wizard.virtual.useBtn"));
+        JButton officialBtn = new JButton(UiText.t("wizard.virtual.officialBtn"));
+        JButton soundUiBtn = new JButton(UiText.t("wizard.virtual.soundUiBtn"));
+
+        installBtn.addActionListener(e -> runVirtualAudioInstallerAsync(outputList, status, installBtn, rescanBtn, useBtn));
+        rescanBtn.addActionListener(e -> refreshVirtualAudioStatus(outputList, status, useBtn));
+        useBtn.addActionListener(e -> applyPreferredVirtualAudioOutput(outputList, status));
+        officialBtn.addActionListener(e -> openBrowser("https://vb-audio.com/Cable/"));
+        soundUiBtn.addActionListener(e -> openWindowsRecordingPanel());
+
+        btnRow1.add(installBtn);
+        btnRow1.add(rescanBtn);
+        btnRow1.add(useBtn);
+        btnRow2.add(officialBtn);
+        btnRow2.add(soundUiBtn);
+        panel.add(btnRow1);
+        panel.add(Box.createVerticalStrut(6));
+        panel.add(btnRow2);
+        panel.add(Box.createVerticalStrut(6));
+        panel.add(status);
+        panel.add(Box.createVerticalStrut(6));
+
+        JTextArea manualHint = new JTextArea(UiText.t("wizard.virtual.manualListenHint"));
+        manualHint.setEditable(false);
+        manualHint.setOpaque(false);
+        manualHint.setLineWrap(true);
+        manualHint.setWrapStyleWord(true);
+        manualHint.setForeground(Color.GRAY);
+        manualHint.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 0));
+        panel.add(manualHint);
+
+        refreshVirtualAudioStatus(outputList, status, useBtn);
+        return panel;
+    }
+
+    private void refreshVirtualAudioStatus(JComboBox<String> outputList, JLabel status, JButton useBtn) {
+        reloadOutputMixerList(outputList);
+
+        List<String> candidates = mobmatewhisp.getVirtualAudioOutputCandidates();
+        String preferred = mobmatewhisp.getPreferredVirtualAudioOutputCandidate();
+        String selected = Objects.toString(outputList.getSelectedItem(), "");
+
+        if (candidates.isEmpty()) {
+            status.setText(UiText.t("wizard.virtual.status.notDetected"));
+            useBtn.setEnabled(false);
+            return;
+        }
+
+        useBtn.setEnabled(true);
+        if (!preferred.isBlank() && !preferred.equals(selected)) {
+            status.setText(tf("wizard.virtual.status.detectedSelect", preferred));
+        } else {
+            status.setText(tf("wizard.virtual.status.detectedReady", preferred));
+        }
+    }
+
+    private void reloadOutputMixerList(JComboBox<String> outputList) {
+        String selected = Objects.toString(outputList.getSelectedItem(), prefs.get("audio.output.device", ""));
+        List<String> outputMixers = mobmatewhisp.getOutputMixerNames();
+        Collections.sort(outputMixers);
+
+        outputList.removeAllItems();
+        for (String name : outputMixers) {
+            outputList.addItem(name);
+        }
+
+        if (!selected.isBlank() && outputMixers.contains(selected)) {
+            outputList.setSelectedItem(selected);
+        } else if (!outputMixers.isEmpty()) {
+            outputList.setSelectedIndex(0);
+        }
+    }
+
+    private void applyPreferredVirtualAudioOutput(JComboBox<String> outputList, JLabel status) {
+        String preferred = mobmatewhisp.getPreferredVirtualAudioOutputCandidate();
+        if (preferred == null || preferred.isBlank()) {
+            status.setText(UiText.t("wizard.virtual.status.noneDetected"));
+            return;
+        }
+
+        outputList.setSelectedItem(preferred);
+        prefs.put("audio.output.device.previous", prefs.get("audio.output.device", ""));
+        prefs.put("audio.output.device", preferred);
+        try {
+            prefs.sync();
+        } catch (BackingStoreException ex) {
+            ex.printStackTrace();
+        }
+        status.setText(tf("wizard.virtual.status.selected", preferred));
+    }
+
+    private void runVirtualAudioInstallerAsync(JComboBox<String> outputList, JLabel status,
+                                               JButton installBtn, JButton rescanBtn, JButton useBtn) {
+        new Thread(() -> {
+            SwingUtilities.invokeLater(() -> {
+                installBtn.setEnabled(false);
+                rescanBtn.setEnabled(false);
+                useBtn.setEnabled(false);
+                status.setText(UiText.t("wizard.virtual.status.downloading"));
+            });
+
+            try {
+                Path installer = findHelperScript("InstallVirtualAudio.bat");
+                if (installer == null) {
+                    SwingUtilities.invokeLater(() -> status.setText(UiText.t("wizard.virtual.status.installerMissing")));
+                    return;
+                }
+
+                ProcessBuilder pb = new ProcessBuilder("cmd", "/c", installer.toAbsolutePath().toString());
+                pb.directory(installer.getParent().toFile());
+                pb.redirectErrorStream(true);
+                Process proc = pb.start();
+                int code = proc.waitFor();
+
+                pollVirtualAudioDetection(outputList, status, useBtn, code == 0
+                        ? UiText.t("wizard.virtual.status.installerDoneChecking")
+                        : tf("wizard.virtual.status.installerExit", code));
+            } catch (Exception ex) {
+                SwingUtilities.invokeLater(() -> status.setText(tf("wizard.virtual.status.installError", ex.getMessage())));
+            } finally {
+                SwingUtilities.invokeLater(() -> {
+                    installBtn.setEnabled(true);
+                    rescanBtn.setEnabled(true);
+                });
+            }
+        }, "WizardVirtualAudioInstall").start();
+    }
+
+    private void pollVirtualAudioDetection(JComboBox<String> outputList, JLabel status, JButton useBtn,
+                                           String initialMessage) {
+        SwingUtilities.invokeLater(() -> status.setText(initialMessage));
+
+        for (int i = 0; i < 30; i++) {
+            try {
+                Thread.sleep(1000);
+            } catch (InterruptedException ignore) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+
+            List<String> candidates = mobmatewhisp.getVirtualAudioOutputCandidates();
+            if (!candidates.isEmpty()) {
+                SwingUtilities.invokeLater(() -> {
+                    refreshVirtualAudioStatus(outputList, status, useBtn);
+                });
+                return;
+            }
+        }
+
+        SwingUtilities.invokeLater(() ->
+                status.setText(UiText.t("wizard.virtual.status.restartRequired")));
     }
 
     // ★ Step2 表示中だけ回す
@@ -1160,6 +1348,38 @@ public class FirstLaunchWizard extends JDialog {
             JOptionPane.showMessageDialog(this, "Failed to open browser:\n" + ex.getMessage());
             ex.printStackTrace();
         }
+    }
+
+    private void openWindowsRecordingPanel() {
+        try {
+            new ProcessBuilder(
+                    "rundll32.exe",
+                    "shell32.dll,Control_RunDLL",
+                    "mmsys.cpl,,1"
+            ).start();
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(this, "Failed to open sound settings:\n" + ex.getMessage());
+            ex.printStackTrace();
+        }
+    }
+
+    private Path findHelperScript(String name) {
+        Path appDir = getAppDir();
+        Path parent = appDir.getParent();
+        Path[] candidates = {
+                appDir.resolve(name),
+                appDir.resolve("ps1").resolve(name),
+                parent != null ? parent.resolve(name) : null,
+                parent != null ? parent.resolve("ps1").resolve(name) : null,
+                Paths.get("app", "ps1", name).toAbsolutePath()
+        };
+
+        for (Path candidate : candidates) {
+            if (candidate != null && Files.exists(candidate)) {
+                return candidate;
+            }
+        }
+        return null;
     }
 
     /* =========================
@@ -2069,5 +2289,8 @@ public class FirstLaunchWizard extends JDialog {
         t.setWrapStyleWord(true);
         t.setBorder(BorderFactory.createEmptyBorder(0, 0, 12, 0));
         return t;
+    }
+    private String tf(String key, Object... args) {
+        return String.format(Locale.ROOT, UiText.t(key), args);
     }
 }

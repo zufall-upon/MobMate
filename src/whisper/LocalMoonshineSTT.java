@@ -496,12 +496,11 @@ public class LocalMoonshineSTT {
         }
         // ★streamResetCount は更新しない
     }
-    /** ストリーム開始直後に無音パディング投入（デコーダウォームアップ） */
-    private void injectSilencePadding() {
+    private void injectSilencePaddingMs(int ms) {
         if (transcriber < 0 || stream < 0) return;
         try {
-            // ★FIX: 1000ms → 300ms（長すぎると文頭音声を食う）
-            final int padSamples = 1600 * 3; // 300ms at 16kHz
+            int clampedMs = Math.max(50, Math.min(1000, ms));
+            final int padSamples = Math.max(160, (16000 * clampedMs) / 1000);
 
             float[] pad = new float[padSamples];
             MoonshineLib.INSTANCE.moonshine_transcribe_add_audio_to_stream(
@@ -517,17 +516,94 @@ public class LocalMoonshineSTT {
             Config.logDebug("[Moonshine] silence padding error: " + e.getMessage());
         }
     }
+    /** ストリーム開始直後に無音パディング投入（デコーダウォームアップ） */
+    private void injectSilencePadding() {
+        injectSilencePaddingMs(300);
+    }
     /** flush直前に末尾へ短い無音を足して、語尾の着地を安定させる */
-    private void injectTailSilencePadding() {
+    private void injectTailSilencePaddingMs(int ms) {
         if (transcriber < 0 || stream < 0) return;
         try {
-            final int padSamples = 1600 * 3; // 300ms at 16kHz
+            int clampedMs = Math.max(50, Math.min(1000, ms));
+            final int padSamples = Math.max(160, (16000 * clampedMs) / 1000);
             float[] pad = new float[padSamples];
             MoonshineLib.INSTANCE.moonshine_transcribe_add_audio_to_stream(
                     transcriber, stream, pad, (long) padSamples, 16000, 0);
             Config.logDebug("[Moonshine] tail silence injected: " + padSamples + " samples");
         } catch (Error e) {
             Config.logDebug("[Moonshine] tail silence error: " + e.getMessage());
+        }
+    }
+    /** flush直前に末尾へ短い無音を足して、語尾の着地を安定させる */
+    private void injectTailSilencePadding() {
+        injectTailSilencePaddingMs(300);
+    }
+    /**
+     * ★Hearing用ワンショット推論: PCMを投入してストリームを即時フラッシュし結果を返す
+     * onCompleted/onPartialコールバックは呼ばない（Hearing専用経路用）
+     */
+    public synchronized String transcribeOneShot(float[] pcmFloat) {
+        if (transcriber < 0 || pcmFloat == null || pcmFloat.length == 0) return "";
+        try {
+            if (stream >= 0) {
+                try { MoonshineLib.INSTANCE.moonshine_stop_stream(transcriber, stream); } catch (Error ignore) {}
+                try { MoonshineLib.INSTANCE.moonshine_free_stream(transcriber, stream); } catch (Error ignore) {}
+                stream = -1;
+            }
+
+            stream = MoonshineLib.INSTANCE.moonshine_create_stream(transcriber, 0);
+            if (stream < 0) return "";
+            lastCompletedCount = 0;
+
+            int err = MoonshineLib.INSTANCE.moonshine_start_stream(transcriber, stream);
+            if (err != 0) {
+                stream = -1;
+                return "";
+            }
+
+            injectSilencePaddingMs(300);
+            MoonshineLib.INSTANCE.moonshine_transcribe_add_audio_to_stream(
+                    transcriber, stream, pcmFloat, (long) pcmFloat.length, 16000, 0);
+            injectTailSilencePaddingMs(300);
+
+            String best = null;
+            for (int pass = 0; pass < 2; pass++) {
+                if (pass > 0) {
+                    try {
+                        Thread.sleep(35);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+
+                PointerByReference pRef = new PointerByReference();
+                int ferr = MoonshineLib.INSTANCE.moonshine_transcribe_stream(
+                        transcriber, stream, MOONSHINE_FLAG_FORCE_UPDATE, pRef);
+                if (ferr != 0) continue;
+
+                Pointer pTx = pRef.getValue();
+                if (pTx == null) continue;
+                Pointer pLines = pTx.getPointer(TX_OFF_LINES);
+                long lineCount = pTx.getLong(TX_OFF_LINE_COUNT);
+                if (pLines == null || lineCount <= 0) continue;
+
+                for (long i = 0; i < lineCount; i++) {
+                    long base = i * LINE_SIZE;
+                    Pointer pText = pLines.getPointer(base + LINE_OFF_TEXT);
+                    if (pText == null) continue;
+                    try {
+                        String text = pText.getString(0, "UTF-8").trim();
+                        if (!text.isEmpty()) best = text;
+                    } catch (Error ignore) {}
+                }
+                if (best != null) break;
+            }
+
+            Config.logDebug("[Moonshine][Hearing] oneShot: " + best);
+            return (best != null) ? best : "";
+        } catch (Error e) {
+            Config.logDebug("[Moonshine][Hearing] transcribeOneShot ERROR: " + e.getMessage());
+            return "";
         }
     }
     // reset直前に pending transcript を1回だけ吸い上げる
