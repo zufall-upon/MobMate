@@ -382,11 +382,15 @@ Links:
 <a id="piper-model-guide"></a>
 ## Piper+ Model Guide / Piper+ モデルガイド / Piper+ 模型指南
 
-MobMate includes the Piper+ runtime, but not every language route is equally stable yet.
+- EN: MobMate includes the Piper+ runtime, but not every language route is equally stable yet.
+- JA: MobMate には Piper+ ランタイムを同梱していますが、すべての言語ルートが同じ完成度に達しているわけではありません。
+- ZH: MobMate 内置了 Piper+ 运行时，但并不是每一种语言路线都已经达到同样的成熟度。
 
-To reduce confusion, the in-app Piper+ picker is centered around recommended defaults.
+- EN: To reduce confusion, the in-app Piper+ picker is centered around recommended defaults.
+- JA: 混乱を減らすため、アプリ内の Piper+ ピッカーは推奨デフォルトを中心に構成しています。
+- ZH: 为了减少混淆，应用内的 Piper+ 选择器优先展示推荐的默认模型。
 
-### Recommended models by language
+### Recommended models by language / 言語別の推奨モデル / 按语言推荐的模型
 
 | Language | In-app default | Status | Notes |
 | --- | --- | --- | --- |
@@ -397,7 +401,7 @@ To reduce confusion, the in-app Piper+ picker is centered around recommended def
 | Portuguese (`PT`) | Cadu | Recommended | Curated replacement |
 | Chinese (`ZH`) | Manual model recommended | Caution | Bundled CSS10 Chinese route is currently unstable |
 
-### What the picker means
+### What the picker means / ピッカー表示の意味 / 选择器含义
 
 - `Recommended - Japanese [JA]`
 - `Recommended - English [EN]`
@@ -406,20 +410,29 @@ To reduce confusion, the in-app Piper+ picker is centered around recommended def
 - `Recommended - Portuguese (Cadu) [PT]`
 - `Chinese (manual model recommended) [ZH]`
 
-If you add your own local Piper+ model, it also appears in the picker.
+- EN: If you add your own local Piper+ model, it also appears in the picker.
+- JA: 独自のローカル Piper+ モデルを追加した場合、それもピッカーに表示されます。
+- ZH: 如果你自行添加本地 Piper+ 模型，它也会显示在选择器中。
 
 ### Chinese note / 中国語メモ / 中文说明
 
-For now, MobMate falls back to Windows TTS for the bundled Chinese Piper+ route because the included CSS10 6lang Chinese path has been unstable in testing.
+- EN: For now, MobMate falls back to Windows TTS for the bundled Chinese Piper+ route because the included CSS10 6lang Chinese path has been unstable in testing.
+- JA: 現時点では、同梱されている CSS10 6lang の中国語経路がテストで不安定だったため、中国語の Piper+ ルートでは Windows TTS へフォールバックします。
+- ZH: 目前由于内置的 CSS10 6lang 中文路线在测试中表现不稳定，MobMate 会在中文 Piper+ 路线下回退到 Windows TTS。
 
-That does **not** mean Chinese Piper is impossible.
-It means the current bundled default is not good enough to recommend.
+- EN: That does **not** mean Chinese Piper is impossible. It means the current bundled default is not good enough to recommend.
+- JA: これは中国語の Piper が不可能という意味ではなく、現在の同梱デフォルトを推奨しにくいという意味です。
+- ZH: 这并不意味着中文 Piper 不可行，而是表示当前内置默认模型还不足以作为推荐方案。
 
-If you want Chinese Piper+ output, please add a separate local Chinese model manually.
+- EN: If you want Chinese Piper+ output, please add a separate local Chinese model manually.
+- JA: 中国語の Piper+ 出力を使いたい場合は、別の中国語ローカルモデルを手動で追加してください。
+- ZH: 如果你希望使用中文 Piper+ 输出，请手动添加单独的中文本地模型。
 
 ### How to add a local Piper+ model / ローカルPiper+モデルの追加方法 / 如何添加本地 Piper+ 模型
 
-Create a folder like this next to `MobMateWhisp.exe`:
+- EN: Create a folder like this next to `MobMateWhisp.exe`:
+- JA: `MobMateWhisp.exe` と同じ階層に、次のようなフォルダを作成します。
+- ZH: 请在 `MobMateWhisp.exe` 同级目录下创建如下文件夹结构：
 
 ```text
 models/
@@ -430,12 +443,12 @@ models/
       mobmate-model.properties
 ```
 
-Required files:
+Required files / 必須ファイル / 必要文件:
 
 - one `.onnx` file
 - one `config.json`
 
-Optional metadata example:
+Optional metadata example / 任意のメタデータ例 / 可选元数据示例:
 
 ```properties
 id=your-model-id
@@ -450,7 +463,7 @@ config_url=config.json
 model_sha256=
 ```
 
-After placing the files:
+After placing the files / 配置後の手順 / 放置文件后的步骤:
 
 1. Restart MobMate
 2. Open Settings
@@ -459,11 +472,15 @@ After placing the files:
 
 ### License note / ライセンス注意 / 许可证说明
 
-MobMate can detect local models, but **you are responsible for checking the model license before use or redistribution**.
+- EN: MobMate can detect local models, but **you are responsible for checking the model license before use or redistribution**.
+- JA: MobMate はローカルモデルを検出できますが、**利用や再配布の前にモデルライセンスを確認する責任は利用者側にあります**。
+- ZH: MobMate 可以检测本地模型，但**在使用或重新分发之前，检查模型许可证的责任仍由使用者承担**。
 
-This matters especially for manually added Chinese voices, because model-specific terms may differ even when the hosting repository looks permissive at first glance.
+- EN: This matters especially for manually added Chinese voices, because model-specific terms may differ even when the hosting repository looks permissive at first glance.
+- JA: 特に中国語の手動追加モデルでは、配布元リポジトリが一見寛容に見えても、モデル固有の条件が別に設定されている場合があります。
+- ZH: 这一点对手动添加的中文语音尤其重要，因为即使托管仓库看起来较为宽松，模型本身也可能附带单独的条款。
 
-### Reference links
+### Reference links / 参考リンク / 参考链接
 
 - Piper+ GitHub: [ayutaz/piper-plus](https://github.com/ayutaz/piper-plus)
 - Rhasspy Piper voices (zh folder): [rhasspy/piper-voices/zh](https://huggingface.co/rhasspy/piper-voices/tree/main/zh)
