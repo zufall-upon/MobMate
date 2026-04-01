@@ -470,6 +470,40 @@ After placing the files / 配置後の手順 / 放置文件后的步骤:
 3. Select `Piper+`
 4. Choose your model from the Piper+ picker
 
+### Concrete example: Tsukuyomi-chan / 具体例: つくよみちゃん / 具体示例：Tsukuyomi-chan
+
+- EN: A practical Japanese example is `ayousanz/piper-plus-tsukuyomi-chan`. Place the `.onnx`, `config.json`, and metadata file in a dedicated folder such as `models/piper_plus/tsukuyomi-chan/`.
+- JA: 日本語の具体例としては `ayousanz/piper-plus-tsukuyomi-chan` があります。`.onnx`、`config.json`、メタデータファイルを `models/piper_plus/tsukuyomi-chan/` のような専用フォルダへ配置します。
+- ZH: 日语的一个具体示例是 `ayousanz/piper-plus-tsukuyomi-chan`。请将 `.onnx`、`config.json` 和元数据文件放入诸如 `models/piper_plus/tsukuyomi-chan/` 这样的独立目录中。
+
+```text
+models/
+  piper_plus/
+    tsukuyomi-chan/
+      tsukuyomi-wavlm-300epoch.onnx
+      config.json
+      mobmate-model.properties
+```
+
+Example metadata / メタデータ例 / 元数据示例:
+
+```properties
+id=tsukuyomi-chan
+install_id=tsukuyomi-chan
+display_name=Piper+ Tsukuyomi-chan
+language=ja
+text_mode_language_tag=ja
+license=tsukuyomi-chan-corpus
+source_page_url=https://huggingface.co/ayousanz/piper-plus-tsukuyomi-chan
+model_url=https://huggingface.co/ayousanz/piper-plus-tsukuyomi-chan/resolve/main/tsukuyomi-wavlm-300epoch.onnx
+config_url=https://huggingface.co/ayousanz/piper-plus-tsukuyomi-chan/resolve/main/config.json
+model_sha256=
+```
+
+- EN: This is still treated as a manual model. Check the model card and license terms before redistribution.
+- JA: これはあくまで手動追加モデルとして扱います。再配布前にはモデルカードとライセンス条件を確認してください。
+- ZH: 该模型仍然属于手动追加模型。重新分发前，请先确认模型卡与许可证条款。
+
 ### License note / ライセンス注意 / 许可证说明
 
 - EN: MobMate can detect local models, but **you are responsible for checking the model license before use or redistribution**.
