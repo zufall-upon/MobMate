@@ -168,89 +168,108 @@ MobMate 更适合：
 
 ---
 
-## Feature Highlights
+## Feature Highlights / 主な機能ハイライト / 核心亮点
 
-### Real-time Speech Recognition & Anonymous Voice Output
+### Real-time Speech Recognition & Anonymous Voice Output / リアルタイム音声認識と匿名発声 / 实时语音识别与匿名发声
 
-Speak into your microphone, let MobMate transcribe locally, and replay the result with TTS when needed.
+- EN: Speak into your microphone, let MobMate transcribe locally, and replay the result with TTS when needed.
+- JA: マイクに話しかけると、その場でローカル認識し、必要に応じて TTS で再発声できるっす。
+- ZH: 对着麦克风说话后，MobMate 会在本地完成识别，并在需要时用 TTS 重新播放出来。
 
-### Built for Gameplay, Not Meetings
+### Built for Gameplay, Not Meetings / 会議よりゲームVC向け / 更适合游戏语音而不是会议记录
 
-MobMate is optimized for fast reactions and multiplayer voice-chat tempo.
+- EN: MobMate is optimized for fast reactions and multiplayer voice-chat tempo.
+- JA: MobMate は長文会議より、短い反応やマルチプレイ VC のテンポ維持に向いてるっす。
+- ZH: MobMate 更适合多人游戏语音中的快速回应，而不是长篇会议记录。
 
-Typical examples:
+Typical examples / 典型例 / 典型示例:
 
 - `Enemy incoming`
 - `Need heal`
 - `Roger`
 - `GG`
 
-### Setup Wizard
+### Setup Wizard / セットアップウィザード / 设置向导
 
-A built-in first-run wizard helps you configure microphone selection, audio routing, and basic testing without diving into every setting manually.
+- EN: A built-in first-run wizard helps you configure microphone selection, audio routing, and basic testing without diving into every setting manually.
+- JA: 初回起動時のウィザードで、マイク選択、音声ルーティング、基本テストを順番に進められるっす。
+- ZH: 内置首次启动向导会帮助你依次完成麦克风、音频路由和基础测试设置。
 
-### Radio Chat
+### Radio Chat / ラジオチャット / Radio Chat
 
-Register preset phrases from history and send them instantly with global hotkeys or an overlay.
+- EN: Register preset phrases from history and send them instantly with global hotkeys or an overlay.
+- JA: 履歴から定型文を登録して、グローバルホットキーやオーバーレイで即送信できるっす。
+- ZH: 可以把历史中的常用短句注册起来，并通过全局热键或覆盖层一键发送。
 
-### Hearing Feature
+### Hearing Feature / Hearing機能 / Hearing 功能
 
-Capture desktop audio and show live captions for Discord, VRChat, and other VC apps.
+- EN: Capture desktop audio and show live captions for Discord, VRChat, and other VC apps.
+- JA: Discord、VRChat、ゲーム VC などのデスクトップ音声を取り込み、字幕のように表示できるっす。
+- ZH: 可以捕获 Discord、VRChat 或其他语音聊天应用的桌面音频，并实时显示类似字幕的文字。
 
-Current status:
+Current status / 現状 / 当前状态:
 
-- useful already
-- still experimental
-- stability and recognition continue to improve
+- EN: useful already, still experimental, and continuing to improve
+- JA: すでに使えるけど、まだ実験的で改善継続中っす
+- ZH: 已经有实用价值，但仍属实验阶段，后续还会继续改进
 
-### Speaker Verification
+### Speaker Verification / 話者照合 / 说话人识别
 
-MobMate can learn your voice and suppress unrelated voices, game audio, or background sounds more effectively.
+- EN: MobMate can learn your voice and suppress unrelated voices, game audio, or background sounds more effectively.
+- JA: 自分の声を学習して、他人の声やゲーム音、環境音の混入を抑えやすくなるっす。
+- ZH: MobMate 可以学习你的声音，从而更有效地抑制他人声音、游戏音效或环境噪音。
 
-### Zero-Cloud Privacy
+### Zero-Cloud Privacy / Zero-Cloud プライバシー / Zero-Cloud 隐私
 
-All speech recognition, optional translation, and TTS routing are designed around local-first processing. Your voice and text are not meant to be sent to external servers by default.
+- EN: Speech recognition, optional translation, and TTS routing are designed around local-first processing.
+- JA: 音声認識、任意の翻訳、TTS ルーティングはローカル優先で動く設計っす。
+- ZH: 语音识别、可选翻译和 TTS 路由都以本地优先为设计原则。
 
-### GPU Acceleration Pack
+### GPU Acceleration Pack / GPUアクセラレーションパック / GPU 加速包
 
-The base app works on CPU, and a separate GPU Acceleration Pack is available for Vulkan-compatible environments that want lower latency and less CPU pressure.
+- EN: The base app works on CPU, and a separate GPU Acceleration Pack is available for Vulkan-compatible environments that want lower latency and less CPU pressure.
+- JA: ベースアプリは CPU で動作して、Vulkan 対応環境向けには低遅延・低 CPU 負荷を狙える GPU Acceleration Pack もあるっす。
+- ZH: 基础版可在 CPU 上运行，如果你的环境支持 Vulkan，也可以使用单独的 GPU Acceleration Pack 来降低延迟和 CPU 压力。
 
 ---
 
-## TTS Engines
+## TTS Engines / TTSエンジン / TTS 引擎
 
 ### VOICEVOX
 
-- strong Japanese quality
-- character-like voices
-- emotion-friendly output
+- EN: strong Japanese quality, character-like voices, emotion-friendly output
+- JA: 日本語品質が強くて、キャラクター性や感情表現が出しやすいっす。
+- ZH: 日语表现较强，声音更有角色感，也更适合情绪表达。
 
 ### Voiceger
 
-- useful for multilingual VC
-- strong for short practical output
-- supported languages differ by build and setup
+- EN: useful for multilingual VC, practical for short output, language support differs by setup
+- JA: 多言語 VC に向いていて、短い実用発話に強いっす。対応言語は構成次第っす。
+- ZH: 适合多语言语音聊天，短句实用性强，但可用语言会因配置而不同。
 
 ### Piper+
 
-- bundled runtime
-- easy local/offline path
-- good fit for lightweight deployment
-- not every built-in language route is equally mature yet
+- EN: bundled runtime, easy local/offline path, lightweight deployment, but not every built-in language route is equally mature yet
+- JA: ランタイム同梱でローカル完結しやすく、軽量寄りっす。ただし内蔵言語ルートの成熟度は均一じゃないっす。
+- ZH: 自带运行时，适合本地离线使用，部署也比较轻量，但内置各语言路线的成熟度还不完全一致。
 
 ### XTTS
 
-- experimental / optional
-- external setup required
+- EN: experimental / optional, external setup required
+- JA: 実験的な位置づけで、外部セットアップが必要っす。
+- ZH: 属于实验性选项，需要额外的外部配置。
 
 ### Windows TTS
 
-- reliable fallback
-- always useful when another engine is unavailable
+- EN: reliable fallback and always useful when another engine is unavailable
+- JA: 他のエンジンが使えないときの、信頼できるフォールバックっす。
+- ZH: 当其他引擎不可用时，它是一个可靠的后备方案。
 
 ---
 
-## Setup Quick Start
+## Setup Quick Start / クイックスタート / 快速开始
+
+### English
 
 1. Download and extract the zip
 2. Run `MobMateWhisp.exe`
@@ -258,7 +277,23 @@ The base app works on CPU, and a separate GPU Acceleration Pack is available for
 4. Choose your TTS engine in Settings
 5. If needed, connect a virtual audio device for Discord / VRChat / games
 
-### Recommended virtual audio tools
+### 日本語
+
+1. zip をダウンロードして展開する
+2. `MobMateWhisp.exe` を起動する
+3. 初回起動時は Setup Wizard に従う
+4. 設定で使いたい TTS エンジンを選ぶ
+5. 必要なら Discord / VRChat / ゲーム向けに仮想オーディオデバイスをつなぐ
+
+### 中文
+
+1. 下载并解压 zip
+2. 运行 `MobMateWhisp.exe`
+3. 首次启动时按照 Setup Wizard 完成设置
+4. 在设置里选择要使用的 TTS 引擎
+5. 如有需要，为 Discord / VRChat / 游戏连接虚拟音频设备
+
+### Recommended virtual audio tools / 推奨仮想オーディオツール / 推荐虚拟音频工具
 
 - VB-Audio VoiceMeeter
 - VB-CABLE
@@ -266,7 +301,7 @@ The base app works on CPU, and a separate GPU Acceleration Pack is available for
 ---
 
 <a id="piper-model-guide"></a>
-## Piper+ Model Guide
+## Piper+ Model Guide / Piper+ モデルガイド / Piper+ 模型指南
 
 MobMate includes the Piper+ runtime, but not every language route is equally stable yet.
 
@@ -294,7 +329,7 @@ To reduce confusion, the in-app Piper+ picker is centered around recommended def
 
 If you add your own local Piper+ model, it also appears in the picker.
 
-### Chinese note
+### Chinese note / 中国語メモ / 中文说明
 
 For now, MobMate falls back to Windows TTS for the bundled Chinese Piper+ route because the included CSS10 6lang Chinese path has been unstable in testing.
 
@@ -303,7 +338,7 @@ It means the current bundled default is not good enough to recommend.
 
 If you want Chinese Piper+ output, please add a separate local Chinese model manually.
 
-### How to add a local Piper+ model
+### How to add a local Piper+ model / ローカルPiper+モデルの追加方法 / 如何添加本地 Piper+ 模型
 
 Create a folder like this next to `MobMateWhisp.exe`:
 
@@ -343,7 +378,7 @@ After placing the files:
 3. Select `Piper+`
 4. Choose your model from the Piper+ picker
 
-### License note
+### License note / ライセンス注意 / 许可证说明
 
 MobMate can detect local models, but **you are responsible for checking the model license before use or redistribution**.
 
@@ -357,68 +392,67 @@ This matters especially for manually added Chinese voices, because model-specifi
 
 ---
 
-## Platform Compatibility
+## Platform Compatibility / 対応プラットフォーム / 平台兼容性
 
-Confirmed / intended targets include:
-
-- Discord
-- VRChat
-- multiplayer games in general
-- apps that can work with virtual audio devices
+- EN: Confirmed or intended for Discord, VRChat, multiplayer games, and apps that can work with virtual audio devices.
+- JA: Discord、VRChat、マルチプレイゲーム、仮想オーディオデバイスを使えるアプリを想定してるっす。
+- ZH: 目前确认或计划支持 Discord、VRChat、多人游戏，以及能使用虚拟音频设备的应用。
 
 ---
 
-## UI Languages
+## UI Languages / UI言語 / 界面语言
 
-The UI supports:
-
-- English
-- Simplified Chinese
-- Traditional Chinese
-- Japanese
-- Korean
+- EN: English, Simplified Chinese, Traditional Chinese, Japanese, Korean
+- JA: 英語、簡体字中国語、繁体字中国語、日本語、韓国語
+- ZH: 英语、简体中文、繁體中文、日语、韩语
 
 ---
 
-## System Requirements
+## System Requirements / 動作環境 / 系统需求
 
-### Minimum
+### Minimum / 最低要件 / 最低配置
 
 - 64-bit Windows 11
 - Intel i5 / Ryzen 5 class CPU or above
 - 8 GB RAM
 - 500 MB available storage
 
-### Runtime
+### Runtime / 必須ランタイム / 运行时
 
 - Visual C++ 2015-2022 (x64)
 - Download: <https://aka.ms/vs/17/release/vc_redist.x64.exe>
 
 ---
 
-## AI Generated Content Disclosure
+## AI Generated Content Disclosure / AI利用に関する開示 / AI 相关说明
 
-This application uses AI technologies for:
+- EN: This application uses AI technologies for real-time speech recognition, optional translation, and voice synthesis during use.
+- JA: このアプリは、リアルタイム音声認識、任意の翻訳、利用中の音声合成に AI 技術を使ってるっす。
+- ZH: 本应用会在实时语音识别、可选翻译和语音合成中使用 AI 技术。
 
-- real-time speech recognition
-- optional translation
-- voice synthesis during use
+- EN: Some promotional or support assets may also be AI-assisted.
+- JA: 告知素材やサポート素材の一部にも AI 補助が含まれる場合があるっす。
+- ZH: 部分宣传素材或支持素材也可能经过 AI 辅助生成。
 
-Some promotional or support assets may also be AI-assisted.
-
-User voice input is processed locally or via optional user-configured models. No personal data is intended to be stored or shared externally without user consent.
-
----
-
-## Open Source / Notice
-
-This software uses open source components including `whisper.cpp` (MIT License).
-
-Speech recognition and translation results may be imperfect. This software is provided as-is without warranty.
+- EN: User voice input is processed locally or via optional user-configured models. No personal data is intended to be stored or shared externally without user consent.
+- JA: ユーザー音声はローカル、またはユーザーが任意設定したモデルで処理され、同意なく外部保存や共有を意図しないっす。
+- ZH: 用户语音输入会在本地或由用户自行配置的模型中处理，未经用户同意，不会以外部存储或共享为目的处理个人数据。
 
 ---
 
-## Support
+## Open Source / Notice / オープンソースと注意事項 / 开源与说明
+
+- EN: This software uses open source components including `whisper.cpp` (MIT License).
+- JA: このソフトは `whisper.cpp` を含むオープンソースコンポーネントを利用してるっす。
+- ZH: 本软件使用了包括 `whisper.cpp`（MIT License）在内的开源组件。
+
+- EN: Speech recognition and translation results may be imperfect. This software is provided as-is without warranty.
+- JA: 音声認識や翻訳結果は完全ではない場合があり、このソフトは無保証で提供されるっす。
+- ZH: 语音识别与翻译结果并非绝对准确，本软件按现状提供，不附带任何保证。
+
+---
+
+## Support / サポート / 支持
 
 - Steam: [Store Page](https://store.steampowered.com/app/4261090/MobMate_WhispTalk__ZeroCloud_Voice_Chat_Toolkit/)
 - GitHub: [zufall-upon/MobMate](https://github.com/zufall-upon/MobMate)
