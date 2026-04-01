@@ -1,568 +1,424 @@
-<!-- pandoc-ignore -->
-# ![MobMateWhispTalk](https://github.com/zufall-upon/MobMate/releases/tag/release)
-**For quiet players who still want to be loud.**
+# MobMate WhispTalk
 
-<div class="banner">
-  <!-- GitHub Repo Banner -->
-  <div style="text-align:center; margin: 24px 0;">
-    <a href="https://github.com/zufall-upon/MobMate" target="_blank">
-      <img
-        src="https://raw.githubusercontent.com/zufall-upon/MobMate/refs/heads/main/logo02_github.png"
-        alt="MobMate GitHub Repository"
-        style="max-width: 480px; width: 80%; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.3);"
-      />
-    </a>
-    <div style="margin-top:8px; opacity:0.8;">
-      ▶ View on GitHub
-    </div>
-  </div>
-</div>
+**Zero-Cloud Voice Chat Toolkit for people who want to stay in VC without using their real voice directly.**
 
+**Quiet players can be loud.**
 
-## 🚀 ビルドについて / About Builds
-
-- 最新・安定版は Steam で先行公開しています
-- GitHub のビルドは 体験版・開発者向け です
-- 今後のアップデートは Steam 版を中心に提供します
-
-- Latest and stable builds are released first on Steam
-- GitHub builds are provided as demo / developer builds
-- Future updates will focus on the Steam version
-
-👉 気に入ったら Steam 版で応援してもらえると嬉しいです
-👉 If you like it, please consider supporting the project on Steam
-
-🔗 Steam Store
-
-25/1/16 released!
-https://store.steampowered.com/app/4261090/MobMateWhispTalk/
-
-### 🧪 GitHub リポジトリについて / About This Repository
-
-ソースコードの公開
-動作確認・カスタマイズ用途
-
-For source code access, testing, and customization.
-
-### 👍 Support
-
-Steam 版の購入が、今後の開発の大きな支えになります。
-Your support on Steam helps continued development.
-
-### ✅ Major Features Added since v0.8
-v0.8以降の主な機能追加
-
-- 自前VAD（Java実装）導入
-- Custom Java-based VAD implementation
-
- 短文・相槌・即時リアクションに強化
- Enhanced support for short utterances, acknowledgements, and quick reactions
-
-- partial / final 分離処理
-- Separated partial and final transcription
-
-反応速度と安定性を両立
-Improves both responsiveness and stability
-
-- 誤検知対策の大幅強化
-- Significant improvements to false-trigger prevention
-
-ignore / good / dictionary をリアルタイム反映
-Real-time ignore, good, and dictionary controls
-
-- Historyベースの操作UI
-- History-based control UI
-
-NG / Good / Dictionary をワンボタン管理
-One-click management for NG, Good, and Dictionary entries
-
-- ユーザー調整可能なUI・設定強化
-- User-adjustable UI and quality-of-life settings
- 
-文字サイズ変更など、常用前提の改善
-Improvements for daily use, including adjustable text size
-
-- Steam配布・GPU対応基盤の整備
-- Steam distribution and GPU support infrastructure
-
-GPU Acceleration Pack（DLC）対応
-GPU Acceleration Pack available as DLC
-
----
-
-ローカルで動作する **STT + TTS（匿名発声）ツール** です。  
-This is a **local-only speech-to-text + text-to-speech (anonymous voice)** tool.
-
-Whisper.cpp _ Java  NAudio を使用しています。  
-Built with Whisper.cpp ／ Java ／ NAudio.
-
-ゲームなどのVCで、話した内容をリアルタイムに  
-**匿名音声として再発声**します。  
-It converts your voice into **anonymous synthesized speech** in real time for voice chats (VC).
-
-短いリアクション・応答向けのVC利用を想定しています。  
-Designed mainly for **short reactions and quick responses**.
-
-ラジオチャット（聞き専・コメント主体）のコミュニケーションに慣れたユーザーが、
-無理なくボイスチャットに参加するためのツールです。
-Designed for users who are comfortable with radio-style, listener-based communication,
-and want a low-pressure way to participate in voice chat.
+[Steam Store](https://store.steampowered.com/app/4261090/MobMate_WhispTalk__ZeroCloud_Voice_Chat_Toolkit/) | [GitHub Releases](https://github.com/zufall-upon/MobMate/releases/tag/release) | [Piper+ Model Guide](#piper-model-guide)
 
 ![MobMateWhispTalk](https://raw.githubusercontent.com/zufall-upon/MobMate/refs/heads/main/mov01.gif)
 
-## 💡 Why MobMate ／ コンセプト
+## Quick Links
 
-### 🇯🇵 日本語
+- Steam release page: [MobMate WhispTalk – Zero-Cloud Voice Chat Toolkit](https://store.steampowered.com/app/4261090/MobMate_WhispTalk__ZeroCloud_Voice_Chat_Toolkit/)
+- GitHub releases: [zufall-upon/MobMate Releases](https://github.com/zufall-upon/MobMate/releases/tag/release)
+- Source code / customization: this repository
 
-MobMate は、**完全ローカルで動作する音声認識（STT）＋音声合成（TTS）による匿名発声ツール**です。  
-Whisper.cpp ／ Java ／ NAudio を利用し、ボイスチャット上の音声をリアルタイムに  
-**「音声 → テキスト → 別の声で再発声」** します。
+## Language / 言語 / 语言
 
-リアルタイム配信における「コメント読み上げ」のような仕組みを、  
-**ゲーム内ボイスチャット（VC）向けに再構成**したツールです。
+[日本語](#ja) | [English](#english) | [中文](#zh-cn)
 
-ゲームなどのVC上で、自分の声の特徴（声質・年齢・性別など）を直接出さずに、  
-テキストを合成音声として流すことができます。
+## At a Glance
 
-たとえば以下のような用途を想定しています：
+- 100% local speech recognition and TTS routing on your PC
+- Built for game VC tempo: short callouts, acknowledgements, laughter, and quick reactions
+- Setup Wizard included for first-run guidance
+- Supports multiple TTS routes including Piper+, VOICEVOX, Voiceger, XTTS, and Windows TTS
+- Hearing overlay can caption desktop audio such as Discord, VRChat, and game voice chat
+- GPU Acceleration Pack is available for Vulkan-capable environments
 
-- 「了解」「待って」「敵いた」などの短い指示
-- 笑い声などの軽いリアクション
-- VCに積極的に参加しづらい状況での意思表示
+## Build Policy
 
-話すことにハードルを感じる理由があっても、  
-**コミュニケーションそのものを諦めなくていい**。  
-MobMate は、そんな「聞き専寄り」の人のための  
-**汎用・擬似ラジオチャットツール**です。
-
----
-
-### 🇺🇸 English
-
-MobMate is a **fully local Speech-to-Text (STT) and Text-to-Speech (TTS) tool** designed for anonymous voice output.  
-Using Whisper.cpp, Java, and NAudio, it converts your voice in real time from  
-**speech → text → synthesized anonymous voice**.
-
-You can think of it as a *live comment reader*—  
-but reimagined for **in-game voice chat**.
-
-Instead of transmitting your raw voice, MobMate outputs synthesized speech,  
-allowing you to communicate without revealing your natural voice characteristics  
-(such as tone, age, or gender).
-
-Typical use cases include:
-
-- Short commands like “OK”, “Wait”, or “Enemy spotted”
-- Simple reactions such as laughter
-- Participating in VC when speaking directly feels difficult
-
-Even if you have reasons to stay quiet,  
-**you shouldn’t have to give up communicating altogether**.
-
-MobMate is designed as a  
-**general-purpose pseudo radio-style chat tool**  
-for players who usually just listen—but still want to be heard.
+- Steam is the main release channel for stable builds
+- GitHub builds are best treated as demo / developer / customization builds
+- Steam release date: **January 15, 2026**
 
 ---
 
-### 🧩 Features at a glance ／ 主な特徴
+<a id="ja"></a>
+## 日本語
 
-#### 🇯🇵 日本語
-- **完全ローカル動作**（クラウド送信なし・Ping安定）
-- **Whisper.cpp による音声認識（STT）**
-- **VOICEVOX API 連携による TTS（匿名発声）** に対応（任意）
-- **短い応答・リアクション専用**の VC コミュニケーションを想定
+MobMate WhispTalk は、**自分の生声をそのまま出さずに VC へ参加したい人向け** の、完全ローカル動作の音声支援ツールです。
 
-#### 🇺🇸 English
-- **Fully local execution** (no cloud, stable ping)
-- **Speech recognition powered by Whisper.cpp (STT)**
-- **Optional TTS via VOICEVOX API** (anonymous voice output)
-- Designed for **short responses and quick reactions** in voice chat
+これは「話せない人のための道具」というより、**今この場面では自分の声を直接出したくない人のための道具** です。深夜の通話、配信中、家族と同居中、体調不良、声を出したくない日でも、VC の流れから置いていかれにくくするのが目的っす。
+
+### こんな場面向け
+
+- 深夜で家族を起こしたくない
+- 配信中で地声をそのまま出したくない
+- 体調が悪く、喉を使いたくない
+- 声質や年齢感をあまり出したくない
+- 外国語 VC に短い反応だけ返したい
+
+### 主な機能
+
+- **リアルタイム STT + 匿名音声出力**
+  - 話した内容をローカルで認識し、必要に応じて TTS で再発声
+- **ゲーム向けテンポ設計**
+  - 長文会議より、短い合図・返事・笑い・タクティカルコール向け
+- **Setup Wizard**
+  - 初回セットアップでマイク、音声ルーティング、テストを順番に案内
+- **Radio Chat**
+  - よく使うフレーズをホットキーやオーバーレイから即送信
+- **Hearing Overlay**
+  - Discord / VRChat / ゲーム VC などの音声を字幕っぽく表示
+- **話者照合**
+  - 自分の声だけを拾いやすくし、他人の声や環境音を誤認識しにくくする
+- **Zero-Cloud**
+  - 音声もテキストも外部へ送信しないローカル優先設計
+- **複数 TTS エンジン**
+  - VOICEVOX / Voiceger / XTTS / Piper+ / Windows TTS
+
+### こんな使い方に向いている
+
+- 「了解」「待って」「敵いた」みたいな短い反応
+- タイピングする余裕がない場面での即応
+- 地声を出しづらいけど会話から抜けたくないとき
+- 外国語 VC で最低限の返答だけ返したいとき
 
 ---
-### 😂 笑い検知・置換機能 ／ Natural Laugh Detection
 
-MobMateWhispTalk には、話している最中の **自然な笑い声** を自動で検知し、
-別の表現（テキストまたは効果音）に変換する機能があります。
+<a id="english"></a>
+## English
 
-MobMateWhispTalk includes a **natural laugh detection** feature  
-that detects actual laughter in your voice and converts it into text or sound.
+MobMate WhispTalk is a **fully local voice chat support toolkit** for people who want to stay in voice chat without using their real voice directly.
 
-Whisper.cpp（例: ggml-small.bin）の特性により、  
-マイクの前で「フフッ」「ハハッ」と笑うだけで、  
-音声認識結果に `(笑)` や `LOL` といった **笑いトークン** が含まれることがあります。
+It is not just for people who "cannot speak." It is for people who **do not want to use their real voice in this moment**, while still staying present in the conversation.
 
-Thanks to Whisper.cpp models (e.g. ggml-small.bin),  
-natural laughter like “haha” or “heh” is often automatically recognized  
-as laugh tokens such as `(笑)` or `LOL` in the transcription.
+### Typical situations
 
-MobMate はこの挙動を利用し、  
-**意図的に言葉を発しなくても**、感情としての「笑い」を拾って処理します。
+- Late-night gaming without waking family or roommates
+- Streaming without exposing your natural voice
+- Voice chat while your throat hurts or you feel tired
+- Privacy-sensitive communication without sharing your voiceprint
+- Quick reactions in multilingual voice chat
 
-MobMate leverages this behavior to capture **emotional laughter**,  
-even when you are not explicitly saying words like “lol” or “haha”.
+### Core features
 
-#### ⚙ 笑いの変換処理 ／ Laugh Replacement
+- **Real-time STT to anonymous voice output**
+  - Speak into your mic, transcribe locally, and replay when needed through TTS
+- **Built for gameplay, not meetings**
+  - Optimized for short callouts, acknowledgements, laughter, and fast back-and-forth
+- **Setup Wizard included**
+  - Guided first-run setup for microphone, routing, and testing
+- **Radio Chat mode**
+  - Trigger preset lines instantly with hotkeys or overlay controls
+- **Hearing Overlay**
+  - Show live captions from desktop audio such as Discord, VRChat, or in-game VC
+- **Speaker verification**
+  - Focus on your own voice and reduce false triggers from others or background sounds
+- **Zero-Cloud local processing**
+  - Voice and text stay on your machine by default
+- **Multiple TTS engines**
+  - Includes Piper+, VOICEVOX, Voiceger, XTTS, and Windows TTS routes depending on setup
 
-検知された笑い表現は、  
-あらかじめ設定した **文字列** または **WAV ファイル** に置き換えられます。
+### What it is designed for
 
-Detected laughter can be replaced with custom **text expressions**  
-or **WAV-based sound effects**.
+MobMate is best when you want to:
 
+- stay socially present without full voice exposure
+- react quickly without typing
+- keep multiplayer VC tempo natural
+- use short, meaningful phrases instead of long dictation
+
+---
+
+<a id="zh-cn"></a>
+## 中文
+
+MobMate WhispTalk 是一个 **完全本地运行** 的语音聊天辅助工具，适合那些想参加语音聊天、但不想直接使用自己真实声音的人。
+
+它并不只是给“不能说话的人”准备的工具，而是给那些 **在当前场合不想直接暴露真实声音**、但又不想完全沉默的人。
+
+### 适合的场景
+
+- 深夜游戏，不想吵到家人或室友
+- 直播时不想直接暴露真实嗓音
+- 嗓子不舒服但还想继续交流
+- 想保护声纹和隐私
+- 在多语言语音聊天里快速回应
+
+### 核心功能
+
+- **实时语音识别 + 匿名语音输出**
+  - 对着麦克风说话，本地转成文字，再按需要用 TTS 播放出来
+- **为游戏语音节奏而设计**
+  - 更适合短句、回应、笑声、战术提示，而不是长篇会议记录
+- **内置 Setup Wizard**
+  - 首次启动时引导你完成麦克风、音频路由和测试
+- **Radio Chat**
+  - 通过快捷键或覆盖层一键发送常用短句
+- **Hearing Overlay**
+  - 将 Discord、VRChat 或游戏语音的桌面音频实时显示成字幕
+- **说话人识别**
+  - 更容易只识别自己的声音，减少他人声音或环境噪音误触发
+- **Zero-Cloud**
+  - 默认不把语音和文本发到外部服务器
+- **多种 TTS 引擎**
+  - 包括 Piper+、VOICEVOX、Voiceger、XTTS 和 Windows TTS
+
+### 更适合怎样的使用方式
+
+MobMate 更适合：
+
+- 保持在 VC 中有存在感
+- 需要快速回应但不想打字
+- 不想暴露真实声音时继续交流
+- 用短而关键的句子自然接上对话节奏
+
+---
+
+## Feature Highlights
+
+### Real-time Speech Recognition & Anonymous Voice Output
+
+Speak into your microphone, let MobMate transcribe locally, and replay the result with TTS when needed.
+
+### Built for Gameplay, Not Meetings
+
+MobMate is optimized for fast reactions and multiplayer voice-chat tempo.
+
+Typical examples:
+
+- `Enemy incoming`
+- `Need heal`
+- `Roger`
+- `GG`
+
+### Setup Wizard
+
+A built-in first-run wizard helps you configure microphone selection, audio routing, and basic testing without diving into every setting manually.
+
+### Radio Chat
+
+Register preset phrases from history and send them instantly with global hotkeys or an overlay.
+
+### Hearing Feature
+
+Capture desktop audio and show live captions for Discord, VRChat, and other VC apps.
+
+Current status:
+
+- useful already
+- still experimental
+- stability and recognition continue to improve
+
+### Speaker Verification
+
+MobMate can learn your voice and suppress unrelated voices, game audio, or background sounds more effectively.
+
+### Zero-Cloud Privacy
+
+All speech recognition, optional translation, and TTS routing are designed around local-first processing. Your voice and text are not meant to be sent to external servers by default.
+
+### GPU Acceleration Pack
+
+The base app works on CPU, and a separate GPU Acceleration Pack is available for Vulkan-compatible environments that want lower latency and less CPU pressure.
+
+---
+
+## TTS Engines
+
+### VOICEVOX
+
+- strong Japanese quality
+- character-like voices
+- emotion-friendly output
+
+### Voiceger
+
+- useful for multilingual VC
+- strong for short practical output
+- supported languages differ by build and setup
+
+### Piper+
+
+- bundled runtime
+- easy local/offline path
+- good fit for lightweight deployment
+- not every built-in language route is equally mature yet
+
+### XTTS
+
+- experimental / optional
+- external setup required
+
+### Windows TTS
+
+- reliable fallback
+- always useful when another engine is unavailable
+
+---
+
+## Setup Quick Start
+
+1. Download and extract the zip
+2. Run `MobMateWhisp.exe`
+3. Follow the Setup Wizard on first launch
+4. Choose your TTS engine in Settings
+5. If needed, connect a virtual audio device for Discord / VRChat / games
+
+### Recommended virtual audio tools
+
+- VB-Audio VoiceMeeter
+- VB-CABLE
+
+---
+
+<a id="piper-model-guide"></a>
+## Piper+ Model Guide
+
+MobMate includes the Piper+ runtime, but not every language route is equally stable yet.
+
+To reduce confusion, the in-app Piper+ picker is centered around recommended defaults.
+
+### Recommended models by language
+
+| Language | In-app default | Status | Notes |
+| --- | --- | --- | --- |
+| Japanese (`JA`) | CSS10 6lang | Recommended | Works out of the box |
+| English (`EN`) | CSS10 6lang | Recommended | Works out of the box |
+| Spanish (`ES`) | CSS10 6lang | Recommended | Works out of the box |
+| French (`FR`) | Gilles | Recommended | Curated replacement |
+| Portuguese (`PT`) | Cadu | Recommended | Curated replacement |
+| Chinese (`ZH`) | Manual model recommended | Caution | Bundled CSS10 Chinese route is currently unstable |
+
+### What the picker means
+
+- `Recommended - Japanese [JA]`
+- `Recommended - English [EN]`
+- `Recommended - Spanish [ES]`
+- `Recommended - French (Gilles) [FR]`
+- `Recommended - Portuguese (Cadu) [PT]`
+- `Chinese (manual model recommended) [ZH]`
+
+If you add your own local Piper+ model, it also appears in the picker.
+
+### Chinese note
+
+For now, MobMate falls back to Windows TTS for the bundled Chinese Piper+ route because the included CSS10 6lang Chinese path has been unstable in testing.
+
+That does **not** mean Chinese Piper is impossible.
+It means the current bundled default is not good enough to recommend.
+
+If you want Chinese Piper+ output, please add a separate local Chinese model manually.
+
+### How to add a local Piper+ model
+
+Create a folder like this next to `MobMateWhisp.exe`:
+
+```text
+models/
+  piper_plus/
+    your-model-id/
+      your-model.onnx
+      config.json
+      mobmate-model.properties
 ```
-laughs.enable=true
-laughs.detect=（笑）,(笑),笑,草,ｗ,www,L�v,lol,lolol,lmao,rofl,laugh
-laughs.detect.auto=（笑）,笑,草,ｗ,www,lol,lmao,rofl,ㅋㅋ,ㅎㅎ,哈哈,呵呵
-laugh.replace=ワハハハ,ふふふっ,laughsounds/laughter01.wav
+
+Required files:
+
+- one `.onnx` file
+- one `config.json`
+
+Optional metadata example:
+
+```properties
+id=your-model-id
+install_id=your-model-id
+display_name=Piper+ Your Model
+language=zh
+text_mode_language_tag=zh
+license=check-model-card
+source_page_url=https://example.com/model-page
+model_url=your-model.onnx
+config_url=config.json
+model_sha256=
 ```
 
-- 自然な笑い声 → Whisper が (笑) 等を生成
-- MobMate がそれを検知して変換
-- VC には 別の声・効果音として再生
+After placing the files:
 
-Natural laughter → Whisper generates a laugh marker
-→ MobMate detects it → replaces it with another voice or sound
+1. Restart MobMate
+2. Open Settings
+3. Select `Piper+`
+4. Choose your model from the Piper+ picker
 
-⚠ Bluetoothヘッドセットをご利用の場合
-一部の機種ではマイクのノイズキャンセリングにより、
-笑い声や息音などの非言語音が検出されにくくなることがあります。
+### License note
 
-可能であれば、マイクのノイズキャンセリング機能をオフにするか、
-デスクトップマイクの使用を推奨します。
+MobMate can detect local models, but **you are responsible for checking the model license before use or redistribution**.
 
-## 🟢 動作環境 ／ System Requirements
+This matters especially for manually added Chinese voices, because model-specific terms may differ even when the hosting repository looks permissive at first glance.
 
-- Windows 10 ／ 11 (64bit)
+### Reference links
 
-### 🧩 必須ランタイム ／ Required Runtime
-Visual C++ 2015–2022 (x64)
-
-https://aka.ms/vs/17/release/vc_redist.x64.exe
+- Piper+ GitHub: [ayutaz/piper-plus](https://github.com/ayutaz/piper-plus)
+- Rhasspy Piper voices (zh folder): [rhasspy/piper-voices/zh](https://huggingface.co/rhasspy/piper-voices/tree/main/zh)
+- CSS10 6lang model page: [ayousanz/piper-plus-css10-ja-6lang](https://huggingface.co/ayousanz/piper-plus-css10-ja-6lang)
 
 ---
 
-## 🚀 ダウンロード ／ Download
-https://github.com/zufall-upon/MobMate/releases/tag/release
+## Platform Compatibility
+
+Confirmed / intended targets include:
+
+- Discord
+- VRChat
+- multiplayer games in general
+- apps that can work with virtual audio devices
 
 ---
 
-## 🚀 起動方法 ／ How to Run
+## UI Languages
 
-1. zip を展開  
-   Extract the zip file
-2. `MobMateWhisp.exe` をダブルクリック  
-   Double-click `MobMateWhisp.exe`
-
-### 🟢 First Launch ／ 初回起動について
-
-On first launch, if `_outtts.txt` does not exist,
-MobMate will ask you to select a language.
-
-初回起動時、`_outtts.txt` が存在しない場合は  
-言語選択ダイアログが表示されます。
+The UI supports:
 
 - English
-- 日本語
-- 中文・简体 (Chinese Simplified),
-- 中文・繁體 (Chinese Traditional),
-- 한국어 (Korean)
-
-Based on your selection, a preset configuration file
-will be copied automatically.
-
-選択した言語に応じた初期設定ファイルが自動で作成されます。
+- Simplified Chinese
+- Traditional Chinese
+- Japanese
+- Korean
 
 ---
 
-## 🔹 Whisperモデルの配置 ／ Whisper Model Setup
+## System Requirements
 
-`models` フォルダに Whisper のモデルファイルを配置してください。  
-Place the Whisper model file inside the `models` folder.
+### Minimum
 
-- `ggml-small.bin`  
-  https://huggingface.co/ggerganov/whisper.cpp/tree/main
+- 64-bit Windows 11
+- Intel i5 / Ryzen 5 class CPU or above
+- 8 GB RAM
+- 500 MB available storage
 
----
+### Runtime
 
-### 👉 推奨モデル ／ Recommended Model
-
-**`ggml-small.bin`（推奨 ／ Recommended）**
-
-精度・速度・安定性のバランスが最も良く、  
-MobMateWhispTalk の用途（短い発話・リアクション）に最適です。
-
-Offers the best balance of accuracy, speed, and stability,  
-and is well suited for short voice chat interactions.
-
-🆙 上位モデルについて ／ About Larger Models
-
-MobMateWhispTalk では VAD（発話検出）を導入したことで、
-従来よりも 長文認識時のスパミングや暴走が大幅に抑制されています。
-
-With the introduction of VAD (Voice Activity Detection),
-spam-like or runaway transcription during long speech has been significantly reduced.
-
-そのため、長めの発話を行うユーザーには
-以下のモデルを アップグレードパスとして選択する価値があります。
-
-As a result, users who frequently speak in longer sentences
-may benefit from upgrading to the following models.
-
-🔍 モデル比較 ／ Model Comparison
-
-Tiny
-精度不足で誤認識が多いため非推奨
-Low accuracy, frequent misrecognition (not recommended)
-
-Small（推奨）
-高速・安定・軽量。短文VC用途に最適
-Fast, stable, lightweight — best for short VC usage
-
-Medium
-長文での精度が向上。処理はやや重め
-Better accuracy for longer speech, slightly heavier processing
-
-Large / Large-v3-turbo
-最も高精度。長文・翻訳用途向け（高負荷）
-Highest accuracy, suited for long speech or translation (high load)
-
-👉 結論 ／ Conclusion
-まずは ggml-small.bin を強く推奨します ⭐
-より長く話す用途では、Medium や Large-v3-turbo へのアップグレードも有効です。
-
-We strongly recommend starting with ggml-small.bin ⭐
-For longer speech use cases, upgrading to Medium or Large-v3-turbo is also a valid option.
+- Visual C++ 2015-2022 (x64)
+- Download: <https://aka.ms/vs/17/release/vc_redist.x64.exe>
 
 ---
 
-## 🎧 Virtual Audio Setup ／ 仮想オーディオ設定
+## AI Generated Content Disclosure
 
-MobMate requires a **virtual audio device** to route TTS output into games or voice chat software.  
-MobMate は、TTS の音声をゲームやボイスチャットに送るために  
-**仮想オーディオデバイス**が必要です。
+This application uses AI technologies for:
 
----
+- real-time speech recognition
+- optional translation
+- voice synthesis during use
 
-### Recommended tools ／ 推奨ツール
+Some promotional or support assets may also be AI-assisted.
 
-- **VB-Audio Virtual Cable (Windows)**  
-  https://vb-audio.com/Cable/  
-
-  Simple and lightweight virtual audio cable.  
-  シンプルで軽量な定番の仮想オーディオケーブルです。
-
-- **SteelSeries Sonar (Windows)**  
-  https://jp.steelseries.com/gg/sonar  
-
-  Useful if Windows keeps changing the default audio device.  
-  Windows が毎回既定のオーディオデバイスを変更してしまう場合に便利です。
-
-  ※ Recommended for users who struggle with unstable default device switching  
-  ※ 既定デバイスが勝手に変わる環境の方向け
+User voice input is processed locally or via optional user-configured models. No personal data is intended to be stored or shared externally without user consent.
 
 ---
 
-### Setup concept ／ 設定の考え方
-- **Audio Input**: Your physical microphone  
-  入力：実際に話すマイク
-- **Audio Output**: Virtual audio device  
-  出力：仮想オーディオデバイス
-- Configure your game or voice chat app to use the virtual device as its microphone  
-  ゲームや VC 側では、その仮想デバイスをマイクとして設定します
+## Open Source / Notice
+
+This software uses open source components including `whisper.cpp` (MIT License).
+
+Speech recognition and translation results may be imperfect. This software is provided as-is without warranty.
 
 ---
 
-## 🎤 Basic Usage ／ 基本的な使い方
+## Support
 
-### Initial setup ／ 初期設定
-Open the **Prefs** button and configure the following recommended settings.  
-**Prefs ボタンから以下の推奨設定を行ってください。**
-
-**Recommended settings ／ 推奨設定**
-- **AutoPaste**: OFF  
-  自動貼り付けを無効にします
-- **Auto type**: OFF  
-  自動入力を無効にします
-- **Silence detection**: ON  
-  無音検出を有効にします
-- **Key trigger mode**: Start ／ Stop  
-  キーで録音の開始・停止を切り替えます
-- **Audio Inputs**: Select your physical microphone  
-  使用するマイクを指定してください
-- **Audio Outputs**: Select a virtual audio device  
-  別の仮想マイクを指定します  
-  （VB-Audio Virtual Cable や SteelSeries Sonar で動作確認済み）
-
----
-
-### How to use ／ 使い方
-- Press the hotkey (**Default: F9**) or click **Start** to begin recording  
-  ホットキー（初期設定：F9）または「Start」ボタンで録音を開始します
-- Your voice is transcribed (STT) and converted into speech (TTS)  
-  音声が認識され、テキスト化された後に音声として再生されます
-- Recognition results are appended to the end of `_outtts.txt`  and speach it.
-  認識結果は `_outtts.txt` の末尾に追記され、そのまま発声されます
-
----
-
-### Notes ／ 補足
-- Designed for **short reactions and quick voice responses**  
-  短いリアクションや即時発声向けに設計されています
-
----
-
-### 🔧 Available Settings ／ 設定項目一覧
-
-| Setting | Description (EN) | 説明 (JP) |
-|--------|------------------|-----------|
-| `language` | Whisper language hint (`ja ／ en ／ ko ／ zh ／ auto`) | Whisper の言語ヒント（ja ／ en ／ ko ／ zh ／ auto） |
-| `initial_prompt` | Initial prompt for Whisper (shorter = more stable) | Whisper 用の事前プロンプト（短いほど安定） |
-| `silence` | Silence detection threshold (ms, higher = more tolerant) | 無音判定（ミリ秒。大きいほど判定が甘くなる） |
-| `silence_hard` | Hard silence detection to suppress noise | ハード無音判定（ノイズ誤認識を抑制） |
-| `voicevox.exe` | Path to VOICEVOX executable (optional) | VOICEVOX 実行ファイルのパス（任意） |
-| `voicevox.api` | VOICEVOX API endpoint | VOICEVOX API の URL |
-| `voicevox.speaker` | VOICEVOX speaker ID | VOICEVOX 話者 ID |
-| `laughs.enable` | Enable natural laugh detection | 笑い検知機能の有効 ／ 無効 |
-| `laughs.detect` | Laugh tokens for the selected language | 言語別の笑い検知トークン |
-| `laughs.detect.auto` | Laugh tokens for auto language mode | auto モード用の多言語笑い検知 |
-| `laughs.replace` | Replacement text or WAV paths for laughter | 笑いを置換する文字列または WAV |
-| `ignore.mode` | Ignore filter mode (`simple` or `regex`) | 無視フィルタ方式（simple ／ regex） |
-
-## 📝 Configuration Options ／ 各項目の説明
-
-The `_outtts.txt` file works as both **configuration** and **log**.  
-設定はファイル上部に記述してください。下部はログ領域になります。
-
----
-
-## 🔊 匿名発声（TTS） ／ Anonymous TTS
-
-MobMate can optionally integrate with **VOICEVOX** for text-to-speech output.  
-MobMate は **VOICEVOX** と連携して匿名発声（TTS）を行うことができます（任意）。
-
----
-
-### VOICEVOX Integration ／ VOICEVOX 連携
-
-```ini
-voicevox.exe="M:\VOICEVOX\VOICEVOX.exe"
-voicevox.api="http://127.0.0.1:50021"
-voicevox.speaker=3
-initial_prompt=This is an in-game radio communication. Speak briefly and clearly. Do not output subtitles, background music, sound effects, or emoticons. Laughter is allowed. Focus only on spoken content. Common words include "roger", "enemy", "ally", "help".
-```
-
-```ini
-voicevox.exe="M:\VOICEVOX\VOICEVOX.exe"
-voicevox.api="http://127.0.0.1:50021"
-voicevox.speaker=3
-initial_prompt=これはゲーム内の無線チャットです。短く簡潔に話す。字幕、BGM、効果音、顔文字は出力しないで。笑い声は出していい。話している内容だけに集中してください。使われる単語は「了解、敵、味方、助けて」
---------------------------↑設定↓ログ--------------------------
-```
-
-### 🔊 VOICEVOX Notes ／ VOICEVOX に関する注意
-
-- VOICEVOX is automatically detected if `voicevox.exe` path is valid  
-  `voicevox.exe` に有効なパスが設定されていれば自動認識されます
-- VOICEVOX will be launched automatically when MobMate starts  
-  MobMate 起動時に VOICEVOX も自動起動します
-- Default API port is **50021**  
-  API ポートのデフォルトは **50021** です
-- Speaker ID must be checked separately  
-  話者 ID は VOICEVOX 側で調べてください
-
-⚠ **VOICEVOX is a third-party tool**  
-⚠ **VOICEVOX は第三者製ツールです**
-
-https://voicevox.hiroshiba.jp/
-
----
-
-## 📄 `_ignore.txt` (Ignored Words)
-
-このファイルには **無視したい単語やフレーズ** を 1 行ずつ記述します。  
-Write **words or phrases to be ignored**, one per line.
-
-例 ／ Example:  simple(部分一致）
-```ini
-えーと  uh
-あのー  um
-えっと  aa
-```
-例 ／ Example:  regex(正規表現)
-```ini
-ん$　　　Aa$
-^えー+   Ye$
-```
-
-このリストに含まれる語句は、**ログにも TTS 出力にも表示・再生されません**。  
-Any phrase listed here will be **excluded from both logs and TTS output**.
-
-短いフィラー音（例: “uh”, “um”, “えーと”）を除外する用途に向いています。  
-Useful for filtering filler words such as “uh”, “um”, etc.
-
-
----
-
-## 📄 `_dictionary.txt` (Word Replacement Dictionary)
-
-このファイルには **発声時に変換したい単語** を 1 行ずつ記述します。  
-Write **words you want to be replaced during TTS output**, one per line.
-
-一致した語句は **音声発声時に自動的に変換** されます。  
-Matched words will be **automatically replaced at TTS playback time**.
-
-※ 動作しない場合、`_ignore.txt` が優先されている可能性があります。  
-※ If it does not work, the word may be overridden by `_ignore.txt`.
-
-語句の登録先は用途に応じて調整してください。  
-Adjust which file to use depending on your purpose.
-
-例：
-```
-frag=フラグ, グレネード, 手りゅう弾        # frag → grenade / explosive
-tango=敵                                   # tango → enemy (NATO phonetic slang)
-fuck=チョメ, Fワード                       # fuck → censored / softened expression
-```
----
-## 🔖 License ／ ライセンス
-
-本ツールは、複数のオープンソースソフトウェア（OSS）を組み合わせて構成されています。  
-This tool is built using multiple open-source software components.
-
-### 📦 Included OSS ／ 使用している主なOSS
-
-- MisterWhisper — MIT License  
-- Whisper.cpp — MIT License  
-- JNA — Apache License 2.0  
-- NAudio — MIT License  
-- JNativeHook — BSD License  
-- VOICEVOX API — Subject to each character's individual license  
-
-### 📄 Distribution ／ 配布について
-
-本ツール自体の配布は **MIT 相当ライセンス**で可能です。  
-This tool itself may be distributed under an MIT-equivalent license.
-
-VOICEVOX の話者（キャラクター）利用については、  
-**各キャラクターごとのライセンス条件に従ってください。**  
-Usage of VOICEVOX voices must comply with each character's license terms.
-
----
-
-🙏 **Thanks ／ 謝辞**
-
-- Whisper.cpp  
-- VOICEVOX  
-- GPT の友達 ／ GPT, my coding companion  
-
----
-
-### 🔗 Based on ／ ベースプロジェクト
-
-This project is based on **MisterWhisper** by openConcerto.  
-本プロジェクトは openConcerto による MisterWhisper をベースにしています。
-
-Original repository:  
-https://github.com/openconcerto/MisterWhisper
-
+- Steam: [Store Page](https://store.steampowered.com/app/4261090/MobMate_WhispTalk__ZeroCloud_Voice_Chat_Toolkit/)
+- GitHub: [zufall-upon/MobMate](https://github.com/zufall-upon/MobMate)
