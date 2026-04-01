@@ -22,6 +22,7 @@ import java.net.URI;
 public class MobMateSettingsFrame extends JDialog {
 
     private static final String DISCORD_INVITE_URL = "https://discord.gg/CkhYzNw7YF";
+    private static final String PIPER_PLUS_MODEL_GUIDE_URL = "https://github.com/zufall-upon/MobMate#piper-model-guide";
     private static final String OUTTTS_MARKER = "↑Settings↓Logs below";
 
     private final MobMateWhisp app;
@@ -71,8 +72,16 @@ public class MobMateSettingsFrame extends JDialog {
     private JComboBox<Choice<Integer>> ttsConfirmSecCombo;
     private JComboBox<String> windowsVoiceCombo;
     private JComboBox<String> voicevoxSpeakerCombo;
+    private JComboBox<String> piperPlusModelCombo;
+    private JButton piperPlusDownloadBtn;
     private JCheckBox voicevoxAutoEmotionCheck;
+    private JCheckBox ttsReflectEmotionCheck;
+    private JComboBox<Choice<String>> ttsContourStrengthCombo;
+    private JComboBox<Choice<String>> ttsToneEmphasisCombo;
     private JComboBox<Choice<String>> voicegerLangCombo;
+    private JLabel piperPlusLicenseLabel;
+    private JLabel piperPlusStatusLabel;
+    private JLabel piperPlusProsodyLabel;
 
     // ===== Text / _outtts =====
     private JComboBox<String> whisperLanguageCombo;
@@ -389,6 +398,7 @@ public class MobMateSettingsFrame extends JDialog {
 
         ttsEngineCombo = new JComboBox<>(new Choice[]{
                 new Choice<>("Auto", "auto"),
+                new Choice<>("Piper+", "piper_plus"),
                 new Choice<>("VOICEVOX", "voicevox"),
                 new Choice<>("XTTS", "xtts"),
                 new Choice<>("Windows", "windows"),
@@ -415,10 +425,28 @@ public class MobMateSettingsFrame extends JDialog {
 
         windowsVoiceCombo = new JComboBox<>();
         voicevoxSpeakerCombo = new JComboBox<>();
+        piperPlusModelCombo = new JComboBox<>();
         JButton reloadVoicevoxBtn = new JButton(tt("settings.voicevox.reload", "Reload"));
         reloadVoicevoxBtn.addActionListener(e -> ensureTtsListsLoadedAsync(true));
+        piperPlusDownloadBtn = new JButton(tt("settings.piperPlus.download", "Download / Update"));
+        piperPlusDownloadBtn.addActionListener(e -> handleSelectedPiperPlusPrimaryAction());
+        JButton piperPlusRemoveBtn = new JButton(tt("settings.piperPlus.remove", "Remove"));
+        piperPlusRemoveBtn.addActionListener(e -> removeSelectedPiperPlusModel());
+        JButton piperPlusOpenBtn = new JButton(tt("settings.piperPlus.open", "Open folder"));
+        piperPlusOpenBtn.addActionListener(e -> openSelectedPiperPlusModelFolder());
 
         voicevoxAutoEmotionCheck = new JCheckBox(tt("menu.voicevox.autoEmotion", "VOICEVOX auto emotion"));
+        ttsReflectEmotionCheck = new JCheckBox(tt("settings.tts.reflectEmotion", "Reflect emotion into TTS"));
+        ttsContourStrengthCombo = new JComboBox<>(new Choice[]{
+                new Choice<>(tt("settings.choice.mild", "Mild"), "mild"),
+                new Choice<>(tt("settings.choice.normal", "Normal"), "normal"),
+                new Choice<>(tt("settings.choice.strong", "Strong"), "strong")
+        });
+        ttsToneEmphasisCombo = new JComboBox<>(new Choice[]{
+                new Choice<>(tt("settings.choice.mild", "Mild"), "mild"),
+                new Choice<>(tt("settings.choice.normal", "Normal"), "normal"),
+                new Choice<>(tt("settings.choice.strong", "Strong"), "strong")
+        });
         voicegerLangCombo = new JComboBox<>(new Choice[]{
                 new Choice<>("Japanese", "all_ja"),
                 new Choice<>("English", "en"),
@@ -434,12 +462,30 @@ public class MobMateSettingsFrame extends JDialog {
         addRow(form, row++, tt("settings.label.ttsEngine", "TTS engine"), ttsEngineCombo);
         addRow(form, row++, tt("settings.label.windowsVoice", "Windows voice"), windowsVoiceCombo);
 
+        JPanel piperPanel = new JPanel(new BorderLayout(8, 0));
+        piperPanel.add(piperPlusModelCombo, BorderLayout.CENTER);
+        JPanel piperButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        piperButtons.add(piperPlusDownloadBtn);
+        piperButtons.add(piperPlusRemoveBtn);
+        piperButtons.add(piperPlusOpenBtn);
+        piperPanel.add(piperButtons, BorderLayout.EAST);
+        addRow(form, row++, tt("settings.label.piperPlusModel", "Piper+ model"), piperPanel);
+        piperPlusLicenseLabel = new JLabel("License: -");
+        piperPlusStatusLabel = new JLabel("Status: -");
+        piperPlusProsodyLabel = new JLabel("Prosody: -");
+        addRow(form, row++, "", piperPlusLicenseLabel);
+        addRow(form, row++, "", piperPlusStatusLabel);
+        addRow(form, row++, "", piperPlusProsodyLabel);
+
         JPanel vvPanel = new JPanel(new BorderLayout(8, 0));
         vvPanel.add(voicevoxSpeakerCombo, BorderLayout.CENTER);
         vvPanel.add(reloadVoicevoxBtn, BorderLayout.EAST);
         addRow(form, row++, tt("settings.label.voicevoxSpeaker", "VOICEVOX speaker"), vvPanel);
 
         addRow(form, row++, "", voicevoxAutoEmotionCheck);
+        addRow(form, row++, "", ttsReflectEmotionCheck);
+        addRow(form, row++, tt("settings.label.ttsContourStrength", "Cadence reflection"), ttsContourStrengthCombo);
+        addRow(form, row++, tt("settings.label.ttsToneEmphasis", "Bright / dark tone emphasis"), ttsToneEmphasisCombo);
         addRow(form, row++, tt("settings.label.voicegerLang", "Voiceger TTS language"), voicegerLangCombo);
 
         form.add(sectionLabel(tt("settings.section.ttsSetup", "Setup / Advanced")), sectionGbc(row++));
@@ -773,9 +819,14 @@ public class MobMateSettingsFrame extends JDialog {
 
         voicevoxSpeakerCombo.removeAllItems();
         voicevoxSpeakerCombo.addItem("loading...");
+        reloadPiperPlusModelChoices();
 
         voicevoxAutoEmotionCheck.setSelected(MobMateWhisp.prefs.getBoolean("voicevox.auto_emotion", true));
+        ttsReflectEmotionCheck.setSelected(MobMateWhisp.prefs.getBoolean("tts.reflect_emotion", true));
+        selectChoice(ttsContourStrengthCombo, MobMateWhisp.prefs.get("tts.reflect.contour_strength", "normal"));
+        selectChoice(ttsToneEmphasisCombo, MobMateWhisp.prefs.get("tts.reflect.tone_emphasis", "normal"));
         selectChoice(voicegerLangCombo, MobMateWhisp.prefs.get("voiceger.tts.lang", "all_ja"));
+        updatePiperPlusSelectionDetails();
 
         // ===== Text / _outtts =====
         selectStringComboValue(whisperLanguageCombo, app.getTalkLanguage(), app.getTalkLanguage());
@@ -1004,9 +1055,17 @@ public class MobMateSettingsFrame extends JDialog {
         int colon = vvSel.indexOf(':');
         if (colon > 0) vvId = vvSel.substring(0, colon).trim();
         values.put("tts.voice", vvId);
+        values.put("piper.plus.model_id", selectedPiperPlusModelId());
 
         values.put("voicevox.auto_emotion", String.valueOf(voicevoxAutoEmotionCheck.isSelected()));
+        values.put("tts.reflect_emotion", String.valueOf(ttsReflectEmotionCheck.isSelected()));
+        values.put("tts.reflect.contour_strength", selectedValue(ttsContourStrengthCombo));
+        values.put("tts.reflect.tone_emphasis", selectedValue(ttsToneEmphasisCombo));
         values.put("voiceger.tts.lang", selectedValue(voicegerLangCombo));
+        values.put("piper.plus.model_id", selectedPiperPlusModelId());
+        PiperPlusCatalog.Entry piperEntry = PiperPlusCatalog.findById(selectedPiperPlusModelId());
+        values.put("piper.plus.license", piperEntry != null ? piperEntry.license() : "");
+        values.put("piper.plus.source_url", piperEntry != null ? piperEntry.sourcePageUrl() : "");
 
         values.put("language", talkLang);
         values.put("initial_prompt", oneLine(initialPromptArea.getText()));
@@ -1127,6 +1186,7 @@ public class MobMateSettingsFrame extends JDialog {
         String oldTtsEngine = MobMateWhisp.prefs.get("tts.engine", "auto");
         String newTtsEngine = selectedValue(ttsEngineCombo);
         MobMateWhisp.prefs.put("tts.engine", newTtsEngine);
+        MobMateWhisp.prefs.put("piper.plus.model_id", selectedPiperPlusModelId());
         Integer confirmSec = selectedValue(ttsConfirmSecCombo);
         if (confirmSec != null) {
             MobMateWhisp.prefs.putInt("tts.confirm_sec", confirmSec);
@@ -1149,6 +1209,10 @@ public class MobMateSettingsFrame extends JDialog {
         }
 
         MobMateWhisp.prefs.putBoolean("voicevox.auto_emotion", voicevoxAutoEmotionCheck.isSelected());
+        MobMateWhisp.prefs.putBoolean("tts.reflect_emotion", ttsReflectEmotionCheck.isSelected());
+        MobMateWhisp.prefs.putBoolean("tts.reflect_emotion.user_touched", true);
+        MobMateWhisp.prefs.put("tts.reflect.contour_strength", selectedValue(ttsContourStrengthCombo));
+        MobMateWhisp.prefs.put("tts.reflect.tone_emphasis", selectedValue(ttsToneEmphasisCombo));
 
         String oldVoicegerLang = MobMateWhisp.prefs.get("voiceger.tts.lang", "all_ja");
         String newVoicegerLang = selectedValue(voicegerLangCombo);
@@ -1189,6 +1253,10 @@ public class MobMateSettingsFrame extends JDialog {
         writeOutttsKey("xtts.api", xttsApiField.getText().trim(), false);
         writeOutttsKey("xtts.apichk", xttsApiChkField.getText().trim(), false);
         writeOutttsKey("xtts.language", xttsLanguageField.getText().trim(), false);
+        writeOutttsKey("piper.plus.model_id", selectedPiperPlusModelId(), false);
+        PiperPlusCatalog.Entry piperEntry = PiperPlusCatalog.findById(selectedPiperPlusModelId());
+        writeOutttsKey("piper.plus.license", piperEntry != null ? piperEntry.license() : "", false);
+        writeOutttsKey("piper.plus.source_url", piperEntry != null ? piperEntry.sourcePageUrl() : "", false);
 
         writeOutttsKey("ignore.mode", selectedValue(ignoreModeCombo), false);
         writeOutttsKey("laughs.enable", String.valueOf(laughsEnableCheck.isSelected()), false); 
@@ -1295,6 +1363,89 @@ public class MobMateSettingsFrame extends JDialog {
             );
         }
     }
+    private void openPiperPlusModelGuide() {
+        try {
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
+                Desktop.getDesktop().browse(new URI(PIPER_PLUS_MODEL_GUIDE_URL));
+                return;
+            }
+        } catch (Exception ex) {
+            showPiperPlusGuideFallbackDialog(ex.getMessage());
+            return;
+        }
+        showPiperPlusGuideFallbackDialog(null);
+    }
+
+    private void showPiperPlusGuideFallbackDialog(String reason) {
+        StringBuilder message = new StringBuilder(tt(
+                "settings.piperPlus.guideDialog",
+                "Open this Piper+ model guide in your browser:"
+        )).append("\n")
+                .append(PIPER_PLUS_MODEL_GUIDE_URL);
+        if (reason != null && !reason.isBlank()) {
+            message.append("\n\n")
+                    .append(tt("settings.common.reason", "Reason"))
+                    .append(": ")
+                    .append(reason);
+        }
+        JOptionPane.showMessageDialog(
+                this,
+                message.toString(),
+                tt("settings.piperPlus.guideTitle", "MobMate"),
+                JOptionPane.INFORMATION_MESSAGE
+        );
+    }
+
+    private boolean isManualGuideOnlyPiperPlusEntry(PiperPlusCatalog.Entry entry) {
+        return entry != null && "css10-ja-6lang-zh".equalsIgnoreCase(entry.id());
+    }
+
+    private boolean hasExternalPiperPlusModelCard(PiperPlusCatalog.Entry entry) {
+        return entry != null
+                && entry.sourcePageUrl() != null
+                && !entry.sourcePageUrl().isBlank()
+                && entry.sourcePageUrl().startsWith("http");
+    }
+
+    private void openSelectedPiperPlusModelCard(PiperPlusCatalog.Entry entry) {
+        if (!hasExternalPiperPlusModelCard(entry)) return;
+        try {
+            if (Desktop.isDesktopSupported() && Desktop.getDesktop().isSupported(Desktop.Action.BROWSE)) {
+                Desktop.getDesktop().browse(new URI(entry.sourcePageUrl()));
+                return;
+            }
+        } catch (Exception ex) {
+            JOptionPane.showMessageDialog(
+                    this,
+                    tt("settings.piperPlus.modelCardDialog", "Open this Piper+ model page in your browser:")
+                            + "\n" + entry.sourcePageUrl()
+                            + "\n\n" + tt("settings.common.reason", "Reason") + ": " + ex.getMessage(),
+                    tt("settings.piperPlus.guideTitle", "MobMate"),
+                    JOptionPane.INFORMATION_MESSAGE
+            );
+            return;
+        }
+        JOptionPane.showMessageDialog(
+                this,
+                tt("settings.piperPlus.modelCardDialog", "Open this Piper+ model page in your browser:")
+                        + "\n" + entry.sourcePageUrl(),
+                tt("settings.piperPlus.guideTitle", "MobMate"),
+                JOptionPane.INFORMATION_MESSAGE
+        );
+    }
+
+    private void handleSelectedPiperPlusPrimaryAction() {
+        PiperPlusCatalog.Entry entry = PiperPlusCatalog.findById(selectedPiperPlusModelId());
+        if (isManualGuideOnlyPiperPlusEntry(entry)) {
+            openPiperPlusModelGuide();
+            return;
+        }
+        if (entry != null && !entry.isDownloadable() && hasExternalPiperPlusModelCard(entry)) {
+            openSelectedPiperPlusModelCard(entry);
+            return;
+        }
+        downloadSelectedPiperPlusModel();
+    }
     private void openVoiceVoxSetup() {
         FirstLaunchWizard wizard = null;
         try {
@@ -1339,6 +1490,121 @@ public class MobMateSettingsFrame extends JDialog {
                 if (wizard != null) wizard.stopAllWizardTests();
             } catch (Throwable ignore) {}
         }
+    }
+    private void reloadPiperPlusModelChoices() {
+        String current = MobMateWhisp.prefs.get("piper.plus.model_id", "");
+        piperPlusModelCombo.removeAllItems();
+        for (PiperPlusCatalog.Entry entry : PiperPlusCatalog.pickerEntries()) {
+            piperPlusModelCombo.addItem(entry.comboLabel());
+        }
+        if (!current.isBlank()) {
+            PiperPlusCatalog.Entry saved = PiperPlusCatalog.pickerSelectionForSaved(current);
+            if (saved != null) {
+                if (!saved.id().equalsIgnoreCase(current)) {
+                    MobMateWhisp.prefs.put("piper.plus.model_id", saved.id());
+                }
+                piperPlusModelCombo.setSelectedItem(saved.comboLabel());
+            }
+        }
+        if (piperPlusModelCombo.getSelectedItem() == null && piperPlusModelCombo.getItemCount() > 0) {
+            piperPlusModelCombo.setSelectedIndex(0);
+        }
+        piperPlusModelCombo.addActionListener(e -> updatePiperPlusSelectionDetails());
+    }
+
+    private String selectedPiperPlusModelId() {
+        Object selected = (piperPlusModelCombo != null) ? piperPlusModelCombo.getSelectedItem() : null;
+        if (selected == null) return MobMateWhisp.prefs.get("piper.plus.model_id", "");
+        String label = selected.toString();
+        for (PiperPlusCatalog.Entry entry : PiperPlusCatalog.pickerEntries()) {
+            if (entry.comboLabel().equals(label)) return entry.id();
+        }
+        return MobMateWhisp.prefs.get("piper.plus.model_id", "");
+    }
+
+    private void updatePiperPlusSelectionDetails() {
+        if (piperPlusLicenseLabel == null || piperPlusStatusLabel == null) return;
+        PiperPlusCatalog.Entry entry = PiperPlusCatalog.findById(selectedPiperPlusModelId());
+        if (entry == null) {
+            piperPlusLicenseLabel.setText("License: -");
+            piperPlusStatusLabel.setText("Status: No model selected");
+            piperPlusProsodyLabel.setText("Prosody: -");
+            if (piperPlusDownloadBtn != null) {
+                piperPlusDownloadBtn.setText(tt("settings.piperPlus.download", "Download / Update"));
+                piperPlusDownloadBtn.setEnabled(false);
+                piperPlusDownloadBtn.setToolTipText(null);
+            }
+            return;
+        }
+        piperPlusLicenseLabel.setText("License: " + entry.license() + " | Source: " + entry.sourcePageUrl());
+        String runtime = PiperPlusModelManager.isRuntimeAvailable() ? "runtime bundled" : "runtime missing";
+        piperPlusStatusLabel.setText("Status: " + PiperPlusModelManager.statusText(entry) + " | " + runtime);
+        if (piperPlusDownloadBtn != null) {
+            boolean manualOnly = isManualGuideOnlyPiperPlusEntry(entry);
+            boolean modelCardOnly = !manualOnly && !entry.isDownloadable() && hasExternalPiperPlusModelCard(entry);
+            piperPlusDownloadBtn.setText(manualOnly
+                    ? tt("settings.piperPlus.guide", "View Setup Guide")
+                    : modelCardOnly
+                    ? tt("settings.piperPlus.modelCard", "Open Model Card")
+                    : tt("settings.piperPlus.download", "Download / Update"));
+            piperPlusDownloadBtn.setEnabled(manualOnly || modelCardOnly || entry.isDownloadable());
+            piperPlusDownloadBtn.setToolTipText(manualOnly
+                    ? tt("settings.piperPlus.guide.tooltip",
+                    "Open the Piper+ Model Guide on GitHub for manual Chinese model setup.")
+                    : modelCardOnly
+                    ? tt("settings.piperPlus.modelCard.tooltip",
+                    "This model is manual/local. Open its model card instead of downloading from MobMate.")
+                    : null);
+        }
+        if (isManualGuideOnlyPiperPlusEntry(entry)) {
+            piperPlusProsodyLabel.setText("Prosody: Chinese built-in route is unstable; manual model is recommended");
+        } else {
+            piperPlusProsodyLabel.setText("Prosody: model-native intonation only; no speech-to-speech prosody transfer");
+        }
+    }
+
+    private void downloadSelectedPiperPlusModel() {
+        PiperPlusCatalog.Entry entry = PiperPlusCatalog.findById(selectedPiperPlusModelId());
+        if (entry == null) {
+            JOptionPane.showMessageDialog(this, "No Piper+ model selected.");
+            return;
+        }
+        piperPlusStatusLabel.setText("Status: Downloading " + entry.displayName() + " ...");
+        new SwingWorker<Void, Void>() {
+            @Override
+            protected Void doInBackground() throws Exception {
+                PiperPlusModelManager.ensureDownloaded(entry);
+                return null;
+            }
+
+            @Override
+            protected void done() {
+                try {
+                    get();
+                    MobMateWhisp.prefs.put("piper.plus.model_id", entry.id());
+                    updatePiperPlusSelectionDetails();
+                } catch (Exception ex) {
+                    piperPlusStatusLabel.setText("Status: Download failed: " + ex.getMessage());
+                }
+            }
+        }.execute();
+    }
+
+    private void removeSelectedPiperPlusModel() {
+        PiperPlusCatalog.Entry entry = PiperPlusCatalog.findById(selectedPiperPlusModelId());
+        if (entry == null) return;
+        try {
+            PiperPlusModelManager.deleteInstalled(entry);
+            updatePiperPlusSelectionDetails();
+        } catch (IOException ex) {
+            JOptionPane.showMessageDialog(this, "Failed to remove Piper+ model:\n" + ex.getMessage());
+        }
+    }
+
+    private void openSelectedPiperPlusModelFolder() {
+        PiperPlusCatalog.Entry entry = PiperPlusCatalog.findById(selectedPiperPlusModelId());
+        if (entry == null) return;
+        openLocalFile(PiperPlusModelManager.getModelDir(entry).toFile());
     }
     private void openWizard() {
         final String beforeEngine = MobMateWhisp.prefs.get("recog.engine", "whisper");

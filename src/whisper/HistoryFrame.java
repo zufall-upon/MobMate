@@ -142,7 +142,9 @@ public class HistoryFrame extends JFrame implements ChangeListener {
         });
         talkTranslateTargetCombo.addActionListener(e -> {
             if (adjustingTalkControls) return;
-            mobMateWhisp.setTalkTranslateTarget(Objects.toString(talkTranslateTargetCombo.getSelectedItem(), "OFF"));
+            String selected = Objects.toString(talkTranslateTargetCombo.getSelectedItem(), "OFF");
+            mobMateWhisp.setTalkTranslateTarget(selected);
+            mobMateWhisp.prewarmPiperPlusForTalkTargetSelection(this, selected);
         });
 
         JPanel talkControlPanel = new JPanel();

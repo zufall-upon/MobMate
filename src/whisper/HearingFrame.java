@@ -91,6 +91,7 @@ public class HearingFrame extends JFrame {
     private static final int AUTO_DETECT_LONG_MERGE_PROBE_FORCE_EXTRA_CP = 6;
     private static final int AUTO_DETECT_BACKFILL_LIMIT = 3;
     private static final long AUTO_DETECT_BACKFILL_MAX_AGE_MS = 10_000L;
+    private static final int WHISPER_AUTO_STABLE_SWITCH_CONFIRMATIONS = 2;
     private static final int CARD_FADE_IN_MS = 220;
     private static final int TRANSLATED_FADE_MS = 1800;
     private static final long DISPLAY_COLLAPSE_GAP_MS = 2000L;
@@ -136,6 +137,8 @@ public class HearingFrame extends JFrame {
     private long stableAutoDetectLockedAtMs = 0L;
     private long autoDetectLastSwitchAtMs = 0L;
     private long lastAutoDetectInputMs = 0L;
+    private String pendingWhisperStableSwitchLang = "";
+    private int pendingWhisperStableSwitchConfirmations = 0;
     private boolean autoDetectBackfillRunning = false;
     private long autoDetectStateVersion = 0L;
     // Moonshine can end almost every chunk with punctuation, so we track consecutive
@@ -367,6 +370,7 @@ public class HearingFrame extends JFrame {
                 toggle.setText("Hearing: OFF");
                 MobMateWhisp.setHearingActive(false);  // ★追加
                 stopMonitor();
+                host.resetHearingAutoSessionState("toggle-off");
                 translatedCaptionCleanupTimer.stop();
                 hideOverlay();
             }
@@ -387,7 +391,7 @@ public class HearingFrame extends JFrame {
         root.add(row1);
 
 
-        langCombo = new JComboBox<>(LanguageOptions.whisperLangs());
+        langCombo = new JComboBox<>(LanguageOptions.hearingWhisperLangs());
         langCombo.setRenderer(LanguageOptions.whisperRenderer());
         langCombo.setFocusable(false);
         Dimension langSize = new Dimension(comboWidth(langCombo, scaledWidth(120, 6)), scaledHeight(26));
@@ -480,8 +484,12 @@ public class HearingFrame extends JFrame {
 
     private void refreshMoonshineAutoHintLabel() {
         if (hearingMoonshineAutoHintLabel == null) return;
+        String sourceLang = host.getHearingSourceLangForUi();
         boolean show = "moonshine".equalsIgnoreCase(host.getHearingEngine())
-                && "auto".equalsIgnoreCase(host.getHearingSourceLangForUi());
+                && (sourceLang == null
+                || sourceLang.isBlank()
+                || "auto".equalsIgnoreCase(sourceLang)
+                || LanguageOptions.HEARING_AUTO_STABLE.equalsIgnoreCase(sourceLang));
         hearingMoonshineAutoHintLabel.setVisible(show);
     }
 
@@ -1450,7 +1458,10 @@ public class HearingFrame extends JFrame {
         try {
             configured = prefs.get("hearing.lang", "auto");
         } catch (Exception ignore) {}
-        return configured == null || configured.isBlank() || "auto".equalsIgnoreCase(configured.trim());
+        if (configured == null || configured.isBlank()) return true;
+        String normalized = configured.trim().toLowerCase(java.util.Locale.ROOT);
+        return "auto".equals(normalized)
+                || LanguageOptions.HEARING_AUTO_STABLE.equals(normalized);
     }
 
     private void resetAutoDetectState(String reason) {
@@ -1462,6 +1473,7 @@ public class HearingFrame extends JFrame {
             stableAutoDetectLockedAtMs = 0L;
             autoDetectLastSwitchAtMs = 0L;
             lastAutoDetectInputMs = 0L;
+            clearPendingWhisperStableSwitchLocked();
             autoDetectBackfillRunning = false;
             autoDetectStateVersion++;
         }
@@ -1584,6 +1596,23 @@ public class HearingFrame extends JFrame {
         return count;
     }
 
+    private int countConflictingAutoDetectVotes(String lang) {
+        if (lang == null || lang.isBlank()) return 0;
+        int count = 0;
+        for (AutoDetectVote vote : autoDetectVotes) {
+            if (vote != null && !vote.lang.isBlank() && !lang.equals(vote.lang)) count++;
+        }
+        return count;
+    }
+
+    private int countAutoDetectTotalVotes() {
+        int count = 0;
+        for (AutoDetectVote vote : autoDetectVotes) {
+            if (vote != null && !vote.lang.isBlank()) count++;
+        }
+        return count;
+    }
+
     private String buildAutoDetectVoteSummary() {
         java.util.LinkedHashMap<String, Integer> counts = new java.util.LinkedHashMap<>();
         for (AutoDetectVote vote : autoDetectVotes) {
@@ -1602,6 +1631,65 @@ public class HearingFrame extends JFrame {
         return sb.toString();
     }
 
+    private boolean isWhisperAutoStableShiftMode() {
+        return host != null
+                && host.isHearingAutoStableLanguage()
+                && !host.isHearingEngineMoonshine();
+    }
+
+    private void clearPendingWhisperStableSwitchLocked() {
+        pendingWhisperStableSwitchLang = "";
+        pendingWhisperStableSwitchConfirmations = 0;
+    }
+
+    private void decayPendingWhisperStableSwitchLocked(String reason) {
+        if (pendingWhisperStableSwitchLang == null || pendingWhisperStableSwitchLang.isBlank()) return;
+        pendingWhisperStableSwitchConfirmations = Math.max(0, pendingWhisperStableSwitchConfirmations - 1);
+        if (pendingWhisperStableSwitchConfirmations <= 0) {
+            Config.logDebug("[Hearing][Lang] whisper auto-stable pending cleared: " + reason);
+            clearPendingWhisperStableSwitchLocked();
+            return;
+        }
+        Config.logDebug("[Hearing][Lang] whisper auto-stable pending decayed: "
+                + pendingWhisperStableSwitchLang
+                + " confirm=" + pendingWhisperStableSwitchConfirmations + "/" + WHISPER_AUTO_STABLE_SWITCH_CONFIRMATIONS
+                + " reason=" + reason);
+    }
+
+    private boolean hasStrongWhisperAutoStableInitialVotes(String bestLang, int bestVotes, int conflictingVotes, int totalVotes) {
+        if (!isWhisperAutoStableShiftMode()) return true;
+        if (bestLang == null || bestLang.isBlank()) return false;
+        return bestVotes >= Math.max(2, getAutoDetectInitialVoteThreshold())
+                && bestVotes > conflictingVotes
+                && (bestVotes * 100) >= (Math.max(1, totalVotes) * 60);
+    }
+
+    private boolean hasStrongWhisperAutoStableSwitchVotes(String bestLang, int bestVotes, int stableVotes, int totalVotes) {
+        if (!isWhisperAutoStableShiftMode()) return true;
+        if (bestLang == null || bestLang.isBlank()) return false;
+        return bestVotes >= Math.max(3, getAutoDetectSwitchVoteThreshold())
+                && bestVotes > stableVotes
+                && (bestVotes * 100) >= (Math.max(1, totalVotes) * 60);
+    }
+
+    private String commitAutoDetectSwitchLocked(String nextLang, String text, int textLetters, long now, int bestVotes, int probeLetters) {
+        String prev = stableAutoDetectLang;
+        stableAutoDetectLang = nextLang;
+        stableAutoDetectLockedAtMs = now;
+        autoDetectLastSwitchAtMs = now;
+        autoDetectStateVersion++;
+        autoDetectProbeBuffer.setLength(0);
+        autoDetectVotes.clear();
+        appendAutoDetectProbe(text);
+        appendAutoDetectVote(nextLang, Math.max(textLetters, autoDetectMinLettersForVote(nextLang)), now);
+        clearPendingWhisperStableSwitchLocked();
+        Config.log("[Hearing][Lang] auto-detect switched: " + prev + " -> " + nextLang
+                + " votes=" + bestVotes
+                + " probeLetters=" + probeLetters
+                + " voteSummary=" + buildAutoDetectVoteSummary());
+        return nextLang;
+    }
+
     private String resolveStableAutoDetectSourceLang(String text) {
         if (!isHearingAutoDetectMode()) {
             resetAutoDetectState("configured-lang");
@@ -1618,6 +1706,7 @@ public class HearingFrame extends JFrame {
                 stableAutoDetectLang = "";
                 stableAutoDetectLockedAtMs = 0L;
                 autoDetectLastSwitchAtMs = 0L;
+                clearPendingWhisperStableSwitchLocked();
                 Config.logDebug("[Hearing][Lang] auto-detect gap reset: gapMs=" + (now - lastAutoDetectInputMs)
                         + " thresholdMs=" + resetGapMs);
             }
@@ -1635,6 +1724,8 @@ public class HearingFrame extends JFrame {
 
             String bestLang = findBestAutoDetectVoteLang();
             int bestVotes = countAutoDetectVotes(bestLang);
+            int conflictingVotes = countConflictingAutoDetectVotes(bestLang);
+            int totalVotes = countAutoDetectTotalVotes();
             boolean hasStable = stableAutoDetectLang != null && !stableAutoDetectLang.isBlank();
             if (!hasStable) {
                 String probeCandidate = host.detectHearingSourceLangByScript(autoDetectProbeBuffer.toString());
@@ -1642,10 +1733,12 @@ public class HearingFrame extends JFrame {
                 long pendingWaitMs = getAutoDetectPendingWaitMs();
                 if (!bestLang.isBlank()
                         && bestVotes >= getAutoDetectInitialVoteThreshold()
+                        && hasStrongWhisperAutoStableInitialVotes(bestLang, bestVotes, conflictingVotes, totalVotes)
                         && probeLetters >= probeThreshold) {
                     stableAutoDetectLang = bestLang;
                     stableAutoDetectLockedAtMs = now;
                     autoDetectLastSwitchAtMs = now;
+                    clearPendingWhisperStableSwitchLocked();
                     autoDetectStateVersion++;
                     moonshineSwitchLang = bestLang;
                     Config.log("[Hearing][Lang] auto-detect stabilized: " + bestLang
@@ -1656,23 +1749,29 @@ public class HearingFrame extends JFrame {
                             + " probe=" + autoDetectProbeBuffer);
                     resolvedLang = stableAutoDetectLang;
                 } else if (!bestLang.isBlank()
-                        && bestVotes >= 1
+                        && bestVotes >= 2
+                        && bestVotes > conflictingVotes
+                        && (bestVotes * 100) >= (Math.max(1, totalVotes) * 60)
                         && probeLetters >= probeThreshold
                         && pendingWaitMs >= AUTO_DETECT_MAX_STABILIZATION_WAIT_MS) {
                     stableAutoDetectLang = bestLang;
                     stableAutoDetectLockedAtMs = now;
                     autoDetectLastSwitchAtMs = now;
+                    clearPendingWhisperStableSwitchLocked();
                     autoDetectStateVersion++;
                     moonshineSwitchLang = bestLang;
                     Config.log("[Hearing][Lang] auto-detect timeout-stabilized: " + bestLang
                             + " votes=" + bestVotes
+                            + " conflictingVotes=" + conflictingVotes
+                            + " totalVotes=" + totalVotes
                             + " probeLetters=" + probeLetters
                             + " pendingWaitMs=" + pendingWaitMs
                             + " threshold=" + probeThreshold
                             + " voteSummary=" + buildAutoDetectVoteSummary()
                             + " probe=" + autoDetectProbeBuffer);
                     resolvedLang = stableAutoDetectLang;
-                } else if (isLongMergeWaitForAutoDetect()
+                } else if (!isWhisperAutoStableShiftMode()
+                        && isLongMergeWaitForAutoDetect()
                         && !probeCandidate.isBlank()
                         && probeCandidate.equals(bestLang)
                         && bestVotes >= 1
@@ -1680,6 +1779,7 @@ public class HearingFrame extends JFrame {
                     stableAutoDetectLang = probeCandidate;
                     stableAutoDetectLockedAtMs = now;
                     autoDetectLastSwitchAtMs = now;
+                    clearPendingWhisperStableSwitchLocked();
                     autoDetectStateVersion++;
                     Config.log("[Hearing][Lang] auto-detect probe-forced: " + probeCandidate
                             + " votes=" + bestVotes
@@ -1689,35 +1789,65 @@ public class HearingFrame extends JFrame {
                             + " probe=" + autoDetectProbeBuffer);
                     resolvedLang = stableAutoDetectLang;
                 } else {
+                    clearPendingWhisperStableSwitchLocked();
                     resolvedLang = "";
                 }
             } else if (now - stableAutoDetectLockedAtMs < AUTO_DETECT_LOCK_HOLD_MS) {
+                clearPendingWhisperStableSwitchLocked();
                 resolvedLang = stableAutoDetectLang;
             } else if (now - autoDetectLastSwitchAtMs < AUTO_DETECT_SWITCH_COOLDOWN_MS) {
+                clearPendingWhisperStableSwitchLocked();
                 resolvedLang = stableAutoDetectLang;
             } else {
+                int stableVotes = countAutoDetectVotes(stableAutoDetectLang);
                 if (!bestLang.isBlank()
                         && !bestLang.equals(stableAutoDetectLang)
                         && bestVotes >= getAutoDetectSwitchVoteThreshold()) {
-                    String prev = stableAutoDetectLang;
-                    stableAutoDetectLang = bestLang;
-                    stableAutoDetectLockedAtMs = now;
-                    autoDetectLastSwitchAtMs = now;
-                    autoDetectStateVersion++;
-                    autoDetectProbeBuffer.setLength(0);
-                    autoDetectVotes.clear();
-                    appendAutoDetectProbe(text);
-                    appendAutoDetectVote(bestLang, Math.max(textLetters, autoDetectMinLettersForVote(bestLang)), now);
-                    moonshineSwitchLang = bestLang;
-                    Config.log("[Hearing][Lang] auto-detect switched: " + prev + " -> " + bestLang
-                            + " votes=" + bestVotes
-                            + " probeLetters=" + probeLetters);
+                    if (isWhisperAutoStableShiftMode()) {
+                        if (hasStrongWhisperAutoStableSwitchVotes(bestLang, bestVotes, stableVotes, totalVotes)) {
+                            if (!bestLang.equals(pendingWhisperStableSwitchLang)) {
+                                pendingWhisperStableSwitchLang = bestLang;
+                                pendingWhisperStableSwitchConfirmations = 1;
+                                Config.logDebug("[Hearing][Lang] whisper auto-stable pending switch: "
+                                        + stableAutoDetectLang + " -> " + bestLang
+                                        + " confirm=1/" + WHISPER_AUTO_STABLE_SWITCH_CONFIRMATIONS
+                                        + " votes=" + bestVotes
+                                        + " stableVotes=" + stableVotes
+                                        + " voteSummary=" + buildAutoDetectVoteSummary());
+                            } else {
+                                pendingWhisperStableSwitchConfirmations++;
+                                if (pendingWhisperStableSwitchConfirmations >= WHISPER_AUTO_STABLE_SWITCH_CONFIRMATIONS) {
+                                    moonshineSwitchLang = commitAutoDetectSwitchLocked(bestLang, text, textLetters, now, bestVotes, probeLetters);
+                                } else {
+                                    Config.logDebug("[Hearing][Lang] whisper auto-stable pending switch: "
+                                            + stableAutoDetectLang + " -> " + bestLang
+                                            + " confirm=" + pendingWhisperStableSwitchConfirmations + "/" + WHISPER_AUTO_STABLE_SWITCH_CONFIRMATIONS
+                                            + " votes=" + bestVotes
+                                            + " stableVotes=" + stableVotes
+                                            + " voteSummary=" + buildAutoDetectVoteSummary());
+                                }
+                            }
+                        } else {
+                            decayPendingWhisperStableSwitchLocked("weak-switch-evidence");
+                        }
+                    } else {
+                        moonshineSwitchLang = commitAutoDetectSwitchLocked(bestLang, text, textLetters, now, bestVotes, probeLetters);
+                    }
+                } else if (isWhisperAutoStableShiftMode()) {
+                    if (bestLang.isBlank()) {
+                        decayPendingWhisperStableSwitchLocked("blank-best");
+                    } else if (bestLang.equals(stableAutoDetectLang)) {
+                        decayPendingWhisperStableSwitchLocked("returned-to-stable");
+                    }
+                } else if (bestLang.isBlank() || bestLang.equals(stableAutoDetectLang)) {
+                    clearPendingWhisperStableSwitchLocked();
                 }
                 resolvedLang = stableAutoDetectLang;
             }
         }
         if (!moonshineSwitchLang.isBlank()) {
             host.requestHearingAutoMoonshineSessionLang(moonshineSwitchLang);
+            host.requestHearingAutoWhisperSessionLang(moonshineSwitchLang);
         }
         return resolvedLang;
     }
@@ -1773,7 +1903,8 @@ public class HearingFrame extends JFrame {
             int previousBoundaryStreak = consecutiveBoundaryChunks;
             synchronized (pendingMergeChunks) {
                 chunkCount = pendingMergeChunks.size();
-                boundaryFlush = chunkCount >= 5 || previousBoundaryStreak >= 3;
+                boundaryFlush = chunkCount >= getBoundaryFlushMinChunks()
+                        || previousBoundaryStreak >= getBoundaryFlushMinStreak();
             }
             if (boundaryFlush) {
                 chunkMergeTimer.stop();
@@ -1796,15 +1927,39 @@ public class HearingFrame extends JFrame {
         }
     }
 
+    private boolean isWhisperMergeSegmentationMode() {
+        return host != null && !"moonshine".equalsIgnoreCase(host.getHearingEngine());
+    }
+
+    private int getMergeForceFlushCodePointsThreshold() {
+        return isWhisperMergeSegmentationMode() ? 760 : MERGE_FORCE_FLUSH_CODEPOINTS;
+    }
+
+    private int getMergeForceFlushHardCodePointsThreshold() {
+        return isWhisperMergeSegmentationMode() ? 1040 : MERGE_FORCE_FLUSH_HARD_CODEPOINTS;
+    }
+
+    private int getMergeForceFlushLookbackCodePointsThreshold() {
+        return isWhisperMergeSegmentationMode() ? 96 : MERGE_FORCE_FLUSH_LOOKBACK_CODEPOINTS;
+    }
+
+    private int getBoundaryFlushMinChunks() {
+        return isWhisperMergeSegmentationMode() ? 7 : 5;
+    }
+
+    private int getBoundaryFlushMinStreak() {
+        return isWhisperMergeSegmentationMode() ? 4 : 3;
+    }
+
     private boolean shouldForceFlushMergeByLength() {
         synchronized (pendingMergeChunks) {
             int chunkCount = pendingMergeChunks.size();
             if (chunkCount < MERGE_FORCE_FLUSH_MIN_CHUNKS) return false;
             String merged = mergeChunkTexts(pendingMergeChunks);
             int mergedCp = countCodePoints(merged);
-            if (mergedCp < MERGE_FORCE_FLUSH_CODEPOINTS) return false;
-            if (mergedCp >= MERGE_FORCE_FLUSH_HARD_CODEPOINTS) return true;
-            return hasTailFlushBoundary(merged, MERGE_FORCE_FLUSH_LOOKBACK_CODEPOINTS);
+            if (mergedCp < getMergeForceFlushCodePointsThreshold()) return false;
+            if (mergedCp >= getMergeForceFlushHardCodePointsThreshold()) return true;
+            return hasTailFlushBoundary(merged, getMergeForceFlushLookbackCodePointsThreshold());
         }
     }
 
@@ -1826,6 +1981,15 @@ public class HearingFrame extends JFrame {
     }
 
     private boolean isFlushBoundaryCodePoint(int cp) {
+        if (isWhisperMergeSegmentationMode()) {
+            return cp == '。'
+                    || cp == '！'
+                    || cp == '？'
+                    || cp == '.'
+                    || cp == '!'
+                    || cp == '?'
+                    || cp == '…';
+        }
         return Character.isWhitespace(cp)
                 || cp == '。'
                 || cp == '！'
@@ -1897,6 +2061,7 @@ public class HearingFrame extends JFrame {
         if (text == null) return false;
         String s = text.trim();
         if (s.isEmpty()) return false;
+        if (isWhisperMergeSegmentationMode() && countCodePoints(s) < 10) return false;
         return s.endsWith("。")
                 || s.endsWith("！")
                 || s.endsWith("？")

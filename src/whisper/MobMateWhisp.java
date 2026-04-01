@@ -50,7 +50,10 @@ import static whisper.VoicegerManager.httpOk;
 public class MobMateWhisp implements NativeKeyListener {
 
     private static final AtomicBoolean shutdownHookOnce = new AtomicBoolean(false);
+    private static final PiperPlusPersistentSessionManager piperPlusSessionManager = new PiperPlusPersistentSessionManager();
     private static final String OUTTTS_MARKER = "↑Settings↓Logs below";
+    private static final long PIPER_PLUS_DOWNLOAD_DECLINE_COOLDOWN_MS = 10 * 60 * 1000L;
+    private static final long PIPER_PLUS_SESSION_PREWARM_COOLDOWN_MS = 45_000L;
     private static LinkedHashMap<String, String> createPresetKeys() {
         LinkedHashMap<String, String> keys = new LinkedHashMap<>();
         keys.put("audio.device", "");
@@ -63,9 +66,14 @@ public class MobMateWhisp implements NativeKeyListener {
         keys.put("talk.lang", "auto");
         keys.put("talk.translate.target", "OFF");
         keys.put("tts.engine", "auto");
+        keys.put("piper.plus.model_id", "");
         keys.put("tts.windows.voice", "auto");
         keys.put("tts.voice", "3");
         keys.put("voicevox.auto_emotion", "true");
+        keys.put("tts.reflect_emotion", "true");
+        keys.put("tts.reflect_emotion.user_touched", "false");
+        keys.put("tts.reflect.contour_strength", "normal");
+        keys.put("tts.reflect.tone_emphasis", "normal");
         keys.put("voiceger.tts.lang", "all_ja");
         keys.put("hearing.lang", "auto");
         keys.put("hearing.engine", "whisper");
@@ -93,6 +101,9 @@ public class MobMateWhisp implements NativeKeyListener {
         keys.put("initial_prompt", "");
         keys.put("voicevox.exe", "");
         keys.put("voicevox.api", "");
+        keys.put("piper.plus.model_id", "");
+        keys.put("piper.plus.license", "");
+        keys.put("piper.plus.source_url", "");
         keys.put("xtts.api", "");
         keys.put("xtts.apichk", "");
         keys.put("xtts.language", "");
@@ -161,6 +172,7 @@ public class MobMateWhisp implements NativeKeyListener {
         final long acceptedAtMs;
         final long dueAtMs;
         final String originTag;
+        final TtsProsodyProfile ttsProsodyProfile;
 
         PendingConfirmItem(long id,
                            String sourceText,
@@ -169,7 +181,8 @@ public class MobMateWhisp implements NativeKeyListener {
                            Action action,
                            long acceptedAtMs,
                            long dueAtMs,
-                           String originTag) {
+                           String originTag,
+                           TtsProsodyProfile ttsProsodyProfile) {
             this.id = id;
             this.sourceText = (sourceText == null) ? "" : sourceText;
             this.outputText = (outputText == null) ? "" : outputText;
@@ -178,6 +191,7 @@ public class MobMateWhisp implements NativeKeyListener {
             this.acceptedAtMs = acceptedAtMs;
             this.dueAtMs = dueAtMs;
             this.originTag = (originTag == null || originTag.isBlank()) ? "confirm" : originTag;
+            this.ttsProsodyProfile = ttsProsodyProfile;
         }
     }
 
@@ -282,6 +296,11 @@ public class MobMateWhisp implements NativeKeyListener {
     private final AtomicLong hearingMoonshineReloadSeq = new AtomicLong(0L);
     private volatile String hearingMoonshineAutoSessionLang = "en";
     private volatile long hearingMoonshineLastReloadMs = 0L;
+    private volatile String hearingWhisperAutoSessionLang = "auto";
+    private volatile long hearingWhisperLastShiftMs = 0L;
+    private final Map<String, Long> piperPlusDownloadDeclinedUntil = new ConcurrentHashMap<>();
+    private final Map<String, Long> piperPlusSessionPrewarmUntil = new ConcurrentHashMap<>();
+    private final Set<String> piperPlusCompatibilityNotified = ConcurrentHashMap.newKeySet();
     private String model;
     private String model_dir;
     private final String remoteUrl;
@@ -299,6 +318,11 @@ public class MobMateWhisp implements NativeKeyListener {
     });
     private static final ExecutorService audioService = Executors.newFixedThreadPool(2, r -> {
         Thread t = new Thread(r, "audio-executor");
+        t.setDaemon(true);
+        return t;
+    });
+    private static final ExecutorService piperPlusPrewarmExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "piper-plus-prewarm");
         t.setDaemon(true);
         return t;
     });
@@ -553,6 +577,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 new WString("MobMate.MobMateWhispTalk")
         );
         prefs = Preferences.userRoot().node("MobMateWhispTalk");
+        migrateTtsReflectEmotionDefaultIfNeeded();
         audioPrefilterMode = normalizeAudioPrefilterMode(prefs.get("audio.prefilter.mode", "normal"));
         hearingAudioPrefilterMode = loadHearingAudioPrefilterMode(prefs);
         // ★話者プロファイル初期化（prefsから設定値を取得）
@@ -684,19 +709,19 @@ public class MobMateWhisp implements NativeKeyListener {
         LocalWhisperCPP cur = wHearing;
         if (cur != null) {
             // ★キャッシュでも毎回 prefs を反映（UI変更が即効く）
-            try { cur.setLanguage(prefs.get("hearing.lang", "auto")); } catch (Exception ignore) {}
+            try { cur.setLanguage(getHearingWhisperRuntimeLang()); } catch (Exception ignore) {}
             try { cur.setHearingTranslateToEn(false); } catch (Exception ignore) {}
             return cur;
         }
         synchronized (hearingWhisperLock) {
             if (wHearing != null) {
                 // ★二重チェック側でも同様に反映
-                try { wHearing.setLanguage(prefs.get("hearing.lang", "auto")); } catch (Exception ignore) {}
+                try { wHearing.setLanguage(getHearingWhisperRuntimeLang()); } catch (Exception ignore) {}
                 try { wHearing.setHearingTranslateToEn(false); } catch (Exception ignore) {}
                 return wHearing;
             }
             wHearing = new LocalWhisperCPP(new File(this.model_dir, this.model), "Hearing");
-            try { wHearing.setLanguage(prefs.get("hearing.lang", "auto")); } catch (Exception ignore) {}
+            try { wHearing.setLanguage(getHearingWhisperRuntimeLang()); } catch (Exception ignore) {}
             try { wHearing.setHearingTranslateToEn(false); } catch (Exception ignore) {}
             return wHearing;
         }
@@ -1140,10 +1165,10 @@ public class MobMateWhisp implements NativeKeyListener {
         String out = (talkText.outputText() == null || talkText.outputText().isBlank()) ? original : talkText.outputText();
         String historyText = (talkText.historyText() == null || talkText.historyText().isBlank()) ? original : talkText.historyText();
         if (ttsConfirmMode) {
-            enqueuePendingConfirm(original, out, historyText, Action.NOTHING, 0L, "radio/ui");
+            enqueuePendingConfirm(original, out, historyText, Action.NOTHING, 0L, "radio/ui", null);
             return;
         }
-        commitTalkOutput(original, out, historyText, Action.NOTHING, 0L, "radio/ui");
+        commitTalkOutput(original, out, historyText, Action.NOTHING, 0L, "radio/ui", null);
     }
 
     public String buildTranslatedCaption(String originalText, String translatedText) {
@@ -1237,7 +1262,8 @@ public class MobMateWhisp implements NativeKeyListener {
                                        String historyText,
                                        Action action,
                                        long acceptedAtMs,
-                                       String originTag) {
+                                       String originTag,
+                                       TtsProsodyProfile ttsProsodyProfile) {
         long now = System.currentTimeMillis();
         long dueAtMs = now + (getConfirmDelaySeconds() * 1000L);
         PendingConfirmItem next = new PendingConfirmItem(
@@ -1248,7 +1274,8 @@ public class MobMateWhisp implements NativeKeyListener {
                 action,
                 acceptedAtMs,
                 dueAtMs,
-                originTag
+                originTag,
+                ttsProsodyProfile
         );
         PendingConfirmItem dropped = null;
         boolean wasEmpty;
@@ -1362,7 +1389,8 @@ public class MobMateWhisp implements NativeKeyListener {
                         item.historyText,
                         item.action,
                         item.acceptedAtMs,
-                        item.originTag + "/confirm"
+                        item.originTag + "/confirm",
+                        item.ttsProsodyProfile
                 );
             } else {
                 Config.log("[Confirm] flush cancel (" + reason + "): " + item.outputText);
@@ -1442,6 +1470,15 @@ public class MobMateWhisp implements NativeKeyListener {
             window.repaint();
         }
     }
+    private void migrateTtsReflectEmotionDefaultIfNeeded() {
+        if (prefs == null) return;
+        boolean touched = prefs.getBoolean("tts.reflect_emotion.user_touched", false);
+        String raw = prefs.get("tts.reflect_emotion", "__missing__");
+        if (!touched && ("__missing__".equals(raw) || "false".equalsIgnoreCase(raw))) {
+            prefs.putBoolean("tts.reflect_emotion", true);
+            Config.logDebug("[TTS_PROSODY] migrate default -> ON (untouched install)");
+        }
+    }
 
     private void notifyHistoryConfirmStateChanged() {
         if (historyFrame == null) return;
@@ -1457,7 +1494,8 @@ public class MobMateWhisp implements NativeKeyListener {
                                   String historyText,
                                   Action action,
                                   long acceptedAtMs,
-                                  String logTag) {
+                                  String logTag,
+                                  TtsProsodyProfile ttsProsodyProfile) {
         final String safeSource = (sourceText == null) ? "" : sourceText.trim();
         final String safeOut = (out == null || out.isBlank()) ? safeSource : out;
         final String safeHistory = (historyText == null || historyText.isBlank()) ? safeOut : historyText;
@@ -1497,7 +1535,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     long f2tts = ttsStart - acceptedAtMs;
                     Config.logDebug("★LAT(ms) confirm final->tts=" + f2tts);
                 }
-                speak(safeOut);
+                speak(safeOut, ttsProsodyProfile);
                 Config.appendOutTts(safeOut);
                 Config.logDebug("speak(" + logTag + "): " + safeOut);
             });
@@ -1655,7 +1693,32 @@ public class MobMateWhisp implements NativeKeyListener {
 
     private boolean isHearingAutoLanguage() {
         String sourceLang = getHearingSourceLang();
-        return sourceLang.isBlank() || "auto".equalsIgnoreCase(sourceLang);
+        return sourceLang.isBlank()
+                || "auto".equalsIgnoreCase(sourceLang)
+                || LanguageOptions.HEARING_AUTO_STABLE.equalsIgnoreCase(sourceLang);
+    }
+
+    public boolean isHearingAutoStableLanguage() {
+        return LanguageOptions.HEARING_AUTO_STABLE.equalsIgnoreCase(getHearingSourceLang());
+    }
+
+    private String normalizeHearingWhisperRuntimeLang(String lang) {
+        if (lang == null) return "auto";
+        String normalized = lang.trim().toLowerCase(Locale.ROOT);
+        if (normalized.isBlank()
+                || "auto".equals(normalized)
+                || LanguageOptions.HEARING_AUTO_STABLE.equals(normalized)) {
+            return "auto";
+        }
+        return normalized;
+    }
+
+    private String getHearingWhisperRuntimeLang() {
+        if (isHearingAutoStableLanguage()) {
+            String session = normalizeHearingWhisperRuntimeLang(hearingWhisperAutoSessionLang);
+            if (!"auto".equals(session)) return session;
+        }
+        return normalizeHearingWhisperRuntimeLang(getHearingSourceLang());
     }
 
     private String getHearingMoonshineAutoBaseLang() {
@@ -1728,6 +1791,55 @@ public class MobMateWhisp implements NativeKeyListener {
         hearingMoonshineReloadExecutor.execute(() -> reloadHearingMoonshineForAutoSessionLang(normalized, seq));
     }
 
+    public void requestHearingAutoWhisperSessionLang(String lang) {
+        String normalized = normalizeHearingWhisperRuntimeLang(lang);
+        if ("auto".equals(normalized)) return;
+        if (isHearingEngineMoonshine() || !isHearingAutoStableLanguage()) return;
+        String current = normalizeHearingWhisperRuntimeLang(hearingWhisperAutoSessionLang);
+        if (normalized.equals(current)) return;
+        long now = System.currentTimeMillis();
+        if ((now - hearingWhisperLastShiftMs) < HEARING_MOONSHINE_AUTO_SWITCH_COOLDOWN_MS) {
+            Config.logDebug("[Whisper][Hearing] auto-shift skipped by cooldown: current="
+                    + current + " next=" + normalized
+                    + " elapsed=" + (now - hearingWhisperLastShiftMs));
+            return;
+        }
+        hearingWhisperAutoSessionLang = normalized;
+        hearingWhisperLastShiftMs = now;
+        try {
+            LocalWhisperCPP cur = wHearing;
+            if (cur != null) cur.setLanguage(normalized);
+            Config.log("[Whisper][Hearing] auto-session language shifted -> " + normalized);
+        } catch (Exception ex) {
+            Config.logError("[Whisper][Hearing] auto-session language shift failed", ex);
+        }
+    }
+
+    public void resetHearingAutoSessionState(String reason) {
+        hearingMoonshineReloadSeq.incrementAndGet();
+        hearingMoonshineAutoSessionLang = "en";
+        hearingMoonshineLastReloadMs = 0L;
+        hearingWhisperAutoSessionLang = "auto";
+        hearingWhisperLastShiftMs = 0L;
+
+        synchronized (hearingWhisperLock) {
+            wHearing = null;
+            hw = null;
+        }
+        hearingSem.acquireUninterruptibly();
+        try {
+            synchronized (hearingMoonshineLock) {
+                if (hearingMoonshine != null) {
+                    try { hearingMoonshine.close(); } catch (Throwable ignore) {}
+                    hearingMoonshine = null;
+                }
+            }
+        } finally {
+            hearingSem.release();
+        }
+        Config.log("[Hearing] auto session state reset (" + reason + ")");
+    }
+
     private void reloadHearingMoonshineForAutoSessionLang(String lang, long seq) {
         if (!isHearingEngineMoonshine() || !isHearingAutoLanguage()) return;
         String path = resolveHearingMoonshineModelPathForLang(lang);
@@ -1767,18 +1879,24 @@ public class MobMateWhisp implements NativeKeyListener {
             if (prefs != null) path = prefs.get("hearing.moonshine.model_path", "");
         } catch (Exception ignore) {}
         String hearingLang = getHearingSourceLang();
-        if (path != null && !path.isBlank() && !"auto".equalsIgnoreCase(hearingLang)) {
+        boolean autoLikeLang = hearingLang.isBlank()
+                || "auto".equalsIgnoreCase(hearingLang)
+                || LanguageOptions.HEARING_AUTO_STABLE.equalsIgnoreCase(hearingLang);
+        if (path != null && !path.isBlank() && !autoLikeLang) {
             return path;
         }
         String modelLang = hearingLang;
-        if (modelLang.isBlank() || "auto".equalsIgnoreCase(modelLang)) {
+        if (autoLikeLang) {
             modelLang = getHearingMoonshineAutoBaseLang();
         }
         String resolved = resolveHearingMoonshineModelPathForLang(modelLang);
-        if (!resolved.isBlank() && !"auto".equalsIgnoreCase(hearingLang)) {
+        if (!resolved.isBlank() && !autoLikeLang) {
             try {
                 if (prefs != null) prefs.put("hearing.moonshine.model_path", resolved);
             } catch (Exception ignore) {}
+        } else if (resolved.isBlank()) {
+            Config.log("[Moonshine][Hearing] no model path resolved for hearing.lang="
+                    + hearingLang + " modelLang=" + modelLang);
         }
         return resolved;
     }
@@ -1805,6 +1923,41 @@ public class MobMateWhisp implements NativeKeyListener {
             return detected;
         }
         return fallbackHearingSourceLang(targetLang);
+    }
+
+    private String inferWhisperAutoStableCjkBiasLang(int latin, int kana, int cjk, int hangul, int total) {
+        if (isHearingEngineMoonshine() || !isHearingAutoStableLanguage()) {
+            return "";
+        }
+        String currentRuntime = getHearingWhisperRuntimeLang();
+        if (!"en".equals(currentRuntime) || total <= 0) {
+            return "";
+        }
+        int jaScore = kana + cjk;
+        if (hangul >= 3
+                && hangul >= (latin * 2)
+                && (hangul * 100) >= (total * 60)) {
+            Config.logDebug("[Hearing][Lang] whisper auto-stable cjk-bias -> ko"
+                    + " hangul=" + hangul + " total=" + total + " latin=" + latin);
+            return "ko";
+        }
+        if (kana >= 3
+                && jaScore >= 6
+                && jaScore >= (latin * 2)
+                && (jaScore * 100) >= (total * 60)) {
+            Config.logDebug("[Hearing][Lang] whisper auto-stable cjk-bias -> ja"
+                    + " kana=" + kana + " cjk=" + cjk + " total=" + total + " latin=" + latin);
+            return "ja";
+        }
+        if (cjk >= 6
+                && kana == 0
+                && cjk >= (latin * 2)
+                && (cjk * 100) >= (total * 70)) {
+            Config.logDebug("[Hearing][Lang] whisper auto-stable cjk-bias -> zh"
+                    + " cjk=" + cjk + " total=" + total + " latin=" + latin);
+            return "zh";
+        }
+        return "";
     }
 
     private String inferHearingSourceLangByScript(String text) {
@@ -1857,6 +2010,11 @@ public class MobMateWhisp implements NativeKeyListener {
         int total = latin + kana + cjk + hangul + cyrillic + arabic + hebrew + thai + devanagari;
         if (total <= 0) return "";
 
+        String whisperAutoStableBiasLang = inferWhisperAutoStableCjkBiasLang(latin, kana, cjk, hangul, total);
+        if (!whisperAutoStableBiasLang.isBlank()) {
+            return whisperAutoStableBiasLang;
+        }
+
         // 英語音声に少量のかな/漢字ノイズが混ざるケースが多いので、
         // mixed script では latin 優勢を先に拾うっす。
         int nonLatin = total - latin;
@@ -1874,7 +2032,9 @@ public class MobMateWhisp implements NativeKeyListener {
         if (thai >= 2 && (thai * 100) >= (total * 30)) return "th";
         if (devanagari >= 2 && (devanagari * 100) >= (total * 30)) return "hi";
 
-        if (latin >= 4 && latin > nonLatin) return "en";
+        // 短い mixed text（例: はいOkay.）だけで en に倒れるのを避けつつ、
+        // 英語主体の弱い断片は拾えるように 70% 支配で見るっす。
+        if (latin >= 6 && (latin * 100) >= (total * 70)) return "en";
         return "";
     }
 
@@ -2289,9 +2449,9 @@ public class MobMateWhisp implements NativeKeyListener {
 
             if (partialExtendsComplete) {
                 Config.logDebug("★Instant FINAL (partial extends complete): " + lastP);
-                handleFinalText(lastP, getActionFromPrefs(), true);
+                handleFinalTextWithUtteranceSeq(uttSeq, lastP, getActionFromPrefs(), true);
             } else {
-                handleFinalText(candidate, getActionFromPrefs(), false);
+                handleFinalTextWithUtteranceSeq(uttSeq, candidate, getActionFromPrefs(), false);
             }
             MobMateWhisp.setLastPartial("");
             clearMoonshineCompleteCandidate(uttSeq);
@@ -2603,7 +2763,7 @@ public class MobMateWhisp implements NativeKeyListener {
             return cur;
         }
     }
-    private String runWhisperFallbackForMoonshine(byte[] pcm16le, Action action, boolean commitFinal) {
+    private String runWhisperFallbackForMoonshine(byte[] pcm16le, Action action, boolean commitFinal, long utteranceSeq) {
         if (pcm16le == null || pcm16le.length == 0) return "";
         LocalWhisperCPP fallback = getOrCreateMoonshineFallbackWhisper();
         if (fallback == null) return "";
@@ -2612,7 +2772,7 @@ public class MobMateWhisp implements NativeKeyListener {
             String out = (raw == null) ? "" : raw.trim();
             if (commitFinal && !out.isBlank()) {
                 Config.logDebug("★Moon no-output fallback -> handleFinalText: " + out);
-                handleFinalText(out, action, true);
+                handleFinalTextWithUtteranceSeq(utteranceSeq, out, action, true);
                 MobMateWhisp.setLastPartial("");
             } else if (!out.isBlank()) {
                 Config.logDebug("★Moon no-output fallback raw: " + out);
@@ -2637,7 +2797,7 @@ public class MobMateWhisp implements NativeKeyListener {
             }
             if (hasMoonshineOutputForUtterance(utteranceSeq)) return;
             Config.logDebug("★Moon no-output fallback armed: utt=" + utteranceSeq + " bytes=" + pcm16le.length);
-            runWhisperFallbackForMoonshine(pcm16le, action, true);
+            runWhisperFallbackForMoonshine(pcm16le, action, true, utteranceSeq);
         });
     }
     private int levenshtein(String a, String b) {
@@ -4969,8 +5129,25 @@ public class MobMateWhisp implements NativeKeyListener {
 
                                 // ★ADD: TTS再生中はVADをマスク（ループバック防止）
                                 if (isTtsSpeaking && speech && System.currentTimeMillis() < ttsVadSuppressUntilMs) {
-                                    Config.logDebug("★VAD suppressed (TTS playing)");
-                                    speech = false;
+                                    int suppressPeakFloor = 520;
+                                    int suppressAvgFloor = 120;
+                                    if (vad instanceof ImprovedVAD) {
+                                        AdaptiveNoiseProfile profile = ((ImprovedVAD) vad).getNoiseProfile();
+                                        suppressPeakFloor = Math.max(suppressPeakFloor, Math.max(260, (int) (profile.getPeakThreshold() * 0.42)));
+                                        suppressAvgFloor = Math.max(suppressAvgFloor, Math.max(110, (int) (profile.getAvgThreshold() * 0.38)));
+                                    }
+                                    boolean likelyUserBargeIn = isSpeaking
+                                            || buffer.size() >= 3200
+                                            || peak >= suppressPeakFloor
+                                            || avg >= suppressAvgFloor;
+                                    if (likelyUserBargeIn) {
+                                        Config.logDebug("★VAD suppress bypass (possible user barge-in): peak=" + peak
+                                                + " avg=" + avg
+                                                + " buf=" + buffer.size());
+                                    } else {
+                                        Config.logDebug("★VAD suppressed (TTS playing)");
+                                        speech = false;
+                                    }
                                 }
                                 // ===== 話者照合はfinalChunkレベルで実施（フレーム単位は精度不足）=====
 
@@ -5126,6 +5303,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                         firstPartialSent = false;
                                         forceFinalizePending = false;
                                         currentUtteranceSeq = ++utteranceSeqGen;
+                                        resetActiveTalkProsodyTail(currentUtteranceSeq);
                                         MobMateWhisp.setLastPartial("");
                                         clearMoonshineCompleteCandidate(-1L);
                                         lastPartialUpdateMs = 0L; // partial更新時刻もリセット
@@ -5151,6 +5329,7 @@ public class MobMateWhisp implements NativeKeyListener {
 //                                    }
                                     buffer.write(pcmForAsr, 0, n);
                                     rawSpeechBuffer.write(pcm, 0, n);
+                                    appendActiveTalkProsodyTail(currentUtteranceSeq, pcm, n, now);
                                     partialBuf.write(pcmForAsr, 0, n);
                                     lastSpeechEndTime = now;
 
@@ -5270,7 +5449,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                         forceFinalizePending = false;
                                         incompleteHoldUntilMs = 0L;
 
-                                        handleFinalText(p, action, true);
+                                        handleFinalTextWithUtteranceSeq(currentUtteranceSeq, p, action, true);
                                     }
                                 }
                                 if (!alt && isSpeaking) {
@@ -5456,7 +5635,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                             try {
                                                 if (useRescueText) {
                                                     Config.logDebug("★Final rescue from partial: " + rescueText);
-                                                    handleFinalText(rescueText, action, true);
+                                                    handleFinalTextWithUtteranceSeq(currentUtteranceSeq, rescueText, action, true);
                                                 } else {
                                                     final long uttSeq = currentUtteranceSeq;
 
@@ -5501,6 +5680,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                                     if (speakerOk) {
                                                         if (isEngineMoonshine()) {
                                                             rememberMoonshineUtteranceAcoustics(uttSeq, finalProcChunk);
+                                                            rememberTalkTtsProsodyProfile(uttSeq, trimmedRawChunk);
                                                             String cachedComplete = consumeMoonshineCompleteCandidate(uttSeq);
                                                             if (cachedComplete != null && !cachedComplete.isBlank()) {
                                                                 String candidate = removeCjkSpaces(cachedComplete).trim();
@@ -5510,7 +5690,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                                                 }
                                                                 if (!candidate.isBlank()) {
                                                                     Config.logDebug("★Moon final commit from cached COMPLETE: " + candidate);
-                                                                    handleFinalText(candidate, action, false);
+                                                                    handleFinalTextWithUtteranceSeq(uttSeq, candidate, action, false);
                                                                     MobMateWhisp.setLastPartial("");
                                                                     clearMoonshineUtteranceAcoustics(uttSeq);
                                                                     return;
@@ -5933,8 +6113,11 @@ public class MobMateWhisp implements NativeKeyListener {
         boolean willSpeak = (action != Action.NOTHING_NO_SPEAK);
         markFinalAcceptedNow(now, willSpeak, out);
 
+        long uttSeq = TL_FINAL_UTTERANCE_SEQ.get();
+        TtsProsodyProfile ttsProsodyProfile = consumeTalkTtsProsodyProfile(uttSeq, s);
+
         if (ttsConfirmMode && action != Action.NOTHING_NO_SPEAK) {
-            enqueuePendingConfirm(s, out, historyText, action, now, "final");
+            enqueuePendingConfirm(s, out, historyText, action, now, "final", ttsProsodyProfile);
             return;
         }
 
@@ -5946,7 +6129,7 @@ public class MobMateWhisp implements NativeKeyListener {
             long vad2f = (fin > 0) ? (fin - vad) : -1;
             Config.logDebug("★LAT(ms) vad->p1=" + vad2p + " vad->final=" + vad2f);
         }
-        commitTalkOutput(s, out, historyText, action, now, "final");
+        commitTalkOutput(s, out, historyText, action, now, "final", ttsProsodyProfile);
     }
     // ★繰り返しスパム検出: 同じフレーズが3回以上繰り返されてたらtrue
     private boolean isRepeatingSpam(String text) {
@@ -5992,6 +6175,18 @@ public class MobMateWhisp implements NativeKeyListener {
 
         return true;
     }
+    private void handleFinalTextWithUtteranceSeq(long utteranceSeq, String finalStr, Action action, boolean flgRescue) {
+        if (utteranceSeq > 0) {
+            TL_FINAL_UTTERANCE_SEQ.set(utteranceSeq);
+        } else {
+            TL_FINAL_UTTERANCE_SEQ.remove();
+        }
+        try {
+            handleFinalText(finalStr, action, flgRescue);
+        } finally {
+            TL_FINAL_UTTERANCE_SEQ.remove();
+        }
+    }
     // ★ partial救済（transcribeが二度と呼ばれないケース対策）
     private static final ThreadLocal<Long> TL_FINAL_UTTERANCE_SEQ =
             ThreadLocal.withInitial(() -> -1L);
@@ -6000,10 +6195,22 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile long lastMoonshineCompleteUtteranceSeq = -1L;
     private volatile String lastMoonshineCompleteNorm = "";
     private volatile long lastMoonshineCompleteAtMs = 0L;
+    private static final int TTS_PROSODY_ACTIVE_TAIL_MAX_BYTES = 16000 * 2 * 8;
+    private static final long TTS_PROSODY_ACTIVE_TAIL_MAX_AGE_MS = 3000L;
+    private final Object talkTtsProsodyTailLock = new Object();
+    private volatile long talkTtsProsodyTailUttSeq = -1L;
+    private volatile byte[] talkTtsProsodyActiveTail = new byte[0];
+    private volatile long talkTtsProsodyTailUpdatedAtMs = 0L;
     private final java.util.concurrent.ConcurrentHashMap<Long, Boolean> moonshineUtteranceMostlySilent =
             new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.concurrent.ConcurrentHashMap<Long, String> moonshineUtterancePartialSnapshot =
             new java.util.concurrent.ConcurrentHashMap<>();
+    private final java.util.concurrent.ConcurrentHashMap<Long, TtsProsodyProfile> talkTtsProsodyByUtterance =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile long lastTalkTtsProsodyRecentSeq = -1L;
+    private volatile long lastTalkTtsProsodyRecentAtMs = 0L;
+    private volatile TtsProsodyProfile lastTalkTtsProsodyRecentProfile = null;
+    private static final long TTS_PROSODY_RECENT_FALLBACK_MS = 2500L;
     private static final long PARTIAL_RESCUE_STALE_MS = 90;      // partial更新が止まった判
     private static final long PARTIAL_RESCUE_MIN_SILENCE_MS = 40; // 無音が続いてる判定
     private static final long PARTIAL_RESCUE_COOLDOWN_MS = 400;    // 連発防止
@@ -6036,6 +6243,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 && (nowMs - lastPartialUpdateMs) <= 80
                 && (nowMs - lastRescueSpeakMs) >= 500) {
             lastRescueSpeakMs = nowMs;
+            rememberTalkTtsProsodyProfile(utteranceSeq, copyActiveTalkProsodyTail(utteranceSeq, nowMs));
             MobMateWhisp.setLastPartial("");
             clearMoonshineCompleteCandidate(utteranceSeq);
             Config.logDebug("★Instant short partial speak (lowGain): " + s);
@@ -6044,7 +6252,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 lastRescueAtMs = nowMs;
                 lastRescueNorm = normForRescueDup(s);
             }
-            handleFinalText(s, action, true);
+            handleFinalTextWithUtteranceSeq(utteranceSeq, s, action, true);
             return;
         }
 
@@ -6064,6 +6272,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
         // ここで確定発話
         lastRescueSpeakMs = nowMs;
+        rememberTalkTtsProsodyProfile(utteranceSeq, copyActiveTalkProsodyTail(utteranceSeq, nowMs));
         MobMateWhisp.setLastPartial("");
         clearMoonshineCompleteCandidate(utteranceSeq);
 
@@ -6074,7 +6283,7 @@ public class MobMateWhisp implements NativeKeyListener {
             lastRescueAtMs = nowMs;
             lastRescueNorm = normForRescueDup(s);
         }
-        handleFinalText(s, action, true);
+        handleFinalTextWithUtteranceSeq(utteranceSeq, s, action, true);
     }
     // Hearing(ループバック)経路用：Historyにも speak にも流さない
     public void instantFinalFromWhisperHearing(String text) {
@@ -6107,7 +6316,7 @@ public class MobMateWhisp implements NativeKeyListener {
         MobMateWhisp.setLastPartial("");  // 持ち越し防止
 
         Config.logDebug("★Instant FINAL -> handleFinalText: " + s);
-        handleFinalText(s, action, true);
+        handleFinalTextWithUtteranceSeq(currentUtteranceSeq, s, action, true);
     }
     private boolean shouldInstantSpeakShortPartialForLowGain(String p) {
         if (p == null) return false;
@@ -6157,14 +6366,430 @@ public class MobMateWhisp implements NativeKeyListener {
             moonshineUtterancePartialSnapshot.put(utteranceSeq, lastP);
         }
     }
+    private void resetActiveTalkProsodyTail(long utteranceSeq) {
+        synchronized (talkTtsProsodyTailLock) {
+            talkTtsProsodyTailUttSeq = utteranceSeq;
+            talkTtsProsodyActiveTail = new byte[0];
+            talkTtsProsodyTailUpdatedAtMs = 0L;
+        }
+    }
+    private void appendActiveTalkProsodyTail(long utteranceSeq, byte[] pcm16le, int len, long nowMs) {
+        if (utteranceSeq <= 0 || pcm16le == null || len <= 0) return;
+        synchronized (talkTtsProsodyTailLock) {
+            if (talkTtsProsodyTailUttSeq != utteranceSeq) {
+                talkTtsProsodyTailUttSeq = utteranceSeq;
+                talkTtsProsodyActiveTail = new byte[0];
+            }
+            int cappedNewLen = Math.min(TTS_PROSODY_ACTIVE_TAIL_MAX_BYTES, talkTtsProsodyActiveTail.length + len);
+            byte[] merged = new byte[cappedNewLen];
+            int keepPrev = Math.max(0, cappedNewLen - len);
+            if (keepPrev > 0 && talkTtsProsodyActiveTail.length > 0) {
+                System.arraycopy(
+                        talkTtsProsodyActiveTail,
+                        talkTtsProsodyActiveTail.length - keepPrev,
+                        merged,
+                        0,
+                        keepPrev
+                );
+            }
+            int copyLen = Math.min(len, cappedNewLen);
+            System.arraycopy(pcm16le, len - copyLen, merged, cappedNewLen - copyLen, copyLen);
+            talkTtsProsodyActiveTail = merged;
+            talkTtsProsodyTailUpdatedAtMs = nowMs;
+        }
+    }
+    private byte[] copyActiveTalkProsodyTail(long utteranceSeq, long nowMs) {
+        synchronized (talkTtsProsodyTailLock) {
+            if (utteranceSeq <= 0 || talkTtsProsodyTailUttSeq != utteranceSeq) return null;
+            if (talkTtsProsodyActiveTail == null || talkTtsProsodyActiveTail.length == 0) return null;
+            if ((nowMs - talkTtsProsodyTailUpdatedAtMs) > TTS_PROSODY_ACTIVE_TAIL_MAX_AGE_MS) return null;
+            return Arrays.copyOf(talkTtsProsodyActiveTail, talkTtsProsodyActiveTail.length);
+        }
+    }
+    private void rememberTalkTtsProsodyProfile(long utteranceSeq, byte[] pcm16le) {
+        if (utteranceSeq <= 0 || pcm16le == null || pcm16le.length == 0) return;
+        byte[] analysisPcm = prepareTalkProsodyAnalysisPcm(pcm16le);
+        TtsProsodyProfile profile = TtsProsodyAnalyzer.analyzePcm(analysisPcm, 16000);
+        if (profile != null && profile.isUsable()) {
+            talkTtsProsodyByUtterance.put(utteranceSeq, profile);
+            lastTalkTtsProsodyRecentSeq = utteranceSeq;
+            lastTalkTtsProsodyRecentAtMs = System.currentTimeMillis();
+            lastTalkTtsProsodyRecentProfile = profile;
+            Config.logDebug("[TTS_PROSODY] cached uttSeq=" + utteranceSeq
+                    + " mood=" + profile.mood()
+                    + " conf=" + profile.confidence()
+                    + " rise=" + String.format(Locale.ROOT, "%.2f", profile.contourRise())
+                    + " melody=" + String.format(Locale.ROOT, "%.2f", profile.melodyDepth())
+                    + " dark=" + String.format(Locale.ROOT, "%.2f", profile.darkScore())
+                    + " energy=" + String.format(Locale.ROOT, "%.2f", profile.energyScore()));
+        } else {
+            talkTtsProsodyByUtterance.remove(utteranceSeq);
+        }
+    }
+    private byte[] prepareTalkProsodyAnalysisPcm(byte[] pcm16le) {
+        if (pcm16le == null || pcm16le.length < 3200) return pcm16le;
+        int length = pcm16le.length & ~1;
+        int minKeep = 16000 * 2;
+        if (length <= minKeep * 2) return Arrays.copyOf(pcm16le, length);
+
+        int leadDrop = (int) (length * 0.16f);
+        int tailDrop = (int) (length * 0.20f);
+        leadDrop &= ~1;
+        tailDrop &= ~1;
+        int start = Math.max(0, leadDrop);
+        int end = Math.max(start + minKeep, length - tailDrop);
+        end = Math.min(length, end & ~1);
+        if ((end - start) < minKeep) {
+            start = Math.max(0, (length - minKeep) / 2);
+            start &= ~1;
+            end = Math.min(length, start + minKeep);
+        }
+        if (start <= 0 && end >= length) return Arrays.copyOf(pcm16le, length);
+        return Arrays.copyOfRange(pcm16le, start, end);
+    }
+    private TtsProsodyProfile consumeTalkTtsProsodyProfile(long utteranceSeq, String text) {
+        TtsProsodyProfile textProfile = TtsProsodyAnalyzer.analyzeText(text);
+        TtsProsodyProfile pcmProfile = null;
+        if (utteranceSeq > 0) {
+            pcmProfile = talkTtsProsodyByUtterance.remove(utteranceSeq);
+        }
+        if (pcmProfile == null) {
+            pcmProfile = consumeRecentTalkTtsProsodyFallback(utteranceSeq);
+        }
+        if (pcmProfile == null) return textProfile;
+        if (!textProfile.isConfident()) return pcmProfile;
+        return textProfile.blendWith(pcmProfile);
+    }
+    private TtsProsodyProfile consumeRecentTalkTtsProsodyFallback(long utteranceSeq) {
+        TtsProsodyProfile recent = lastTalkTtsProsodyRecentProfile;
+        long ageMs = System.currentTimeMillis() - lastTalkTtsProsodyRecentAtMs;
+        if (recent == null || ageMs > TTS_PROSODY_RECENT_FALLBACK_MS) return null;
+        if (utteranceSeq > 0 && lastTalkTtsProsodyRecentSeq > 0 && utteranceSeq != lastTalkTtsProsodyRecentSeq) {
+            return null;
+        }
+        Config.logDebug("[TTS_PROSODY] fallback recent seq=" + lastTalkTtsProsodyRecentSeq + " ageMs=" + ageMs);
+        lastTalkTtsProsodyRecentProfile = null;
+        return recent;
+    }
     private void clearMoonshineUtteranceAcoustics(long utteranceSeq) {
         if (utteranceSeq > 0) {
             moonshineUtteranceMostlySilent.remove(utteranceSeq);
             moonshineUtterancePartialSnapshot.remove(utteranceSeq);
+            talkTtsProsodyByUtterance.remove(utteranceSeq);
+            synchronized (talkTtsProsodyTailLock) {
+                if (talkTtsProsodyTailUttSeq == utteranceSeq) {
+                    talkTtsProsodyTailUttSeq = -1L;
+                    talkTtsProsodyActiveTail = new byte[0];
+                    talkTtsProsodyTailUpdatedAtMs = 0L;
+                }
+            }
         } else {
             moonshineUtteranceMostlySilent.clear();
             moonshineUtterancePartialSnapshot.clear();
+            talkTtsProsodyByUtterance.clear();
+            synchronized (talkTtsProsodyTailLock) {
+                talkTtsProsodyTailUttSeq = -1L;
+                talkTtsProsodyActiveTail = new byte[0];
+                talkTtsProsodyTailUpdatedAtMs = 0L;
+            }
         }
+    }
+
+    public void prewarmPiperPlusForTalkTargetSelection(Component parent, String selectedTarget) {
+        String engine = prefs.get("tts.engine", "auto").toLowerCase(Locale.ROOT);
+        if (!"piper_plus".equals(engine)) return;
+
+        String target = LanguageOptions.normalizeTranslationTarget(selectedTarget);
+        if ("OFF".equals(target)) {
+            Config.logDebug("[Piper+][PREWARM] skip: talk target is OFF");
+            return;
+        }
+
+        String modelId = prefs.get("piper.plus.model_id", "").trim();
+        PiperPlusCatalog.Entry entry = PiperPlusCatalog.resolveForLanguage(modelId, target);
+        if (entry == null) {
+            Config.log("[Piper+][PREWARM] no entry resolved for target=" + target + " modelId=" + modelId);
+            return;
+        }
+
+        boolean installed = PiperPlusModelManager.isInstalled(entry);
+        Config.log("[Piper+][PREWARM] talk target=" + target
+                + " modelId=" + modelId
+                + " resolved=" + entry.id()
+                + " installKey=" + entry.installKey()
+                + " installed=" + installed);
+
+        if (isKnownUnstableBuiltInPiperPlusEntry(entry)) {
+            notifyKnownPiperPlusCompatibilityIssue(parent, entry);
+            return;
+        }
+
+        if (!installed && ensurePiperPlusModelReady(entry, parent)) {
+            Config.log("[Piper+][PREWARM] model downloaded on target selection: " + entry.id());
+            installed = PiperPlusModelManager.isInstalled(entry);
+        }
+        if (!installed) return;
+        schedulePiperPlusPersistentPrewarm(entry, target, "target-select");
+    }
+
+    private void bootstrapPiperPlusPersistentPrewarmIfNeeded() {
+        String engine = prefs.get("tts.engine", "auto").toLowerCase(Locale.ROOT);
+        if (!"piper_plus".equals(engine)) return;
+
+        String outputLanguage = getTalkOutputLanguage();
+        if (outputLanguage == null || outputLanguage.isBlank()) {
+            Config.logDebug("[Piper+][PREWARM] startup skip: output language unavailable");
+            return;
+        }
+
+        String modelId = prefs.get("piper.plus.model_id", "").trim();
+        PiperPlusCatalog.Entry entry = PiperPlusCatalog.resolveForLanguage(modelId, outputLanguage);
+        if (entry == null) {
+            Config.logDebug("[Piper+][PREWARM] startup skip: no entry for output=" + outputLanguage
+                    + " modelId=" + modelId);
+            return;
+        }
+        if (isKnownUnstableBuiltInPiperPlusEntry(entry)) {
+            Config.logDebug("[Piper+][PREWARM] startup skip: unstable builtin entry=" + entry.id());
+            return;
+        }
+        if (!PiperPlusModelManager.isInstalled(entry)) {
+            Config.logDebug("[Piper+][PREWARM] startup skip: model not installed entry=" + entry.id());
+            return;
+        }
+        schedulePiperPlusPersistentPrewarm(entry, outputLanguage, "startup-bootstrap");
+    }
+
+    private void schedulePiperPlusPersistentPrewarm(PiperPlusCatalog.Entry entry, String target, String reason) {
+        if (entry == null || !prefs.getBoolean("piper.plus.persistent", true)) return;
+        Path exePath = PiperPlusModelManager.findBundledExe();
+        if (exePath == null) {
+            Config.logDebug("[Piper+][PREWARM] skip: bundled runtime missing");
+            return;
+        }
+        String cooldownKey = entry.installKey() + "|" + entry.cliTextLanguage() + "|" + target;
+        long now = System.currentTimeMillis();
+        long until = piperPlusSessionPrewarmUntil.getOrDefault(cooldownKey, 0L);
+        if (until > now) {
+            Config.logDebug("[Piper+][PREWARM] skip: cooldown key=" + cooldownKey
+                    + " remain_ms=" + (until - now));
+            return;
+        }
+        piperPlusSessionPrewarmUntil.put(cooldownKey, now + PIPER_PLUS_SESSION_PREWARM_COOLDOWN_MS);
+        List<PiperSynthesisOptions> warmOptions = buildCanonicalPiperPersistentPrewarmOptions(entry);
+        if (warmOptions.isEmpty()) return;
+        piperPlusPrewarmExecutor.submit(() -> runPiperPlusPersistentPrewarm(exePath, entry, target, reason, warmOptions));
+    }
+
+    private List<PiperSynthesisOptions> buildCanonicalPiperPersistentPrewarmOptions(PiperPlusCatalog.Entry entry) {
+        if (entry == null) return Collections.emptyList();
+        int sampleRate = PiperPlusModelManager.getSampleRate(entry);
+        LinkedHashMap<String, PiperSynthesisOptions> unique = new LinkedHashMap<>();
+        addCanonicalPiperPersistentPrewarmOption(unique, sampleRate, 0.80f, 0.16f);
+        addCanonicalPiperPersistentPrewarmOption(unique, sampleRate, 0.68f, 0.16f);
+        addCanonicalPiperPersistentPrewarmOption(unique, sampleRate, 0.80f, 0.08f);
+        addCanonicalPiperPersistentPrewarmOption(unique, sampleRate, 0.80f, 0.32f);
+        addCanonicalPiperPersistentPrewarmOption(unique, sampleRate, 0.68f, 0.08f);
+        addCanonicalPiperPersistentPrewarmOption(unique, sampleRate, 0.68f, 0.32f);
+        addCanonicalPiperPersistentPrewarmOption(unique, sampleRate, 1.00f, 0.16f);
+        return new ArrayList<>(unique.values());
+    }
+
+    private void addCanonicalPiperPersistentPrewarmOption(Map<String, PiperSynthesisOptions> unique,
+                                                          int sampleRate,
+                                                          float lengthScale,
+                                                          float sentenceSilence) {
+        PiperSynthesisOptions seeded = new PiperSynthesisOptions(
+                sampleRate,
+                lengthScale,
+                sentenceSilence,
+                0.65f,
+                0.85f,
+                String.format(Locale.ROOT, "%.3f", lengthScale),
+                String.format(Locale.ROOT, "%.3f", sentenceSilence),
+                "0.650",
+                "0.850"
+        );
+        PiperSynthesisOptions persistent = toPersistentSessionOptions(seeded);
+        String key = persistent.lengthScaleArg() + "/" + persistent.sentenceSilenceArg();
+        unique.putIfAbsent(key, persistent);
+    }
+
+    private void runPiperPlusPersistentPrewarm(Path exePath,
+                                               PiperPlusCatalog.Entry entry,
+                                               String target,
+                                               String reason,
+                                               List<PiperSynthesisOptions> warmOptions) {
+        String warmupText = selectPiperPlusWarmupText(target);
+        for (PiperSynthesisOptions option : warmOptions) {
+            try {
+                PiperPlusPersistentSessionManager.PrewarmResult result = piperPlusSessionManager.prewarm(
+                        exePath,
+                        entry,
+                        new PiperPlusPersistentSessionManager.SynthesisOptions(
+                                option.sampleRate(),
+                                option.lengthScaleArg(),
+                                option.sentenceSilenceArg(),
+                                option.noiseScaleArg(),
+                                option.noiseWArg()),
+                        warmupText);
+                Config.logDebug("[Piper+][PREWARM] reason=" + reason
+                        + " target=" + target
+                        + " key=" + result.sessionKey()
+                        + " alreadyWarm=" + result.alreadyWarm()
+                        + " boot_ms=" + result.bootMs()
+                        + " warm_ms=" + result.warmupMs()
+                        + " pool=" + result.activeSessions());
+            } catch (Exception ex) {
+                Config.logDebug("[Piper+][PREWARM] failed reason=" + reason
+                        + " target=" + target
+                        + " len=" + option.lengthScaleArg()
+                        + " sil=" + option.sentenceSilenceArg()
+                        + " err=" + ex.getMessage());
+            }
+        }
+    }
+
+    private void schedulePiperPlusEmotionFamilyWarmup(Path exePath,
+                                                      PiperPlusCatalog.Entry entry,
+                                                      String target,
+                                                      PiperSynthesisOptions options,
+                                                      TtsProsodyProfile profile,
+                                                      String reason) {
+        if (exePath == null || entry == null || options == null || profile == null || !profile.isUsable()) return;
+        PiperSynthesisOptions persistent = toPersistentSessionOptions(options);
+        String familyKey = entry.installKey() + "|" + entry.cliTextLanguage()
+                + "|family|" + persistent.lengthScaleArg();
+        long now = System.currentTimeMillis();
+        long until = piperPlusSessionPrewarmUntil.getOrDefault(familyKey, 0L);
+        if (until > now) return;
+        piperPlusSessionPrewarmUntil.put(familyKey, now + PIPER_PLUS_SESSION_PREWARM_COOLDOWN_MS);
+        int sampleRate = persistent.sampleRate();
+        LinkedHashMap<String, PiperSynthesisOptions> family = new LinkedHashMap<>();
+        addCanonicalPiperPersistentPrewarmOption(family, sampleRate, persistent.lengthScale(), 0.08f);
+        addCanonicalPiperPersistentPrewarmOption(family, sampleRate, persistent.lengthScale(), 0.16f);
+        addCanonicalPiperPersistentPrewarmOption(family, sampleRate, persistent.lengthScale(), 0.32f);
+        if (family.isEmpty()) return;
+        piperPlusPrewarmExecutor.submit(() -> runPiperPlusPersistentPrewarm(
+                exePath,
+                entry,
+                target,
+                reason,
+                new ArrayList<>(family.values())));
+    }
+
+    private String selectPiperPlusWarmupText(String target) {
+        String lang = LanguageOptions.normalizeTranslationTarget(target);
+        return switch (lang.toLowerCase(Locale.ROOT)) {
+            case "ja" -> "はい。";
+            case "zh", "zh-cn", "zh-tw" -> "好的。";
+            case "es" -> "si.";
+            case "fr" -> "oui.";
+            case "pt", "pt-br" -> "sim.";
+            default -> "ok.";
+        };
+    }
+
+    private boolean isKnownUnstableBuiltInPiperPlusEntry(PiperPlusCatalog.Entry entry) {
+        return entry != null && "css10-ja-6lang-zh".equalsIgnoreCase(entry.id());
+    }
+
+    private void notifyKnownPiperPlusCompatibilityIssue(Component parent, PiperPlusCatalog.Entry entry) {
+        if (entry == null) return;
+        String key = "compat:" + entry.id().toLowerCase(Locale.ROOT);
+        if (!piperPlusCompatibilityNotified.add(key)) return;
+
+        String message = "The bundled Piper+ Chinese route is currently unstable with this CSS10 6lang voice.\n\n"
+                + "MobMate will fall back to Windows TTS for Chinese output.\n"
+                + "If you want Piper+ Chinese later, you can add a separate local Chinese model.\n\n"
+                + "Open the manual guide or the models folder now?";
+        Runnable show = () -> {
+            Object[] options = {"Open Chinese model guide", "Open models folder", "Close"};
+            int choice = JOptionPane.showOptionDialog(
+                    parent != null ? parent : window,
+                    message,
+                    "MobMate",
+                    JOptionPane.DEFAULT_OPTION,
+                    JOptionPane.INFORMATION_MESSAGE,
+                    null,
+                    options,
+                    options[0]
+            );
+            if (choice == 0) {
+                openPiperPlusGuide(parent);
+            } else if (choice == 1) {
+                openPiperPlusModelsFolder(parent);
+            }
+        };
+        if (SwingUtilities.isEventDispatchThread()) {
+            show.run();
+        } else {
+            SwingUtilities.invokeLater(show);
+        }
+        Config.log("[Piper+][Compat] builtin Chinese route marked unstable for entry=" + entry.id());
+    }
+
+    private void openPiperPlusGuide(Component parent) {
+        String remoteGuideUrl = "https://github.com/zufall-upon/MobMate#piper-model-guide";
+        try {
+            if (Desktop.isDesktopSupported()) {
+                Desktop desktop = Desktop.getDesktop();
+                if (desktop.isSupported(Desktop.Action.BROWSE)) {
+                    desktop.browse(new URI(remoteGuideUrl));
+                    return;
+                }
+            }
+        } catch (Exception ex) {
+            Config.log("[Piper+][Compat] failed to open remote guide: " + ex.getMessage());
+        }
+
+        Path[] candidates = new Path[] {
+                Path.of(System.getProperty("user.dir"), "piper_plus", "ZH_MODEL_GUIDE.html"),
+                Path.of(System.getProperty("user.dir"), "app", "piper_plus", "ZH_MODEL_GUIDE.html"),
+                Path.of(System.getProperty("user.dir"), "..", "app", "piper_plus", "ZH_MODEL_GUIDE.html").normalize()
+        };
+        for (Path candidate : candidates) {
+            if (!Files.isRegularFile(candidate)) continue;
+            try {
+                if (Desktop.isDesktopSupported()) {
+                    Desktop desktop = Desktop.getDesktop();
+                    if (desktop.isSupported(Desktop.Action.BROWSE)) {
+                        desktop.browse(candidate.toUri());
+                        return;
+                    }
+                    desktop.open(candidate.toFile());
+                    return;
+                }
+            } catch (Exception ex) {
+                Config.log("[Piper+][Compat] failed to open Chinese guide: " + ex.getMessage());
+                break;
+            }
+        }
+        JOptionPane.showMessageDialog(
+                parent != null ? parent : window,
+                "Open this guide manually:\n" + remoteGuideUrl,
+                "MobMate",
+                JOptionPane.INFORMATION_MESSAGE
+        );
+    }
+
+    private void openPiperPlusModelsFolder(Component parent) {
+        Path dir = PiperPlusModelManager.getRootDir();
+        try {
+            Files.createDirectories(dir);
+            if (Desktop.isDesktopSupported()) {
+                Desktop.getDesktop().open(dir.toFile());
+                return;
+            }
+        } catch (Exception ex) {
+            Config.log("[Piper+][Compat] failed to open models folder: " + ex.getMessage());
+        }
+        JOptionPane.showMessageDialog(
+                parent != null ? parent : window,
+                "Open this folder manually:\n" + dir.toAbsolutePath(),
+                "MobMate",
+                JOptionPane.INFORMATION_MESSAGE
+        );
     }
     private boolean shouldSuppressWeakMoonshineHallucination(String finalStr, long uttSeq) {
         if (!isLikelyJapaneseHallucinationContext(finalStr)) return false;
@@ -6812,6 +7437,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     return;
                 }
                 r.autoStartVoiceVox();
+                r.bootstrapPiperPlusPersistentPrewarmIfNeeded();
                 r.startPsServer();
 
                 String engine = prefs.get("tts.engine", "auto").toLowerCase(Locale.ROOT);
@@ -6830,6 +7456,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 }, "voiceger-shutdown"));
                 Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                     if (!shutdownHookOnce.compareAndSet(false, true)) return;
+                    try { piperPlusSessionManager.close(); } catch (Throwable ignore) {}
                     try { shutdownMoonshine(); } catch (Throwable ignore) {}
                     try { SteamHelper.shutdown(); } catch (Throwable ignore) {}
                     try {
@@ -6845,6 +7472,13 @@ public class MobMateWhisp implements NativeKeyListener {
                     } catch (Throwable ignore) {
                     } finally {
                         try { audioService.shutdownNow(); } catch (Throwable ignore) {}
+                    }
+                    try {
+                        piperPlusPrewarmExecutor.shutdown();
+                        piperPlusPrewarmExecutor.awaitTermination(1200, TimeUnit.MILLISECONDS);
+                    } catch (Throwable ignore) {
+                    } finally {
+                        try { piperPlusPrewarmExecutor.shutdownNow(); } catch (Throwable ignore) {}
                     }
                 }, "core-shutdown"));
 
@@ -7483,7 +8117,7 @@ public class MobMateWhisp implements NativeKeyListener {
             return latest.rawText().trim();
         }
         if (!hasMoonshineOutputForUtterance(uttSeq)) {
-            String fallback = runWhisperFallbackForMoonshine(pcm, Action.NOTHING, false);
+            String fallback = runWhisperFallbackForMoonshine(pcm, Action.NOTHING, false, uttSeq);
             if (fallback != null && !fallback.isBlank()) {
                 return fallback.trim();
             }
@@ -8061,14 +8695,17 @@ public class MobMateWhisp implements NativeKeyListener {
         } catch (Exception ignore) {}
         hearingMoonshineReloadSeq.incrementAndGet();
         hearingMoonshineAutoSessionLang = "auto".equalsIgnoreCase(normalizedLang)
+                || LanguageOptions.HEARING_AUTO_STABLE.equalsIgnoreCase(normalizedLang)
                 ? "en"
                 : normalizedLang;
+        hearingWhisperAutoSessionLang = "auto";
+        hearingWhisperLastShiftMs = 0L;
 
         LocalWhisperCPP.markIgnoreDirty();
         // 既にHearing用Whisperが居れば即反映
         try {
             LocalWhisperCPP cur = wHearing;
-            if (cur != null) cur.setLanguage(normalizedLang);
+            if (cur != null) cur.setLanguage(getHearingWhisperRuntimeLang());
         } catch (Exception ignore) {}
 
         try {
@@ -8087,7 +8724,8 @@ public class MobMateWhisp implements NativeKeyListener {
             if (newModelDir != null && prefs != null) {
                 prefs.put("hearing.moonshine.model_path", newModelDir.getAbsolutePath());
                 Config.log("[Hearing] moonshine model switched for lang=" + normalizedLang + " -> " + newModelDir.getAbsolutePath());
-            } else if (prefs != null && "auto".equalsIgnoreCase(normalizedLang)) {
+            } else if (prefs != null && ("auto".equalsIgnoreCase(normalizedLang)
+                    || LanguageOptions.HEARING_AUTO_STABLE.equalsIgnoreCase(normalizedLang))) {
                 prefs.put("hearing.moonshine.model_path", "");
                 Config.log("[Hearing] moonshine model cleared for auto language");
             } else {
@@ -8117,6 +8755,8 @@ public class MobMateWhisp implements NativeKeyListener {
         } catch (Exception ignore) {}
         hearingMoonshineReloadSeq.incrementAndGet();
         hearingMoonshineAutoSessionLang = "en";
+        hearingWhisperAutoSessionLang = "auto";
+        hearingWhisperLastShiftMs = 0L;
 
         synchronized (hearingWhisperLock) {
             wHearing = null;
@@ -8737,10 +9377,15 @@ public class MobMateWhisp implements NativeKeyListener {
         );
     }
     public void speak(String text) {
+        speak(text, null);
+    }
+    public void speak(String text, TtsProsodyProfile ttsProsodyProfile) {
         if (text == null || text.trim().isEmpty()) return;
         markTtsStartNowIfThisFinal(text, System.currentTimeMillis());
         text = normalizeLaugh(text);
         text = Config.applyDictionary(text);
+        TtsProsodyProfile effectiveProsodyProfile =
+                prefs.getBoolean("tts.reflect_emotion", true) ? ttsProsodyProfile : null;
 
         String engine = prefs.get("tts.engine", "auto").toLowerCase(Locale.ROOT);
 
@@ -8750,7 +9395,7 @@ public class MobMateWhisp implements NativeKeyListener {
             return;
         }
         if ("voiceger_vc".equals(engine) || "voiceger".equals(engine)) {
-            speakVoicegerVcOnly(text); // 新規：VCのみ
+            speakVoicegerVcOnly(text); // VCのみ
             return;
         }
         if ("voicevox".equals(engine)) {
@@ -8764,7 +9409,7 @@ public class MobMateWhisp implements NativeKeyListener {
                         ? VoiceVoxStyles.pickStyleId(text, base, api, uiLang)
                         : base;
 
-                speakVoiceVox(text, String.valueOf(styleId), api);
+                speakVoiceVox(text, String.valueOf(styleId), api, effectiveProsodyProfile);
                 return;
             }
             // fallthrough to auto
@@ -8776,8 +9421,12 @@ public class MobMateWhisp implements NativeKeyListener {
             }
             // fallthrough
         }
+        if ("piper_plus".equals(engine)) {
+            speakPiperPlus(text, effectiveProsodyProfile);
+            return;
+        }
         if ("windows".equals(engine)) {
-            speakWindows(text);
+            speakWindows(text, effectiveProsodyProfile);
             return;
         }
 
@@ -8792,12 +9441,759 @@ public class MobMateWhisp implements NativeKeyListener {
                     ? VoiceVoxStyles.pickStyleId(text, base, api, uiLang)
                     : base;
 
-            speakVoiceVox(text, String.valueOf(styleId), api);
+            speakVoiceVox(text, String.valueOf(styleId), api, effectiveProsodyProfile);
         } else if (isXttsAvailable()) {
             try { speakXtts(text); } catch (Exception ignore) {}
         } else {
-            speakWindows(text);
+            speakWindows(text, effectiveProsodyProfile);
         }
+    }
+
+    private void speakPiperPlus(String text, TtsProsodyProfile ttsProsodyProfile) {
+        String modelId = prefs.get("piper.plus.model_id", "").trim();
+        PiperPlusCatalog.Entry entry = PiperPlusCatalog.resolveForLanguage(modelId, getTalkOutputLanguage());
+        if (entry == null) {
+            Config.log("[Piper+] no model selected, fallback to Windows TTS");
+            speakWindows(text, ttsProsodyProfile);
+            return;
+        }
+        boolean installed = PiperPlusModelManager.isInstalled(entry);
+        Config.log("[Piper+] resolve output=" + getTalkOutputLanguage()
+                + " modelId=" + modelId
+                + " resolved=" + entry.id()
+                + " installKey=" + entry.installKey()
+                + " installed=" + installed
+                + " cliLang=" + entry.cliTextLanguage());
+        if (isKnownUnstableBuiltInPiperPlusEntry(entry)) {
+            notifyKnownPiperPlusCompatibilityIssue(window, entry);
+            Config.log("[Piper+][Compat] fallback to Windows TTS for unstable entry=" + entry.id());
+            speakWindows(text, ttsProsodyProfile);
+            return;
+        }
+        if (!installed) {
+            if (ensurePiperPlusModelReady(entry, window)) {
+                Config.log("[Piper+] model downloaded on demand: " + entry.id());
+            } else {
+                Config.log("[Piper+] model not installed: " + entry.id() + ", fallback to Windows TTS");
+                speakWindows(text, ttsProsodyProfile);
+                return;
+            }
+        }
+        if (!PiperPlusModelManager.isInstalled(entry)) {
+            Config.log("[Piper+] model not installed: " + modelId + ", fallback to Windows TTS");
+            speakWindows(text, ttsProsodyProfile);
+            return;
+        }
+        Path exePath = PiperPlusModelManager.findBundledExe();
+        if (exePath == null) {
+            Config.log("[Piper+] runtime not bundled, fallback to Windows TTS");
+            speakWindows(text, ttsProsodyProfile);
+            return;
+        }
+        try {
+            PiperSynthesisOptions options = buildPiperSynthesisOptions(entry, text, ttsProsodyProfile);
+            schedulePiperPlusEmotionFamilyWarmup(
+                    exePath,
+                    entry,
+                    getTalkOutputLanguage(),
+                    options,
+                    ttsProsodyProfile,
+                    "runtime-family");
+            PiperPlusPersistentSessionManager.SynthesisResult session = synthPiperPlusViaPersistentSession(exePath, entry, text, options);
+            if (session != null && session.wavPath() != null && session.wavBytes() >= 256) {
+                Config.logDebug("[Piper+][SESSION] key=" + session.sessionKey()
+                        + " reused=" + session.reused()
+                        + " boot_ms=" + session.bootMs()
+                        + " synth_wait_ms=" + session.synthWaitMs()
+                        + " wav_bytes=" + session.wavBytes());
+                playViaPowerShellPathAsync(maybePostProcessPiperWavPath(session.wavPath(), ttsProsodyProfile), true);
+                return;
+            }
+            Path tempWav = synthPiperPlusToTempWavFile(exePath, entry, text, options);
+            if (tempWav != null && Files.isRegularFile(tempWav)) {
+                try {
+                    long wavBytes = Files.size(tempWav);
+                    Config.logDebug("[Piper+] route=temp_wav_path language=" + entry.cliTextLanguage()
+                            + " wav_bytes=" + wavBytes
+                            + " lenScale=" + String.format(Locale.ROOT, "%.3f", options.lengthScale())
+                            + " sentSil=" + String.format(Locale.ROOT, "%.3f", options.sentenceSilence())
+                            + " noise=" + String.format(Locale.ROOT, "%.3f", options.noiseScale())
+                            + " noiseW=" + String.format(Locale.ROOT, "%.3f", options.noiseW()));
+                } catch (Exception ignore) {}
+                playViaPowerShellPathAsync(maybePostProcessPiperWavPath(tempWav, ttsProsodyProfile), true);
+                return;
+            }
+            PiperRawSynthesis raw = synthPiperPlusRaw(exePath, entry, text, options);
+            if (raw != null && raw.pcmBytes() != null && raw.pcmBytes().length >= 128) {
+                Config.logDebug("[Piper+] route=stdout_raw sr=" + raw.sampleRate()
+                        + " bytes=" + raw.pcmBytes().length
+                        + " spawn_ms=" + raw.spawnMs()
+                        + " raw_read_ms=" + raw.rawReadMs()
+                        + " language=" + entry.cliTextLanguage()
+                        + " lenScale=" + String.format(Locale.ROOT, "%.3f", raw.lengthScale())
+                        + " sentSil=" + String.format(Locale.ROOT, "%.3f", raw.sentenceSilence())
+                        + " noise=" + String.format(Locale.ROOT, "%.3f", raw.noiseScale())
+                        + " noiseW=" + String.format(Locale.ROOT, "%.3f", raw.noiseW()));
+                byte[] postPcm = maybePostProcessPiperPcm16Mono(raw.pcmBytes(), raw.sampleRate(), ttsProsodyProfile);
+                playViaPowerShellPcm16MonoAsync(postPcm, raw.sampleRate(), raw.spawnMs(), raw.rawReadMs());
+                return;
+            }
+            byte[] wavBytes = synthPiperPlusToWavBytes(exePath, entry, text, ttsProsodyProfile);
+            if (wavBytes != null && wavBytes.length >= 256) {
+                playViaPowerShellBytesAsync(maybePostProcessPiperWavBytes(wavBytes, ttsProsodyProfile));
+                return;
+            }
+        } catch (Exception ex) {
+            Config.log("[Piper+] synth failed: " + ex.getMessage());
+        }
+        speakWindows(text, ttsProsodyProfile);
+    }
+
+    private boolean ensurePiperPlusModelReady(PiperPlusCatalog.Entry entry, Component parent) {
+        if (entry == null) return false;
+        if (PiperPlusModelManager.isInstalled(entry)) return true;
+        if (!entry.isDownloadable()) return false;
+
+        long now = System.currentTimeMillis();
+        Long declinedUntil = piperPlusDownloadDeclinedUntil.get(entry.id());
+        if (declinedUntil != null && declinedUntil > now) {
+            return false;
+        }
+
+        AtomicReference<Integer> answerRef = new AtomicReference<>(JOptionPane.NO_OPTION);
+        Runnable ask = () -> {
+            String target = LanguageOptions.displayTranslationTarget(entry.language());
+            String message = "Piper+ model is not downloaded yet.\n\n"
+                    + entry.displayName() + "\n"
+                    + "Target language: " + target + "\n\n"
+                    + "Download it now?";
+            int answer = JOptionPane.showConfirmDialog(
+                    parent != null ? parent : window,
+                    message,
+                    "MobMate",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.QUESTION_MESSAGE
+            );
+            answerRef.set(answer);
+        };
+        try {
+            if (SwingUtilities.isEventDispatchThread()) {
+                ask.run();
+            } else {
+                SwingUtilities.invokeAndWait(ask);
+            }
+        } catch (Exception ex) {
+            Config.log("[Piper+] download prompt failed: " + ex.getMessage());
+            return false;
+        }
+
+        if (answerRef.get() != JOptionPane.YES_OPTION) {
+            piperPlusDownloadDeclinedUntil.put(entry.id(), now + PIPER_PLUS_DOWNLOAD_DECLINE_COOLDOWN_MS);
+            return false;
+        }
+
+        try {
+            Config.log("[Piper+] downloading on demand: " + entry.id());
+            PiperPlusModelManager.ensureDownloaded(entry);
+            return PiperPlusModelManager.isInstalled(entry);
+        } catch (Exception ex) {
+            Config.log("[Piper+] on-demand download failed: " + ex.getMessage());
+            SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(
+                    parent != null ? parent : window,
+                    "Failed to download Piper+ model:\n" + ex.getMessage(),
+                    "MobMate",
+                    JOptionPane.WARNING_MESSAGE
+            ));
+            return false;
+        }
+    }
+
+    private PiperPlusPersistentSessionManager.SynthesisResult synthPiperPlusViaPersistentSession(Path exePath,
+                                                                                                 PiperPlusCatalog.Entry entry,
+                                                                                                 String text,
+                                                                                                 PiperSynthesisOptions options) {
+        if (!prefs.getBoolean("piper.plus.persistent", true)) return null;
+        PiperSynthesisOptions persistent = toPersistentSessionOptions(options);
+        try {
+            return piperPlusSessionManager.synth(
+                    exePath,
+                    entry,
+                    text,
+                    new PiperPlusPersistentSessionManager.SynthesisOptions(
+                            persistent.sampleRate(),
+                            persistent.lengthScaleArg(),
+                            persistent.sentenceSilenceArg(),
+                            persistent.noiseScaleArg(),
+                            persistent.noiseWArg()));
+        } catch (Exception ex) {
+            Config.logDebug("[Piper+][SESSION] fallback to one-shot spawn: " + ex.getMessage());
+            return null;
+        }
+    }
+
+    private byte[] synthPiperPlusToWavBytes(Path exePath,
+                                            PiperPlusCatalog.Entry entry,
+                                            String text,
+                                            TtsProsodyProfile profile) throws Exception {
+        try {
+            return synthPiperPlusToWavBytesRaw(exePath, entry, text, profile);
+        } catch (Exception rawEx) {
+            Config.logDebug("[Piper+] raw stdout path failed -> temp wav fallback: " + rawEx.getMessage());
+            Path tempWav = synthPiperPlusToTempWavFile(exePath, entry, text, buildPiperSynthesisOptions(entry, text, profile));
+            if (tempWav == null || !Files.isRegularFile(tempWav)) {
+                throw new IOException("PiperPlus did not create temp wav");
+            }
+            try {
+                return Files.readAllBytes(tempWav);
+            } finally {
+                try { Files.deleteIfExists(tempWav); } catch (Exception ignore) {}
+            }
+        }
+    }
+
+    private record PiperSynthesisOptions(int sampleRate,
+                                         float lengthScale,
+                                         float sentenceSilence,
+                                         float noiseScale,
+                                         float noiseW,
+                                         String lengthScaleArg,
+                                         String sentenceSilenceArg,
+                                         String noiseScaleArg,
+                                         String noiseWArg) {}
+
+    private record PiperRawSynthesis(byte[] pcmBytes,
+                                     int sampleRate,
+                                     long spawnMs,
+                                     long rawReadMs,
+                                     float lengthScale,
+                                     float sentenceSilence,
+                                     float noiseScale,
+                                     float noiseW) {}
+
+    private PiperSynthesisOptions buildPiperSynthesisOptions(PiperPlusCatalog.Entry entry,
+                                                             String text,
+                                                             TtsProsodyProfile profile) {
+        int sampleRate = PiperPlusModelManager.getSampleRate(entry);
+        float lengthScale = piperLengthScale(text, profile);
+        float sentenceSilence = piperSentenceSilence(text, profile);
+        float noiseScale = piperNoiseScale(profile);
+        float noiseW = piperNoiseW(profile);
+        PiperSynthesisOptions options = new PiperSynthesisOptions(
+                sampleRate,
+                lengthScale,
+                sentenceSilence,
+                noiseScale,
+                noiseW,
+                String.format(Locale.ROOT, "%.3f", lengthScale),
+                String.format(Locale.ROOT, "%.3f", sentenceSilence),
+                String.format(Locale.ROOT, "%.3f", noiseScale),
+                String.format(Locale.ROOT, "%.3f", noiseW)
+        );
+        logPiperProsodyOptions(text, profile, options);
+        return options;
+    }
+
+    private void logPiperProsodyOptions(String text,
+                                        TtsProsodyProfile profile,
+                                        PiperSynthesisOptions options) {
+        float contourPref = getPiperContourReflectionStrength();
+        float tonePref = getPiperToneEmphasisStrength();
+        String contourMode = prefs.get("tts.reflect.contour_strength", "normal");
+        String toneMode = prefs.get("tts.reflect.tone_emphasis", "normal");
+        if (profile == null || !profile.isUsable()) {
+            Config.logDebug("[TTS_PROSODY][PIPER+] no-conf text=" + shortenForProsodyLog(text, 48)
+                    + " contourMode=" + contourMode
+                    + " toneMode=" + toneMode
+                    + " contourPref=" + String.format(Locale.ROOT, "%.2f", contourPref)
+                    + " tonePref=" + String.format(Locale.ROOT, "%.2f", tonePref)
+                    + " pitchDirect=false");
+            return;
+        }
+        float sourceTimingSec = estimateSourceTimingDurationSec(profile);
+        int units = estimateSpeechUnits(text);
+        float msPerUnit = (sourceTimingSec > 0.0f && units > 0)
+                ? (sourceTimingSec * 1000.0f) / units
+                : 0.0f;
+        float derivedSpeed = inferPiperSpeedScale(text, profile);
+        Config.logDebug("[TTS_PROSODY][PIPER+] mood=" + profile.mood()
+                + " speed=" + String.format(Locale.ROOT, "%.3f", profile.speedScale())
+                + " pitch=" + String.format(Locale.ROOT, "%.3f", profile.pitchScale())
+                + " intonation=" + String.format(Locale.ROOT, "%.3f", profile.intonationScale())
+                + " volume=" + String.format(Locale.ROOT, "%.3f", profile.volumeScale())
+                + " conf=" + String.format(Locale.ROOT, "%.2f", profile.confidence())
+                + " rise=" + String.format(Locale.ROOT, "%.2f", profile.contourRise())
+                + " melody=" + String.format(Locale.ROOT, "%.2f", profile.melodyDepth())
+                + " dark=" + String.format(Locale.ROOT, "%.2f", profile.darkScore())
+                + " energy=" + String.format(Locale.ROOT, "%.2f", profile.energyScore())
+                + " sourceSec=" + String.format(Locale.ROOT, "%.3f", sourceTimingSec)
+                + " msPerUnit=" + String.format(Locale.ROOT, "%.1f", msPerUnit)
+                + " derivedSpeed=" + String.format(Locale.ROOT, "%.3f", derivedSpeed)
+                + " lengthScale=" + options.lengthScaleArg()
+                + " sentenceSilence=" + options.sentenceSilenceArg()
+                + " noiseScale=" + options.noiseScaleArg()
+                + " noiseW=" + options.noiseWArg()
+                + " contourMode=" + contourMode
+                + " toneMode=" + toneMode
+                + " contourPref=" + String.format(Locale.ROOT, "%.2f", contourPref)
+                + " tonePref=" + String.format(Locale.ROOT, "%.2f", tonePref)
+                + " pitchDirect=false"
+                + " text=" + shortenForProsodyLog(text, 48));
+    }
+
+    private PiperSynthesisOptions toPersistentSessionOptions(PiperSynthesisOptions options) {
+        float lengthScale = roundToStep(options.lengthScale(), 0.20f, 0.68f, 1.45f);
+        float sentenceSilence = canonicalPersistentSentenceSilence(options.sentenceSilence());
+        // Keep persistent-session noise knobs nearly fixed so warm sessions are reused more often.
+        // Bright/dark character is still handled mainly by the post-process tone shaping path.
+        float noiseScale = 0.65f;
+        float noiseW = 0.85f;
+        return new PiperSynthesisOptions(
+                options.sampleRate(),
+                lengthScale,
+                sentenceSilence,
+                noiseScale,
+                noiseW,
+                String.format(Locale.ROOT, "%.3f", lengthScale),
+                String.format(Locale.ROOT, "%.3f", sentenceSilence),
+                String.format(Locale.ROOT, "%.3f", noiseScale),
+                String.format(Locale.ROOT, "%.3f", noiseW)
+        );
+    }
+
+    private float canonicalPersistentSentenceSilence(float value) {
+        float clamped = clampVoiceVoxProsody(value, 0.06f, 0.44f);
+        if (clamped <= 0.12f) return 0.08f;
+        if (clamped <= 0.22f) return 0.16f;
+        return 0.32f;
+    }
+
+    private float roundToStep(float value, float step, float min, float max) {
+        if (step <= 0f) return clampVoiceVoxProsody(value, min, max);
+        float rounded = Math.round(value / step) * step;
+        return clampVoiceVoxProsody(rounded, min, max);
+    }
+
+    private PiperRawSynthesis synthPiperPlusRaw(Path exePath,
+                                                PiperPlusCatalog.Entry entry,
+                                                String text,
+                                                PiperSynthesisOptions options) throws Exception {
+
+        ArrayList<String> cmd = new ArrayList<>();
+        cmd.add(exePath.toAbsolutePath().toString());
+        cmd.add("--model");
+        cmd.add(PiperPlusModelManager.getModelFile(entry).toAbsolutePath().toString());
+        cmd.add("--config");
+        cmd.add(PiperPlusModelManager.getConfigFile(entry).toAbsolutePath().toString());
+        cmd.add("--output_raw");
+        cmd.add("--language");
+        cmd.add(entry.cliTextLanguage());
+        cmd.add("--speaker");
+        cmd.add("0");
+        cmd.add("--length-scale");
+        cmd.add(options.lengthScaleArg());
+        cmd.add("--sentence-silence");
+        cmd.add(options.sentenceSilenceArg());
+        cmd.add("--noise-scale");
+        cmd.add(options.noiseScaleArg());
+        cmd.add("--noise-w");
+        cmd.add(options.noiseWArg());
+        cmd.add("--text");
+        cmd.add(text);
+        cmd.add("--quiet");
+
+        ProcessBuilder pb = new ProcessBuilder(cmd);
+        pb.directory(exePath.getParent().toFile());
+        pb.redirectErrorStream(false);
+        long spawnStartNs = System.nanoTime();
+        Process process = pb.start();
+        long spawnMs = (System.nanoTime() - spawnStartNs) / 1_000_000L;
+
+        CompletableFuture<String> stderrFuture = CompletableFuture.supplyAsync(() -> {
+            try (InputStream err = process.getErrorStream()) {
+                return new String(err.readAllBytes(), StandardCharsets.UTF_8);
+            } catch (Exception ex) {
+                return "";
+            }
+        });
+
+        byte[] pcmBytes;
+        long readStartNs = System.nanoTime();
+        try (InputStream in = process.getInputStream()) {
+            pcmBytes = in.readAllBytes();
+        }
+        long rawReadMs = (System.nanoTime() - readStartNs) / 1_000_000L;
+
+        int exit = process.waitFor();
+        String stderr = "";
+        try {
+            stderr = stderrFuture.get(5, TimeUnit.SECONDS);
+        } catch (Exception ignore) {}
+        if (exit != 0) {
+            throw new IOException("PiperPlus raw exit=" + exit + " err=" + stderr);
+        }
+        if (pcmBytes == null || pcmBytes.length < 128) {
+            throw new IOException("PiperPlus raw stdout empty");
+        }
+        return new PiperRawSynthesis(
+                pcmBytes,
+                options.sampleRate(),
+                spawnMs,
+                rawReadMs,
+                options.lengthScale(),
+                options.sentenceSilence(),
+                options.noiseScale(),
+                options.noiseW());
+    }
+
+    private byte[] synthPiperPlusToWavBytesRaw(Path exePath,
+                                               PiperPlusCatalog.Entry entry,
+                                               String text,
+                                               TtsProsodyProfile profile) throws Exception {
+        PiperRawSynthesis raw = synthPiperPlusRaw(exePath, entry, text, buildPiperSynthesisOptions(entry, text, profile));
+        return wrapPcm16MonoAsWav(raw.pcmBytes(), raw.sampleRate());
+    }
+
+    private Path synthPiperPlusToTempWavFile(Path exePath,
+                                             PiperPlusCatalog.Entry entry,
+                                             String text,
+                                             PiperSynthesisOptions options) throws Exception {
+        Path modelPath = PiperPlusModelManager.getModelFile(entry);
+        Path configPath = PiperPlusModelManager.getConfigFile(entry);
+        Path tempOut = Files.createTempFile("piper_plus_", ".wav");
+        try {
+            ArrayList<String> cmd = new ArrayList<>();
+            cmd.add(exePath.toAbsolutePath().toString());
+            cmd.add("--model");
+            cmd.add(modelPath.toAbsolutePath().toString());
+            cmd.add("--config");
+            cmd.add(configPath.toAbsolutePath().toString());
+            cmd.add("--output_file");
+            cmd.add(tempOut.toAbsolutePath().toString());
+            cmd.add("--language");
+            cmd.add(entry.cliTextLanguage());
+            cmd.add("--speaker");
+            cmd.add("0");
+            cmd.add("--length-scale");
+            cmd.add(options.lengthScaleArg());
+            cmd.add("--sentence-silence");
+            cmd.add(options.sentenceSilenceArg());
+            cmd.add("--noise-scale");
+            cmd.add(options.noiseScaleArg());
+            cmd.add("--noise-w");
+            cmd.add(options.noiseWArg());
+            cmd.add("--text");
+            cmd.add(text);
+            cmd.add("--quiet");
+
+            ProcessBuilder pb = new ProcessBuilder(cmd);
+            pb.directory(exePath.getParent().toFile());
+            pb.redirectErrorStream(true);
+            Process process = pb.start();
+            String output;
+            try (InputStream in = process.getInputStream()) {
+                output = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            }
+            int exit = process.waitFor();
+            if (exit != 0) {
+                throw new IOException("PiperPlus exit=" + exit + " out=" + output);
+            }
+            if (!Files.isRegularFile(tempOut)) {
+                throw new IOException("PiperPlus did not create wav");
+            }
+            return tempOut;
+        } finally {
+            if (!Files.isRegularFile(tempOut)) {
+                try { Files.deleteIfExists(tempOut); } catch (Exception ignore) {}
+            }
+        }
+    }
+
+    private float piperLengthScale(String text, TtsProsodyProfile profile) {
+        if (profile == null) return 1.0f;
+        float speed = Math.max(0.64f, Math.min(1.40f, inferPiperSpeedScale(text, profile)));
+        float lengthScale = 1.0f / speed;
+        float timingSec = estimateSourceTimingDurationSec(profile);
+        int units = estimateSpeechUnits(text);
+        if (timingSec > 0.18f && units >= 3) {
+            float msPerUnit = (timingSec * 1000.0f) / Math.max(1, units);
+            float pacingAssist = clampVoiceVoxProsody((msPerUnit - 112.0f) / 150.0f, -0.12f, 0.18f);
+            lengthScale += pacingAssist;
+        }
+        return Math.max(0.68f, Math.min(1.45f, lengthScale));
+    }
+
+    private float piperSentenceSilence(String text, TtsProsodyProfile profile) {
+        if (profile == null) return 0.20f;
+        float speed = Math.max(0.68f, Math.min(1.40f, inferPiperSpeedScale(text, profile)));
+        float dark = Math.max(0.0f, Math.min(1.0f, profile.darkScore()));
+        float energy = Math.max(0.0f, Math.min(1.0f, profile.energyScore()));
+        float pause = 0.19f + (dark * 0.12f) - (energy * 0.06f) + ((1.0f / speed) - 1.0f) * 0.12f;
+        if (profile.hasTimingContour()) {
+            pause += 0.02f;
+        }
+        float sourceTimingSec = estimateSourceTimingDurationSec(profile);
+        int units = estimateSpeechUnits(text);
+        if (sourceTimingSec > 0.18f && units >= 4) {
+            float msPerUnit = (sourceTimingSec * 1000.0f) / Math.max(1, units);
+            pause += clampVoiceVoxProsody((msPerUnit - 112.0f) / 320.0f, -0.04f, 0.07f);
+        }
+        return Math.max(0.06f, Math.min(0.44f, pause));
+    }
+
+    private float inferPiperSpeedScale(String text, TtsProsodyProfile profile) {
+        if (profile == null) return 1.0f;
+        float inferred = inferWindowsNarratorSpeedScale(text, profile);
+        float base = 1.0f + ((inferred - 1.0f) * 0.55f);
+        float contourAssist = clampVoiceVoxProsody(profile.contourRise() * 0.05f, -0.04f, 0.04f);
+        float energyAssist = clampVoiceVoxProsody((profile.energyScore() - profile.darkScore()) * 0.10f, -0.06f, 0.06f);
+        float melodyAssist = clampVoiceVoxProsody((profile.melodyDepth() - 0.45f) * 0.05f, -0.03f, 0.03f);
+        float timingAssist = 0.0f;
+        float sourceTimingSec = estimateSourceTimingDurationSec(profile);
+        int units = estimateSpeechUnits(text);
+        if (sourceTimingSec > 0.18f && units >= 3) {
+            float msPerUnit = (sourceTimingSec * 1000.0f) / Math.max(1, units);
+            timingAssist = clampVoiceVoxProsody((108.0f - msPerUnit) / 150.0f, -0.16f, 0.16f);
+        }
+        return clampVoiceVoxProsody(base + contourAssist + energyAssist + melodyAssist + timingAssist, 0.64f, 1.40f);
+    }
+
+    private Path maybePostProcessPiperWavPath(Path wavPath, TtsProsodyProfile profile) {
+        if (wavPath == null || !Files.isRegularFile(wavPath) || profile == null || !profile.isUsable()) return wavPath;
+        try {
+            byte[] wavBytes = Files.readAllBytes(wavPath);
+            byte[] processed = maybePostProcessPiperWavBytes(wavBytes, profile);
+            if (processed != wavBytes) {
+                Files.write(wavPath, processed, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
+            }
+        } catch (Exception ex) {
+            Config.logDebug("[Piper+][POST] wav path skipped: " + ex.getMessage());
+        }
+        return wavPath;
+    }
+
+    private byte[] maybePostProcessPiperWavBytes(byte[] wavBytes, TtsProsodyProfile profile) {
+        if (wavBytes == null || wavBytes.length < 64 || profile == null || !profile.isUsable()) return wavBytes;
+        WavPcmView wav = tryParsePcm16MonoWav(wavBytes);
+        if (wav == null) return wavBytes;
+        byte[] processedPcm = maybePostProcessPiperPcm16Mono(wav.pcmBytes(), wav.sampleRate(), profile);
+        if (processedPcm == wav.pcmBytes()) return wavBytes;
+        byte[] out = Arrays.copyOf(wavBytes, wavBytes.length);
+        System.arraycopy(processedPcm, 0, out, wav.dataOffset(), processedPcm.length);
+        return out;
+    }
+
+    private byte[] maybePostProcessPiperPcm16Mono(byte[] pcmBytes, int sampleRate, TtsProsodyProfile profile) {
+        if (pcmBytes == null || pcmBytes.length < 8 || sampleRate < 8000 || profile == null || !profile.isUsable()) {
+            return pcmBytes;
+        }
+        float contourPref = getPiperContourReflectionStrength();
+        float tonePref = getPiperToneEmphasisStrength();
+        float tone = derivePiperToneColor(profile);
+        if (Math.abs(tone) < 0.08f) return pcmBytes;
+
+        byte[] out = Arrays.copyOf(pcmBytes, pcmBytes.length);
+        float cutoffHz = 1500.0f + (Math.abs(tone) * 1100.0f);
+        float dt = 1.0f / Math.max(8000, sampleRate);
+        float rc = 1.0f / (2.0f * (float) Math.PI * cutoffHz);
+        float alpha = clampVoiceVoxProsody(dt / (rc + dt), 0.03f, 0.40f);
+        float low = 0.0f;
+        float prevInput = 0.0f;
+        float brightMix = (tone >= 0.0f)
+                ? (1.20f + (tone * 1.40f))
+                : (0.10f + ((1.0f + tone) * 0.18f));
+        float darkMix = (tone >= 0.0f)
+                ? (0.78f - (tone * 0.20f))
+                : (1.15f + ((-tone) * 0.55f));
+        float melodicLift = Math.max(0.0f, profile.melodyDepth() - 0.45f) * 0.18f * contourPref;
+        float presence = Math.max(0.0f, tone) * (0.48f + (0.18f * tonePref) + melodicLift);
+        float gain = 1.0f + (tone * (0.07f + (0.03f * tonePref)));
+
+        for (int i = 0; i + 1 < out.length; i += 2) {
+            short sample = readLePcm16Sample(out, i);
+            float x = sample / 32768.0f;
+            low += alpha * (x - low);
+            float high = x - low;
+            float y = (low * darkMix) + (high * brightMix);
+            if (presence > 0.0f) {
+                float pre = x - (prevInput * (0.68f + (presence * 0.22f)));
+                y += pre * presence;
+            }
+            y *= gain;
+            y = (float) Math.tanh(y * (1.05f + (Math.abs(tone) * 0.18f)));
+            short shaped = (short) Math.round(clampVoiceVoxProsody(y, -1.0f, 1.0f) * 32767.0f);
+            writeLePcm16Sample(out, i, shaped);
+            prevInput = x;
+        }
+
+        Config.logDebug("[Piper+][POST] tone=" + String.format(Locale.ROOT, "%.3f", tone)
+                + " pitch=" + String.format(Locale.ROOT, "%.3f", profile.pitchScale())
+                + " dark=" + String.format(Locale.ROOT, "%.2f", profile.darkScore())
+                + " energy=" + String.format(Locale.ROOT, "%.2f", profile.energyScore())
+                + " melody=" + String.format(Locale.ROOT, "%.2f", profile.melodyDepth())
+                + " sr=" + sampleRate);
+        return out;
+    }
+
+    private float derivePiperToneColor(TtsProsodyProfile profile) {
+        if (profile == null) return 0.0f;
+        float tonePref = getPiperToneEmphasisStrength();
+        float pitch = clampVoiceVoxProsody(profile.pitchScale(), -0.20f, 0.20f);
+        float dark = clampVoiceVoxProsody(profile.darkScore(), 0.0f, 1.0f);
+        float energy = clampVoiceVoxProsody(profile.energyScore(), 0.0f, 1.0f);
+        float melody = clampVoiceVoxProsody(profile.melodyDepth(), 0.0f, 1.0f);
+        float moodBias = switch (profile.mood()) {
+            case "excited" -> 0.24f;
+            case "sing_song_lite" -> 0.14f;
+            case "question" -> 0.06f;
+            case "calm" -> -0.18f;
+            case "whisper" -> -0.28f;
+            default -> 0.0f;
+        };
+        float tone = (pitch * 7.5f)
+                + ((energy - 0.52f) * 0.75f)
+                - ((dark - 0.18f) * 1.20f)
+                + ((melody - 0.50f) * 0.18f)
+                + moodBias;
+        tone *= tonePref;
+        return clampVoiceVoxProsody(tone, -1.0f, 1.0f);
+    }
+
+    private WavPcmView tryParsePcm16MonoWav(byte[] wavBytes) {
+        if (wavBytes == null || wavBytes.length < 44) return null;
+        if (!matchesWavTag(wavBytes, 0, "RIFF") || !matchesWavTag(wavBytes, 8, "WAVE")) return null;
+
+        int channels = 0;
+        int sampleRate = 0;
+        int bitsPerSample = 0;
+        int dataOffset = -1;
+        int dataLength = 0;
+        int offset = 12;
+        while (offset + 8 <= wavBytes.length) {
+            int chunkSize = readLeIntFromBytes(wavBytes, offset + 4);
+            int chunkDataOffset = offset + 8;
+            if (chunkSize < 0 || chunkDataOffset > wavBytes.length) break;
+            int safeChunkLength = Math.min(chunkSize, wavBytes.length - chunkDataOffset);
+            if (matchesWavTag(wavBytes, offset, "fmt ") && safeChunkLength >= 16) {
+                channels = readLeShortFromBytes(wavBytes, chunkDataOffset + 2) & 0xFFFF;
+                sampleRate = readLeIntFromBytes(wavBytes, chunkDataOffset + 4);
+                bitsPerSample = readLeShortFromBytes(wavBytes, chunkDataOffset + 14) & 0xFFFF;
+            } else if (matchesWavTag(wavBytes, offset, "data") && safeChunkLength >= 4) {
+                dataOffset = chunkDataOffset;
+                dataLength = safeChunkLength;
+                break;
+            }
+            int padded = (chunkSize + 1) & ~1;
+            offset = chunkDataOffset + padded;
+        }
+        if (sampleRate < 8000 || channels != 1 || bitsPerSample != 16 || dataOffset < 0 || dataLength < 4) return null;
+        byte[] pcm = Arrays.copyOfRange(wavBytes, dataOffset, dataOffset + dataLength);
+        return new WavPcmView(sampleRate, dataOffset, dataLength, pcm);
+    }
+
+    private boolean matchesWavTag(byte[] bytes, int offset, String tag) {
+        if (bytes == null || tag == null || offset < 0 || offset + tag.length() > bytes.length) return false;
+        for (int i = 0; i < tag.length(); i++) {
+            if ((byte) tag.charAt(i) != bytes[offset + i]) return false;
+        }
+        return true;
+    }
+
+    private int readLeIntFromBytes(byte[] bytes, int offset) {
+        if (bytes == null || offset < 0 || offset + 3 >= bytes.length) return -1;
+        return (bytes[offset] & 0xFF)
+                | ((bytes[offset + 1] & 0xFF) << 8)
+                | ((bytes[offset + 2] & 0xFF) << 16)
+                | ((bytes[offset + 3] & 0xFF) << 24);
+    }
+
+    private short readLeShortFromBytes(byte[] bytes, int offset) {
+        if (bytes == null || offset < 0 || offset + 1 >= bytes.length) return 0;
+        return (short) ((bytes[offset] & 0xFF) | ((bytes[offset + 1] & 0xFF) << 8));
+    }
+
+    private short readLePcm16Sample(byte[] bytes, int offset) {
+        return readLeShortFromBytes(bytes, offset);
+    }
+
+    private void writeLePcm16Sample(byte[] bytes, int offset, short value) {
+        if (bytes == null || offset < 0 || offset + 1 >= bytes.length) return;
+        bytes[offset] = (byte) (value & 0xFF);
+        bytes[offset + 1] = (byte) ((value >>> 8) & 0xFF);
+    }
+
+    private record WavPcmView(int sampleRate, int dataOffset, int dataLength, byte[] pcmBytes) {}
+
+    private byte[] wrapPcm16MonoAsWav(byte[] pcm16le, int sampleRate) throws IOException {
+        if (pcm16le == null || pcm16le.length == 0) return new byte[0];
+        int safeSampleRate = Math.max(8000, sampleRate);
+        int channels = 1;
+        int bitsPerSample = 16;
+        int blockAlign = channels * (bitsPerSample / 8);
+        int byteRate = safeSampleRate * blockAlign;
+        int dataSize = pcm16le.length;
+        int riffSize = 36 + dataSize;
+        ByteArrayOutputStream out = new ByteArrayOutputStream(44 + dataSize);
+        try (DataOutputStream dos = new DataOutputStream(out)) {
+            dos.writeBytes("RIFF");
+            writeLeInt(dos, riffSize);
+            dos.writeBytes("WAVE");
+            dos.writeBytes("fmt ");
+            writeLeInt(dos, 16);
+            writeLeShort(dos, (short) 1);
+            writeLeShort(dos, (short) channels);
+            writeLeInt(dos, safeSampleRate);
+            writeLeInt(dos, byteRate);
+            writeLeShort(dos, (short) blockAlign);
+            writeLeShort(dos, (short) bitsPerSample);
+            dos.writeBytes("data");
+            writeLeInt(dos, dataSize);
+            dos.write(pcm16le);
+        }
+        return out.toByteArray();
+    }
+
+    private void writeLeInt(DataOutputStream dos, int value) throws IOException {
+        dos.writeByte(value & 0xFF);
+        dos.writeByte((value >>> 8) & 0xFF);
+        dos.writeByte((value >>> 16) & 0xFF);
+        dos.writeByte((value >>> 24) & 0xFF);
+    }
+
+    private void writeLeShort(DataOutputStream dos, short value) throws IOException {
+        dos.writeByte(value & 0xFF);
+        dos.writeByte((value >>> 8) & 0xFF);
+    }
+
+    private float piperNoiseScale(TtsProsodyProfile profile) {
+        if (profile == null) return 0.667f;
+        float tonePref = getPiperToneEmphasisStrength();
+        float melodic = Math.max(0.0f, Math.min(1.0f, profile.melodyDepth()));
+        float conf = Math.max(0.0f, Math.min(1.0f, profile.confidence()));
+        float energy = Math.max(0.0f, Math.min(1.0f, profile.energyScore()));
+        float tone = derivePiperToneColor(profile);
+        float noise = 0.58f + (melodic * 0.08f)
+                + (Math.max(0.0f, tone) * 0.07f * tonePref)
+                - (Math.max(0.0f, -tone) * 0.05f * tonePref)
+                + ((energy - 0.45f) * 0.04f * tonePref)
+                - (conf * 0.02f);
+        return Math.max(0.42f, Math.min(0.92f, noise));
+    }
+
+    private float piperNoiseW(TtsProsodyProfile profile) {
+        if (profile == null) return 0.8f;
+        float contourPref = getPiperContourReflectionStrength();
+        float timing = profile.hasTimingContour() ? 0.86f : 0.80f;
+        float dark = Math.max(0.0f, Math.min(1.0f, profile.darkScore()));
+        float melody = Math.max(0.0f, Math.min(1.0f, profile.melodyDepth()));
+        float contour = Math.abs(clampVoiceVoxProsody(profile.contourRise(), -1.0f, 1.0f));
+        float tone = derivePiperToneColor(profile);
+        float width = timing
+                + ((melody - 0.45f) * 0.08f * contourPref)
+                + (contour * 0.04f * contourPref)
+                + (Math.max(0.0f, -tone) * 0.06f)
+                - (Math.max(0.0f, tone) * 0.04f)
+                + (dark * 0.03f);
+        return Math.max(0.68f, Math.min(0.96f, width));
     }
 
     public void requestVoicegerRestartForSettings() {
@@ -8962,7 +10358,57 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
     private byte[] synthWindowsToWavBytesViaAgent(String text) throws Exception {
+        return synthWindowsToWavBytesViaAgent(text, null, null, null);
+    }
+    private byte[] synthWindowsToWavBytesViaAgent(String text, Integer rate, Integer volume) throws Exception {
         if (text == null || text.isBlank()) return null;
+
+        synchronized (psLock) {
+            ensurePsServerLocked();
+
+            String voice = resolveWindowsAutoVoiceName();
+            String id = Long.toHexString(System.nanoTime());
+            String b64Text = Base64.getEncoder().encodeToString(text.getBytes(StandardCharsets.UTF_8));
+
+            psWriter.write("SYNTHB64 " + voice + " " + id + "\n");
+            if (rate != null) {
+                psWriter.write("TRATE " + id + " " + rate + "\n");
+            }
+            if (volume != null) {
+                psWriter.write("TVOLUME " + id + " " + volume + "\n");
+            }
+
+            final int CHUNK = 12000;
+            for (int i = 0; i < b64Text.length(); i += CHUNK) {
+                int end = Math.min(b64Text.length(), i + CHUNK);
+                psWriter.write("TDATA " + id + " " + b64Text.substring(i, end) + "\n");
+            }
+            psWriter.write("TEND " + id + "\n");
+            psWriter.flush();
+
+            StringBuilder b64 = new StringBuilder(256000);
+            while (true) {
+                String line = psReader.readLine();
+                if (line == null) throw new IOException("tts_agent pipe closed");
+                if ("DONE".equals(line)) break;
+
+                if (line.startsWith("ODATA ")) {
+                    b64.append(line.substring("ODATA ".length()));
+                } else if ("OEND".equals(line)) {
+                    // nop
+                } else if (line.startsWith("ERR")) {
+                    throw new IOException("tts_agent synth error: " + line);
+                } else {
+                    throw new IOException("tts_agent bad response: " + line);
+                }
+            }
+
+            if (b64.length() < 64) return null;
+            return Base64.getDecoder().decode(b64.toString());
+        }
+    }
+    private byte[] synthWindowsToWavBytesViaAgent(String text, String ssml, Integer rate, Integer volume) throws Exception {
+        if ((text == null || text.isBlank()) && (ssml == null || ssml.isBlank())) return null;
 
         synchronized (psLock) {
             ensurePsServerLocked();
@@ -8970,11 +10416,18 @@ public class MobMateWhisp implements NativeKeyListener {
             String voice = resolveWindowsAutoVoiceName();
 
             String id = Long.toHexString(System.nanoTime());
-            byte[] txtBytes = text.getBytes(StandardCharsets.UTF_8);
+            String payload = (ssml != null && !ssml.isBlank()) ? ssml : text;
+            byte[] txtBytes = payload.getBytes(StandardCharsets.UTF_8);
             String b64Text = Base64.getEncoder().encodeToString(txtBytes);
 
-            // SYNTHB64 <voiceOrAuto> <id>
-            psWriter.write("SYNTHB64 " + voice + " " + id + "\n");
+            String synthCmd = (ssml != null && !ssml.isBlank()) ? "SYNTHSSMLB64" : "SYNTHB64";
+            psWriter.write(synthCmd + " " + voice + " " + id + "\n");
+            if (rate != null) {
+                psWriter.write("TRATE " + id + " " + rate + "\n");
+            }
+            if (volume != null) {
+                psWriter.write("TVOLUME " + id + " " + volume + "\n");
+            }
 
             final int CHUNK = 12000;
             for (int i = 0; i < b64Text.length(); i += CHUNK) {
@@ -9263,27 +10716,9 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
 
-    private void speakVoiceVox(String text, String speakerId, String base) {
+    private void speakVoiceVox(String text, String speakerId, String base, TtsProsodyProfile ttsProsodyProfile) {
         try {
-            String queryUrl = base + "/audio_query?text=" +
-                    URLEncoder.encode(text, StandardCharsets.UTF_8) +
-                    "&speaker=" + speakerId;
-            HttpURLConnection q = (HttpURLConnection) new URL(queryUrl).openConnection();
-            q.setRequestMethod("POST");
-            q.setDoOutput(true);
-            q.getOutputStream().write(new byte[0]);
-            String queryJson = new String(q.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            String synthUrl = base + "/synthesis?speaker=" + speakerId;
-            HttpURLConnection s = (HttpURLConnection) new URL(synthUrl).openConnection();
-            s.setRequestMethod("POST");
-            s.setDoOutput(true);
-            s.setRequestProperty("Content-Type", "application/json");
-            s.getOutputStream().write(queryJson.getBytes(StandardCharsets.UTF_8));
-            byte[] wavBytes;
-            try (InputStream in = s.getInputStream()) {
-                wavBytes = in.readAllBytes();
-            }
-
+            byte[] wavBytes = synthVoiceVoxToWavBytes(text, speakerId, base, ttsProsodyProfile);
             if (!looksLikeWav(wavBytes)) {
                 Config.logDebug("[VV] synth bytes not wav");
                 return;
@@ -9297,6 +10732,957 @@ public class MobMateWhisp implements NativeKeyListener {
             }).start();
         } catch (Exception ex) {
             Config.logDebug("[VV ERROR] " + ex.getMessage());
+        }
+    }
+    private byte[] synthVoiceVoxToWavBytes(String text, String speakerId, String base, TtsProsodyProfile ttsProsodyProfile) throws Exception {
+        String queryUrl = base + "/audio_query?text=" +
+                URLEncoder.encode(text, StandardCharsets.UTF_8) +
+                "&speaker=" + speakerId;
+        HttpURLConnection q = (HttpURLConnection) new URL(queryUrl).openConnection();
+        q.setRequestMethod("POST");
+        q.setDoOutput(true);
+        q.getOutputStream().write(new byte[0]);
+        String queryJson = new String(q.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        queryJson = applyVoiceVoxEmotionReflectionIfEnabled(text, queryJson, ttsProsodyProfile);
+        String synthUrl = base + "/synthesis?speaker=" + speakerId;
+        HttpURLConnection s = (HttpURLConnection) new URL(synthUrl).openConnection();
+        s.setRequestMethod("POST");
+        s.setDoOutput(true);
+        s.setRequestProperty("Content-Type", "application/json");
+        s.getOutputStream().write(queryJson.getBytes(StandardCharsets.UTF_8));
+        try (InputStream in = s.getInputStream()) {
+            return in.readAllBytes();
+        }
+    }
+    private String applyVoiceVoxEmotionReflectionIfEnabled(String text, String queryJson, TtsProsodyProfile ttsProsodyProfile) {
+        if (!prefs.getBoolean("tts.reflect_emotion", true)) return queryJson;
+        if (queryJson == null || queryJson.isBlank()) return queryJson;
+        try {
+            TtsProsodyProfile textProfile = TtsProsodyAnalyzer.analyzeText(text);
+            TtsProsodyProfile profile = softenVoiceVoxBorderlineUpbeatProfile(
+                    resolveVoiceVoxProsodyProfile(textProfile, ttsProsodyProfile));
+            if (profile != null && profile.hasPitchContour() && !"contour_transfer".equals(profile.mood())) {
+                profile = profile.asContourDriven();
+            }
+            if (profile == null || !profile.isUsable()) {
+                Config.logDebug("[TTS_PROSODY][VV] no-conf text=" + shortenForProsodyLog(text, 48));
+                return queryJson;
+            }
+
+            JSONObject query = new JSONObject(queryJson);
+            boolean contourDriven = profile.hasPitchContour();
+            float contourPref = getVoiceVoxContourReflectionStrength();
+            float tonePref = getVoiceVoxToneEmphasisStrength();
+            float weight = contourDriven ? Math.max(0.88f, prosodyWeight(profile.confidence())) : prosodyWeight(profile.confidence());
+            float contour = profile.contourRise() * weight;
+            float melodyDepth = profile.melodyDepth() * weight;
+            float darkDepth = profile.darkScore() * weight;
+            float energyDepth = profile.energyScore() * weight;
+            float contourDarkAssist = (contour < -0.16f)
+                    ? clampVoiceVoxProsody(((-contour) - 0.16f) * 0.55f, 0.0f, 0.35f)
+                    : 0.0f;
+            float rawDarkTone = Math.max(darkDepth, contourDarkAssist);
+            float rawBrightTone = Math.max(0.0f, Math.max(contour, energyDepth - 0.18f));
+            float toneBalance = rawDarkTone + rawBrightTone + 0.0001f;
+            float darkWeightLocal = rawDarkTone / toneBalance;
+            float strongToneBoost = clampVoiceVoxProsody(tonePref / 1.10f, 0.85f, 1.60f);
+            float darkBlendGate = clamp01(
+                    (((rawDarkTone - 0.12f) / 0.42f) * 0.62f)
+                    + (((-Math.min(contour, 0.0f)) - 0.08f) / 0.55f * 0.38f)
+            );
+            float brightSuppression = clamp01(darkBlendGate * (0.30f + (0.18f * strongToneBoost)));
+            float brightTone = rawBrightTone * (1.0f - brightSuppression);
+            float darkTone = clamp01(rawDarkTone * (1.0f + ((darkWeightLocal * 0.22f) + (darkBlendGate * 0.16f)) * strongToneBoost));
+
+            float pitchTarget = contourDriven
+                    ? ((brightTone * 0.0032f) - (darkTone * 0.032f)) * tonePref
+                    : profile.pitchScale()
+                        + (Math.max(0.0f, contour) * 0.015f * tonePref)
+                        - (darkTone * 0.032f * tonePref);
+            float intonationTarget = contourDriven
+                    ? 1.0f + ((melodyDepth * 0.026f) + (brightTone * 0.006f) - (darkTone * 0.112f)) * tonePref
+                    : profile.intonationScale()
+                        + (melodyDepth * 0.09f * tonePref)
+                        + (Math.max(0.0f, contour) * 0.03f * tonePref)
+                        - (darkTone * 0.062f * tonePref);
+            float speedTarget = profile.speedScale();
+            float volumeTarget = profile.volumeScale();
+
+            query.put("pitchScale", clampVoiceVoxProsody(scaleAroundNeutral(0.0f, pitchTarget, weight), -0.20f, 0.20f));
+            query.put("intonationScale", clampVoiceVoxProsody(scaleAroundNeutral(1.0f, intonationTarget, weight), 0.75f, 1.45f));
+            query.put("speedScale", clampVoiceVoxProsody(scaleAroundNeutral(1.0f, speedTarget, weight), 0.72f, 1.25f));
+            query.put("volumeScale", clampVoiceVoxProsody(scaleAroundNeutral(1.0f, volumeTarget, weight), 0.78f, 1.25f));
+            String melodyInfo = applyVoiceVoxMoraMelodyIfNeeded(query, profile, weight, contourPref);
+            String timingInfo = applyVoiceVoxTimingTransferIfNeeded(query, profile, weight, contourPref);
+            Config.logDebug("[TTS_PROSODY][VV] mood=" + profile.mood()
+                    + " pitch=" + query.getDouble("pitchScale")
+                    + " intonation=" + query.getDouble("intonationScale")
+                    + " speed=" + query.getDouble("speedScale")
+                    + " volume=" + query.getDouble("volumeScale")
+                    + " weight=" + weight
+                    + " conf=" + profile.confidence()
+                    + " rise=" + profile.contourRise()
+                    + " melodyDepth=" + profile.melodyDepth()
+                    + " dark=" + profile.darkScore()
+                    + " energy=" + profile.energyScore()
+                    + " rawDarkTone=" + rawDarkTone
+                    + " rawBrightTone=" + rawBrightTone
+                    + " darkTone=" + darkTone
+                    + " brightTone=" + brightTone
+                    + " darkGate=" + darkBlendGate
+                    + " darkWeight=" + darkWeightLocal
+                    + " contourPref=" + contourPref
+                    + " tonePref=" + tonePref
+                    + melodyInfo
+                    + timingInfo
+                    + " text=" + shortenForProsodyLog(text, 48));
+            return query.toString();
+        } catch (Exception ex) {
+            Config.logDebug("[TTS_PROSODY][VV] skipped: " + ex.getMessage());
+            return queryJson;
+        }
+    }
+    private TtsProsodyProfile resolveVoiceVoxProsodyProfile(TtsProsodyProfile textProfile, TtsProsodyProfile pcmProfile) {
+        if (pcmProfile == null || !pcmProfile.isUsable()) return textProfile;
+        if (textProfile == null || !textProfile.isUsable()) return pcmProfile;
+        if (pcmProfile.hasPitchContour()) {
+            return pcmProfile.asContourDriven();
+        }
+
+        boolean pcmDark = pcmProfile.isDarkLike();
+        boolean pcmMelodic = pcmProfile.isMelodicLike();
+        boolean pcmContinuous = pcmProfile.hasContinuousHint();
+
+        if ((pcmDark || pcmMelodic || pcmContinuous)
+                && pcmProfile.confidence() + 0.04f >= textProfile.confidence()) {
+            return pcmProfile.blendWith(textProfile);
+        }
+        if (!textProfile.isConfident()) {
+            return pcmProfile;
+        }
+        return textProfile.blendWith(pcmProfile);
+    }
+    private TtsProsodyProfile softenVoiceVoxBorderlineUpbeatProfile(TtsProsodyProfile profile) {
+        if (profile == null) return null;
+        if (profile.hasPitchContour()) return profile;
+        if (!isUpbeatTtsMood(profile.mood())) return profile;
+
+        float conf = profile.confidence();
+        if (conf < 0.60f) {
+            return new TtsProsodyProfile(
+                    "neutral",
+                    0.0f,
+                    1.0f + ((profile.intonationScale() - 1.0f) * 0.35f),
+                    1.0f + ((profile.speedScale() - 1.0f) * 0.35f),
+                    1.0f + ((profile.volumeScale() - 1.0f) * 0.35f),
+                    Math.max(0.28f, conf * 0.85f),
+                    profile.contourRise(),
+                    profile.melodyDepth(),
+                    profile.darkScore(),
+                    profile.energyScore()
+            );
+        }
+        if (conf < 0.78f) {
+            return new TtsProsodyProfile(
+                    profile.mood(),
+                    Math.min(profile.pitchScale(), 0.012f),
+                    1.0f + ((profile.intonationScale() - 1.0f) * 0.65f),
+                    1.0f + ((profile.speedScale() - 1.0f) * 0.65f),
+                    1.0f + ((profile.volumeScale() - 1.0f) * 0.65f),
+                    profile.confidence(),
+                    profile.contourRise(),
+                    profile.melodyDepth(),
+                    profile.darkScore(),
+                    profile.energyScore()
+            );
+        }
+        return profile;
+    }
+    private boolean isDarkTtsMood(String mood) {
+        return "whisper".equals(mood) || "calm".equals(mood);
+    }
+    private boolean isUpbeatTtsMood(String mood) {
+        return "sing_song_lite".equals(mood) || "excited".equals(mood) || "question".equals(mood);
+    }
+    private String applyVoiceVoxMoraMelodyIfNeeded(JSONObject query, TtsProsodyProfile profile, float weight, float contourPref) {
+        JSONArray accentPhrases = query.optJSONArray("accent_phrases");
+        if (accentPhrases == null || accentPhrases.size() == 0) return " melody=off";
+
+        ArrayList<JSONObject> voicedMoras = new ArrayList<>();
+        ArrayList<JSONObject> voicedPhraseObjects = new ArrayList<>();
+        ArrayList<ArrayList<JSONObject>> voicedPhraseMoras = new ArrayList<>();
+        ArrayList<ArrayList<Integer>> voicedPhraseIndices = new ArrayList<>();
+        for (int i = 0; i < accentPhrases.size(); i++) {
+            JSONObject phrase = accentPhrases.optJSONObject(i);
+            if (phrase == null) continue;
+            JSONArray moras = phrase.optJSONArray("moras");
+            if (moras == null) continue;
+            ArrayList<JSONObject> phraseVoicedMoras = new ArrayList<>();
+            ArrayList<Integer> phraseVoicedIndices = new ArrayList<>();
+            for (int j = 0; j < moras.size(); j++) {
+                JSONObject mora = moras.optJSONObject(j);
+                if (mora == null) continue;
+                double pitch = mora.optDouble("pitch", 0.0d);
+                if (pitch > 0.0d) {
+                    voicedMoras.add(mora);
+                    phraseVoicedMoras.add(mora);
+                    phraseVoicedIndices.add(j);
+                }
+            }
+            if (!phraseVoicedMoras.isEmpty()) {
+                voicedPhraseObjects.add(phrase);
+                voicedPhraseMoras.add(phraseVoicedMoras);
+                voicedPhraseIndices.add(phraseVoicedIndices);
+            }
+        }
+        int voicedCount = voicedMoras.size();
+        if (voicedCount < 3) return " melody=off voiced=" + voicedCount;
+        if (profile.hasPitchContour()) {
+            float[] contour = normalizeContourForVoiceVox(profile.pitchContour());
+            float[] activity = profile.activityContour();
+            float[] voicing = profile.voicingContour();
+            List<ProsodySegment> segments = buildProsodySegments(contour, activity, voicing);
+            if (isHummingLikeContour(profile, segments, voicedCount)) {
+                String noteInfo = applyVoiceVoxNoteTransfer(voicedMoras, segments, contour, weight, contourPref);
+                if (noteInfo != null) {
+                    return noteInfo;
+                }
+            }
+            float maxAbs = 0.0f;
+            float sumSq = 0.0f;
+            for (float v : contour) {
+                maxAbs = Math.max(maxAbs, Math.abs(v));
+                sumSq += v * v;
+            }
+            float rms = (float) Math.sqrt(sumSq / Math.max(1, contour.length));
+            float contourStrength = clamp01((maxAbs * 0.58f) + (rms * 0.70f) + (Math.abs(profile.contourRise()) * 0.18f));
+            float amplitude = clampVoiceVoxProsody(
+                    (0.12f + (0.22f * Math.max(0.20f, contourStrength) * (0.40f + (0.60f * weight)))) * contourPref,
+                    0.10f, 0.40f);
+            double totalDur = estimateTotalVoicedMoraDurationSec(voicedMoras);
+            double elapsed = 0.0d;
+            double firstDelta = 0.0d;
+            double lastDelta = 0.0d;
+            int voicedIndex = 0;
+            for (int phraseIdx = 0; phraseIdx < voicedPhraseMoras.size(); phraseIdx++) {
+                ArrayList<JSONObject> phraseMoras = voicedPhraseMoras.get(phraseIdx);
+                for (int i = 0; i < phraseMoras.size(); i++) {
+                    JSONObject mora = phraseMoras.get(i);
+                    double dur = estimateVoiceVoxMoraDurationSec(mora);
+                    double startPos = (totalDur <= 0.0d)
+                            ? (voicedIndex / (double) Math.max(1, voicedCount))
+                            : (elapsed / totalDur);
+                    double endPos = (totalDur <= 0.0d)
+                            ? ((voicedIndex + 1.0d) / Math.max(1, voicedCount))
+                            : ((elapsed + dur) / totalDur);
+                    float contourDelta = samplePitchContourAverage(contour, startPos, endPos);
+                    double onsetRamp = Math.min(1.0d, (voicedIndex + 0.35d) / 1.8d);
+                    contourDelta *= (float) onsetRamp;
+                    if (voicedIndex == 0 && contourDelta > 0.0f) {
+                        contourDelta *= 0.58f;
+                    } else if (voicedIndex == 1 && contourDelta > 0.0f) {
+                        contourDelta *= 0.82f;
+                    }
+                    double basePitch = mora.optDouble("pitch", 0.0d);
+                    if (basePitch <= 0.0d) continue;
+                    double applied = amplitude * contourDelta;
+                    if (voicedIndex == 0) firstDelta = applied;
+                    lastDelta = applied;
+                    mora.put("pitch", basePitch + applied);
+                    elapsed += dur;
+                    voicedIndex++;
+                }
+            }
+            return " melody=contour-transfer voiced=" + voicedCount
+                    + " amp=" + String.format(Locale.ROOT, "%.3f", amplitude)
+                    + " contourPts=" + contour.length
+                    + " contourMax=" + String.format(Locale.ROOT, "%.3f", maxAbs)
+                    + " contourRms=" + String.format(Locale.ROOT, "%.3f", rms)
+                    + " headDelta=" + String.format(Locale.ROOT, "%.3f", firstDelta)
+                    + " tailDelta=" + String.format(Locale.ROOT, "%.3f", lastDelta)
+                    + " accents=preserve";
+        }
+
+        float amplitude;
+        String mode;
+        float melodyDepth = profile.melodyDepth() * weight;
+        float contour = profile.contourRise() * weight;
+        float darkDepth = profile.darkScore() * weight;
+        if (profile.isMelodicLike() || melodyDepth >= 0.28f) {
+            if (profile.confidence() < 0.60f) {
+                amplitude = clampVoiceVoxProsody(0.016f + (0.026f * Math.max(weight * 0.7f, melodyDepth * 0.6f)), 0.016f, 0.045f);
+                mode = "ripple-lite";
+            } else {
+                amplitude = clampVoiceVoxProsody(0.03f + (0.05f * Math.max(weight, melodyDepth)), 0.03f, 0.10f);
+                mode = "arch+ripple";
+            }
+        } else if ("excited".equals(profile.mood())) {
+            amplitude = clampVoiceVoxProsody(0.018f + (0.032f * Math.max(weight * 0.7f, profile.energyScore() * weight)), 0.018f, 0.065f);
+            mode = "lift";
+        } else if ("question".equals(profile.mood()) || contour >= 0.18f) {
+            amplitude = clampVoiceVoxProsody(0.015f + (0.030f * Math.max(weight * 0.6f, contour)), 0.015f, 0.055f);
+            mode = "tail-rise";
+        } else if (profile.isDarkLike() || contour <= -0.16f || darkDepth >= 0.18f) {
+            amplitude = clampVoiceVoxProsody(0.015f + (0.035f * Math.max(darkDepth, -contour)), 0.015f, 0.06f);
+            mode = "tail-fall";
+        } else {
+            return " melody=off voiced=" + voicedCount;
+        }
+
+        for (int i = 0; i < voicedCount; i++) {
+            JSONObject mora = voicedMoras.get(i);
+            double basePitch = mora.optDouble("pitch", 0.0d);
+            if (basePitch <= 0.0d) continue;
+
+            double pos = (voicedCount <= 1) ? 0.0d : (i / (double) (voicedCount - 1));
+            double delta;
+            switch (mode) {
+                case "arch+ripple":
+                    double arch = Math.sin(Math.PI * pos);
+                    double ripple = Math.sin(2.0d * Math.PI * pos);
+                    delta = amplitude * ((arch * 0.75d) + (ripple * 0.25d));
+                    break;
+                case "ripple-lite":
+                    delta = amplitude * Math.sin(2.0d * Math.PI * pos) * 0.55d;
+                    break;
+                case "lift":
+                    delta = amplitude * Math.sin(Math.PI * pos);
+                    break;
+                case "tail-fall":
+                    delta = -amplitude * Math.pow(pos, 1.55d);
+                    break;
+                case "tail-rise":
+                    delta = amplitude * pos * pos;
+                    break;
+                default:
+                    delta = 0.0d;
+                    break;
+            }
+            mora.put("pitch", basePitch + delta);
+        }
+        return " melody=" + mode + " voiced=" + voicedCount + " amp=" + String.format(Locale.ROOT, "%.3f", amplitude);
+    }
+
+    private String applyVoiceVoxNoteTransfer(List<JSONObject> voicedMoras, List<ProsodySegment> segments, float[] contour, float weight, float contourPref) {
+        if (voicedMoras == null || voicedMoras.size() < 3 || segments == null || segments.isEmpty()) return null;
+        ArrayList<ProsodySegment> noteSegments = new ArrayList<>();
+        int restCount = 0;
+        float maxPitch = 0.0f;
+        for (ProsodySegment segment : segments) {
+            if (segment.rest()) {
+                restCount++;
+                continue;
+            }
+            noteSegments.add(segment);
+            maxPitch = Math.max(maxPitch, Math.abs(segment.meanPitch()));
+        }
+        if (noteSegments.size() < 2) return null;
+
+        int[] alloc = allocateSegmentCounts(noteSegments, voicedMoras.size());
+        float amplitude = clampVoiceVoxProsody(
+                (0.16f + (0.24f * Math.max(0.30f, maxPitch) * (0.45f + (0.55f * weight)))) * contourPref,
+                0.14f, 0.48f);
+        double firstDelta = 0.0d;
+        double lastDelta = 0.0d;
+        int moraIndex = 0;
+        int assigned = 0;
+        float avgFramesPerMora = estimateAverageFramesPerMora(noteSegments, alloc);
+        float totalNoteFrames = 0.0f;
+        for (ProsodySegment segment : noteSegments) totalNoteFrames += segment.frameCount();
+        float noteFrameCursor = 0.0f;
+        for (int i = 0; i < noteSegments.size(); i++) {
+            ProsodySegment segment = noteSegments.get(i);
+            int count = alloc[i];
+            float segPitch = segment.meanPitch();
+            if (i == 0 && segPitch > 0.0f) segPitch *= 0.88f;
+            if (i == 1 && segPitch > 0.0f) segPitch *= 0.94f;
+            double delta = amplitude * segPitch;
+            if (assigned == 0) firstDelta = delta;
+            for (int j = 0; j < count && moraIndex < voicedMoras.size(); j++, moraIndex++, assigned++) {
+                JSONObject mora = voicedMoras.get(moraIndex);
+                double basePitch = mora.optDouble("pitch", 0.0d);
+                if (basePitch <= 0.0d) continue;
+                double applied;
+                if (contour != null && contour.length >= 3 && totalNoteFrames > 0.0f) {
+                    double segStartPos = noteFrameCursor / totalNoteFrames;
+                    double segEndPos = (noteFrameCursor + segment.frameCount()) / totalNoteFrames;
+                    double subStartPos = segStartPos + ((segEndPos - segStartPos) * j / Math.max(1.0d, count));
+                    double subEndPos = segStartPos + ((segEndPos - segStartPos) * (j + 1.0d) / Math.max(1.0d, count));
+                    float localPitch = samplePitchContourAverage(contour, subStartPos, subEndPos);
+                    applied = amplitude * localPitch;
+                    if (i == 0 && applied > 0.0d && count > 0) {
+                        double within = (j + 0.5d) / Math.max(1.0d, count);
+                        double onsetRamp = 0.22d + (0.78d * Math.pow(within, 1.35d));
+                        applied *= onsetRamp;
+                    }
+                    if (i == 0 && j == 0 && applied > 0.0d) {
+                        applied *= 0.55d;
+                    }
+                } else {
+                    applied = delta;
+                    if (i == 0 && delta > 0.0d && count > 0) {
+                        double within = (j + 0.5d) / Math.max(1.0d, count);
+                        double onsetRamp = 0.45d + (0.55d * within);
+                        applied *= onsetRamp;
+                    }
+                }
+                mora.put("pitch", basePitch + applied);
+                lastDelta = applied;
+            }
+            noteFrameCursor += segment.frameCount();
+        }
+        return " melody=note-transfer voiced=" + voicedMoras.size()
+                + " notes=" + noteSegments.size()
+                + " rests=" + restCount
+                + " amp=" + String.format(Locale.ROOT, "%.3f", amplitude)
+                + " noteAlloc=" + Arrays.toString(alloc)
+                + " avgFpm=" + String.format(Locale.ROOT, "%.2f", avgFramesPerMora)
+                + " headDelta=" + String.format(Locale.ROOT, "%.3f", firstDelta)
+                + " tailDelta=" + String.format(Locale.ROOT, "%.3f", lastDelta)
+                + " accents=preserve";
+    }
+
+    private String applyVoiceVoxTimingTransferIfNeeded(JSONObject query, TtsProsodyProfile profile, float weight, float contourPref) {
+        if (profile == null || !profile.hasTimingContour()) return " timing=off";
+        JSONArray accentPhrases = query.optJSONArray("accent_phrases");
+        if (accentPhrases == null || accentPhrases.size() == 0) return " timing=off";
+
+        ArrayList<TimingUnit> units = new ArrayList<>();
+        for (int i = 0; i < accentPhrases.size(); i++) {
+            JSONObject phrase = accentPhrases.optJSONObject(i);
+            if (phrase == null) continue;
+            JSONArray moras = phrase.optJSONArray("moras");
+            if (moras != null) {
+                for (int j = 0; j < moras.size(); j++) {
+                    JSONObject mora = moras.optJSONObject(j);
+                    if (mora == null) continue;
+                    boolean voiced = mora.optDouble("pitch", 0.0d) > 0.0d;
+                    units.add(new TimingUnit(mora, false, voiced));
+                }
+            }
+            JSONObject pauseMora = phrase.optJSONObject("pause_mora");
+            if (pauseMora != null) {
+                units.add(new TimingUnit(pauseMora, true, false));
+            }
+        }
+        if (units.size() < 2) return " timing=off units=" + units.size();
+
+        double totalDur = 0.0d;
+        for (TimingUnit unit : units) {
+            totalDur += estimateVoiceVoxMoraDurationSec(unit.mora());
+        }
+        if (totalDur <= 0.05d) return " timing=off units=" + units.size();
+
+        float[] activity = profile.activityContour();
+        float[] voicing = profile.voicingContour();
+        if ((activity == null || activity.length < 3) && (voicing == null || voicing.length < 3)) {
+            return " timing=off units=" + units.size();
+        }
+        List<ProsodySegment> segments = buildProsodySegments(
+                profile.hasPitchContour() ? normalizeContourForVoiceVox(profile.pitchContour()) : new float[0],
+                activity,
+                voicing);
+        boolean hummingLike = isHummingLikeContour(profile, segments, units.size());
+        boolean cadenceAware = hummingLike || shouldUseCadenceAwareTiming(profile, segments, units.size());
+        int[] noteAlloc = null;
+        int noteAllocIndex = 0;
+        int pauseAllocIndex = 0;
+        ArrayList<ProsodySegment> noteSegments = new ArrayList<>();
+        ArrayList<ProsodySegment> restSegments = new ArrayList<>();
+        float avgNoteFramesPerMora = 1.0f;
+        float avgRestFrames = 1.0f;
+        if (cadenceAware) {
+            for (ProsodySegment segment : segments) {
+                if (segment.rest()) restSegments.add(segment);
+                else noteSegments.add(segment);
+            }
+            int voicedUnitCount = 0;
+            for (TimingUnit unit : units) if (!unit.pause()) voicedUnitCount++;
+            if (!noteSegments.isEmpty() && voicedUnitCount > 0) {
+                noteAlloc = allocateSegmentCounts(noteSegments, voicedUnitCount);
+                avgNoteFramesPerMora = estimateAverageFramesPerMora(noteSegments, noteAlloc);
+            }
+            avgRestFrames = estimateAverageSegmentFrames(restSegments);
+        }
+
+        float pref = contourPref;
+        double elapsed = 0.0d;
+        int changedMoras = 0;
+        int changedPauses = 0;
+        float meanVoicedScale = 0.0f;
+        float meanPauseScale = 0.0f;
+        int voicedScaleCount = 0;
+        int pauseScaleCount = 0;
+        float sourceTimingSec = estimateSourceTimingDurationSec(profile);
+        float speedAdjust = 1.0f;
+        double speechDur = Math.max(0.05d, totalDur
+                - query.optDouble("prePhonemeLength", 0.0d)
+                - query.optDouble("postPhonemeLength", 0.0d));
+        if (cadenceAware && sourceTimingSec > 0.15f && speechDur > 0.08d) {
+            float sourceToTarget = sourceTimingSec / (float) speechDur;
+            float shortUtteranceBoost = 1.0f + (0.18f * clamp01((8.0f - units.size()) / 4.0f));
+            speedAdjust = clampVoiceVoxProsody(1.0f + (((1.0f / Math.max(0.45f, sourceToTarget)) - 1.0f) * 0.72f * pref * shortUtteranceBoost), 0.76f, 1.32f);
+            query.put("speedScale", clampVoiceVoxProsody((float) query.optDouble("speedScale", 1.0d) * speedAdjust, 0.70f, 1.45f));
+        }
+
+        for (TimingUnit unit : units) {
+            JSONObject mora = unit.mora();
+            double baseDur = estimateVoiceVoxMoraDurationSec(mora);
+            double startPos = elapsed / totalDur;
+            double endPos = (elapsed + baseDur) / totalDur;
+            float activityAvg = sampleGenericContourAverage(activity, startPos, endPos, 0.0f);
+            float voicingAvg = sampleGenericContourAverage(voicing, startPos, endPos, unit.voiced() ? 1.0f : 0.0f);
+            float silenceAvg = clamp01(1.0f - Math.max(activityAvg, voicingAvg));
+            float scale;
+
+            if (unit.pause()) {
+                if (cadenceAware && pauseAllocIndex < restSegments.size()) {
+                    ProsodySegment rest = restSegments.get(pauseAllocIndex++);
+                    float restRatio = clampVoiceVoxProsody(rest.frameCount() / estimateAverageSegmentFrames(restSegments), 0.75f, 1.90f);
+                    scale = clampVoiceVoxProsody(0.82f + ((restRatio - 1.0f) * 0.92f * pref) + (silenceAvg * 0.34f), 0.66f, 2.10f);
+                } else {
+                    scale = clampVoiceVoxProsody(
+                            0.92f + (silenceAvg * 0.40f * pref) - (activityAvg * 0.10f),
+                            0.78f, 1.55f);
+                }
+                if (applyVoiceVoxTimingScale(mora, scale)) changedPauses++;
+                meanPauseScale += scale;
+                pauseScaleCount++;
+            } else if (unit.voiced()) {
+                if (cadenceAware && noteAlloc != null && noteAllocIndex < noteAlloc.length) {
+                    int segmentIdx = findSegmentIndexForAllocatedMora(noteAlloc, noteAllocIndex);
+                    ProsodySegment note = noteSegments.get(Math.min(segmentIdx, noteSegments.size() - 1));
+                    int allocCount = Math.max(1, noteAlloc[segmentIdx]);
+                    float framesPerMora = note.frameCount() / (float) allocCount;
+                    float noteRatio = clampVoiceVoxProsody(framesPerMora / Math.max(1.0f, avgNoteFramesPerMora), 0.62f, 2.45f);
+                    float durationBoost = 0.80f
+                            + ((noteRatio - 1.0f) * 1.02f * pref)
+                            + (Math.max(voicingAvg, activityAvg * 0.30f) * 0.16f)
+                            + (silenceAvg * 0.05f);
+                    scale = clampVoiceVoxProsody(durationBoost, 0.58f, 2.40f);
+                    noteAllocIndex++;
+                } else {
+                    float expressiveness = Math.max(voicingAvg, (activityAvg * 0.35f));
+                    float durationBoost = 0.90f + (expressiveness * 0.30f * pref) + (silenceAvg * 0.08f);
+                    scale = clampVoiceVoxProsody(durationBoost, 0.82f, 1.60f);
+                }
+                if (applyVoiceVoxTimingScale(mora, scale)) changedMoras++;
+                meanVoicedScale += scale;
+                voicedScaleCount++;
+            } else {
+                scale = clampVoiceVoxProsody(0.95f + (silenceAvg * 0.18f), 0.82f, 1.25f);
+                if (applyVoiceVoxTimingScale(mora, scale)) changedMoras++;
+                meanVoicedScale += scale;
+                voicedScaleCount++;
+            }
+            elapsed += baseDur;
+        }
+        return " timing=dur-transfer"
+                + " moras=" + changedMoras
+                + " pauses=" + changedPauses
+                + (hummingLike ? " mode=note-aware" : (cadenceAware ? " mode=cadence-aware" : " mode=direct"))
+                + (cadenceAware ? " noteAlloc=" + Arrays.toString(noteAlloc == null ? new int[0] : noteAlloc) : "")
+                + (cadenceAware ? " avgNoteFpm=" + String.format(Locale.ROOT, "%.2f", avgNoteFramesPerMora) : "")
+                + (cadenceAware ? " avgRestFrames=" + String.format(Locale.ROOT, "%.2f", avgRestFrames) : "")
+                + (cadenceAware ? " sourceSec=" + String.format(Locale.ROOT, "%.2f", sourceTimingSec) : "")
+                + (cadenceAware ? " speechSec=" + String.format(Locale.ROOT, "%.2f", speechDur) : "")
+                + (cadenceAware ? " speedAdj=" + String.format(Locale.ROOT, "%.3f", speedAdjust) : "")
+                + " voicedScale=" + String.format(Locale.ROOT, "%.3f", voicedScaleCount == 0 ? 1.0f : (meanVoicedScale / voicedScaleCount))
+                + " pauseScale=" + String.format(Locale.ROOT, "%.3f", pauseScaleCount == 0 ? 1.0f : (meanPauseScale / pauseScaleCount));
+    }
+
+    private float getVoiceVoxContourReflectionStrength() {
+        String mode = prefs.get("tts.reflect.contour_strength", "normal");
+        if ("mild".equalsIgnoreCase(mode)) return 0.85f;
+        if ("strong".equalsIgnoreCase(mode)) return 1.35f;
+        return 1.10f;
+    }
+
+    private float getVoiceVoxToneEmphasisStrength() {
+        String mode = prefs.get("tts.reflect.tone_emphasis", "normal");
+        if ("mild".equalsIgnoreCase(mode)) return 0.85f;
+        if ("strong".equalsIgnoreCase(mode)) return 1.55f;
+        return 1.10f;
+    }
+    private float getPiperContourReflectionStrength() {
+        String mode = prefs.get("tts.reflect.contour_strength", "normal");
+        if ("mild".equalsIgnoreCase(mode)) return 0.85f;
+        if ("strong".equalsIgnoreCase(mode)) return 1.30f;
+        return 1.00f;
+    }
+
+    private float getPiperToneEmphasisStrength() {
+        String mode = prefs.get("tts.reflect.tone_emphasis", "normal");
+        if ("mild".equalsIgnoreCase(mode)) return 0.85f;
+        if ("strong".equalsIgnoreCase(mode)) return 1.35f;
+        return 1.00f;
+    }
+    private static float prosodyWeight(float confidence) {
+        float c = Math.max(0.25f, Math.min(1.0f, confidence));
+        float norm = (c - 0.25f) / 0.75f;
+        return 0.20f + (0.80f * (float) Math.sqrt(Math.max(0.0f, norm)));
+    }
+    private static float scaleAroundNeutral(float neutral, float target, float weight) {
+        return neutral + ((target - neutral) * weight);
+    }
+    private static float clampVoiceVoxProsody(float value, float min, float max) {
+        return Math.max(min, Math.min(max, value));
+    }
+    private static double estimateVoiceVoxMoraDurationSec(JSONObject mora) {
+        if (mora == null) return 0.12d;
+        double consonant = mora.optDouble("consonant_length", 0.0d);
+        double vowel = mora.optDouble("vowel_length", 0.0d);
+        double total = consonant + vowel;
+        return (total > 0.02d) ? total : 0.12d;
+    }
+    private static double estimateTotalVoicedMoraDurationSec(List<JSONObject> voicedMoras) {
+        double total = 0.0d;
+        if (voicedMoras == null) return total;
+        for (JSONObject mora : voicedMoras) total += estimateVoiceVoxMoraDurationSec(mora);
+        return total;
+    }
+    private static boolean applyVoiceVoxTimingScale(JSONObject mora, float scale) {
+        if (mora == null) return false;
+        boolean changed = false;
+        double consonant = mora.optDouble("consonant_length", 0.0d);
+        double vowel = mora.optDouble("vowel_length", 0.0d);
+        if (consonant > 0.0d) {
+            double consonantScale = 1.0d + ((scale - 1.0d) * 0.45d);
+            mora.put("consonant_length", clampVoiceVoxDuration(consonant * consonantScale, 0.018d, 0.320d));
+            changed = true;
+        }
+        if (vowel > 0.0d) {
+            mora.put("vowel_length", clampVoiceVoxDuration(vowel * scale, 0.040d, 0.750d));
+            changed = true;
+        }
+        return changed;
+    }
+    private static double clampVoiceVoxDuration(double value, double min, double max) {
+        return Math.max(min, Math.min(max, value));
+    }
+    private static float samplePitchContourAt(float[] contour, double pos) {
+        if (contour == null || contour.length == 0) return 0.0f;
+        if (contour.length == 1) return contour[0];
+        double clamped = Math.max(0.0d, Math.min(1.0d, pos));
+        double scaled = clamped * (contour.length - 1);
+        int lo = (int) Math.floor(scaled);
+        int hi = Math.min(contour.length - 1, lo + 1);
+        double t = scaled - lo;
+        return (float) (contour[lo] + ((contour[hi] - contour[lo]) * t));
+    }
+    private static float samplePitchContourAverage(float[] contour, double startPos, double endPos) {
+        if (contour == null || contour.length == 0) return 0.0f;
+        if (contour.length == 1) return contour[0];
+        double lo = Math.max(0.0d, Math.min(1.0d, startPos));
+        double hi = Math.max(lo, Math.min(1.0d, endPos));
+        if (Math.abs(hi - lo) < 0.0001d) {
+            return samplePitchContourAt(contour, (lo + hi) * 0.5d);
+        }
+        double sum = 0.0d;
+        int n = 5;
+        for (int i = 0; i < n; i++) {
+            double t = (i + 0.5d) / n;
+            double pos = lo + ((hi - lo) * t);
+            sum += samplePitchContourAt(contour, pos);
+        }
+        return (float) (sum / n);
+    }
+    private static float sampleGenericContourAverage(float[] contour, double startPos, double endPos, float defaultValue) {
+        if (contour == null || contour.length == 0) return defaultValue;
+        if (contour.length == 1) return contour[0];
+        double lo = Math.max(0.0d, Math.min(1.0d, startPos));
+        double hi = Math.max(lo, Math.min(1.0d, endPos));
+        if (Math.abs(hi - lo) < 0.0001d) {
+            return samplePitchContourAt(contour, (lo + hi) * 0.5d);
+        }
+        double sum = 0.0d;
+        int n = 5;
+        for (int i = 0; i < n; i++) {
+            double t = (i + 0.5d) / n;
+            double pos = lo + ((hi - lo) * t);
+            sum += samplePitchContourAt(contour, pos);
+        }
+        return (float) (sum / n);
+    }
+    private static float sampleGenericContourAt(float[] contour, double pos, float defaultValue) {
+        if (contour == null || contour.length == 0) return defaultValue;
+        return samplePitchContourAt(contour, pos);
+    }
+    private static List<ProsodySegment> buildProsodySegments(float[] contour, float[] activity, float[] voicing) {
+        int len = Math.max(contour == null ? 0 : contour.length, Math.max(activity == null ? 0 : activity.length, voicing == null ? 0 : voicing.length));
+        if (len < 3) return List.of();
+        ArrayList<ProsodySegment> segments = new ArrayList<>();
+        int start = 0;
+        float sumPitch = 0.0f;
+        float sumActivity = 0.0f;
+        float sumVoicing = 0.0f;
+        int pitchCount = 0;
+        boolean currentRest = false;
+        float lastPitch = 0.0f;
+        boolean initialized = false;
+        for (int i = 0; i < len; i++) {
+            double pos = len <= 1 ? 0.0d : (i / (double) (len - 1));
+            float a = sampleGenericContourAt(activity, pos, 0.0f);
+            float v = sampleGenericContourAt(voicing, pos, 0.0f);
+            float p = sampleGenericContourAt(contour, pos, 0.0f);
+            boolean rest = (v <= 0.28f && a <= 0.22f);
+            if (!initialized) {
+                currentRest = rest;
+                start = i;
+                initialized = true;
+            } else {
+                boolean split = rest != currentRest;
+                if (!split && !rest && pitchCount >= 3 && Math.abs(p - lastPitch) >= 0.42f && (i - start) >= 3) {
+                    split = true;
+                }
+                if (split) {
+                    addProsodySegment(segments, start, i - 1, currentRest, sumPitch, pitchCount, sumActivity, sumVoicing, i - start);
+                    start = i;
+                    sumPitch = 0.0f;
+                    sumActivity = 0.0f;
+                    sumVoicing = 0.0f;
+                    pitchCount = 0;
+                    currentRest = rest;
+                }
+            }
+            sumActivity += a;
+            sumVoicing += v;
+            if (!rest) {
+                sumPitch += p;
+                pitchCount++;
+                lastPitch = p;
+            }
+        }
+        addProsodySegment(segments, start, len - 1, currentRest, sumPitch, pitchCount, sumActivity, sumVoicing, len - start);
+        return mergeShortProsodySegments(segments);
+    }
+    private static void addProsodySegment(List<ProsodySegment> segments, int start, int end, boolean rest,
+                                          float sumPitch, int pitchCount, float sumActivity, float sumVoicing, int frames) {
+        int frameCount = Math.max(1, end - start + 1);
+        float meanPitch = (rest || pitchCount == 0) ? 0.0f : (sumPitch / Math.max(1, pitchCount));
+        float meanActivity = sumActivity / Math.max(1, frameCount);
+        float meanVoicing = sumVoicing / Math.max(1, frameCount);
+        segments.add(new ProsodySegment(rest, start, end, frameCount, meanPitch, meanActivity, meanVoicing));
+    }
+    private static List<ProsodySegment> mergeShortProsodySegments(List<ProsodySegment> raw) {
+        if (raw == null || raw.size() <= 1) return raw == null ? List.of() : raw;
+        ArrayList<ProsodySegment> merged = new ArrayList<>();
+        for (ProsodySegment seg : raw) {
+            if (!merged.isEmpty() && seg.frameCount() <= (seg.rest() ? 1 : 2)) {
+                ProsodySegment prev = merged.remove(merged.size() - 1);
+                merged.add(prev.merge(seg));
+            } else {
+                merged.add(seg);
+            }
+        }
+        return merged;
+    }
+    private static boolean isHummingLikeContour(TtsProsodyProfile profile, List<ProsodySegment> segments, int voicedUnits) {
+        if (profile == null || segments == null || segments.isEmpty()) return false;
+        if (!profile.hasPitchContour()) return false;
+        int notes = 0;
+        int rests = 0;
+        float totalNoteFrames = 0.0f;
+        float maxPitch = 0.0f;
+        for (ProsodySegment seg : segments) {
+            if (seg.rest()) {
+                rests++;
+            } else {
+                notes++;
+                totalNoteFrames += seg.frameCount();
+                maxPitch = Math.max(maxPitch, Math.abs(seg.meanPitch()));
+            }
+        }
+        float avgNoteFrames = notes == 0 ? 0.0f : totalNoteFrames / notes;
+        return notes >= 2
+                && voicedUnits >= 3
+                && avgNoteFrames >= 3.0f
+                && maxPitch >= 0.28f
+                && (rests >= 1 || profile.melodyDepth() >= 0.62f);
+    }
+    private static boolean shouldUseCadenceAwareTiming(TtsProsodyProfile profile, List<ProsodySegment> segments, int totalUnits) {
+        if (profile == null || segments == null || segments.isEmpty()) return false;
+        if (!profile.hasTimingContour()) return false;
+        int notes = 0;
+        int rests = 0;
+        float voicedFrames = 0.0f;
+        float maxPitch = 0.0f;
+        for (ProsodySegment seg : segments) {
+            if (seg.rest()) {
+                rests++;
+            } else {
+                notes++;
+                voicedFrames += seg.frameCount();
+                maxPitch = Math.max(maxPitch, Math.abs(seg.meanPitch()));
+            }
+        }
+        float avgNoteFrames = notes == 0 ? 0.0f : voicedFrames / notes;
+        boolean rhythmicRest = rests >= 1 && avgNoteFrames >= 2.0f;
+        boolean melodicEnough = notes >= 2 && maxPitch >= 0.18f && profile.melodyDepth() >= 0.28f;
+        boolean contourDriven = Math.abs(profile.contourRise()) >= 0.22f && profile.confidence() >= 0.28f;
+        return totalUnits >= 4
+                && notes >= 2
+                && avgNoteFrames >= 2.0f
+                && (melodicEnough || (rhythmicRest && contourDriven));
+    }
+    private static int[] allocateSegmentCounts(List<ProsodySegment> segments, int totalUnits) {
+        int[] counts = new int[segments.size()];
+        if (segments.isEmpty() || totalUnits <= 0) return counts;
+        float totalFrames = 0.0f;
+        for (ProsodySegment seg : segments) totalFrames += seg.frameCount();
+        int assigned = 0;
+        double[] fractions = new double[segments.size()];
+        for (int i = 0; i < segments.size(); i++) {
+            double raw = (segments.get(i).frameCount() / Math.max(1.0f, totalFrames)) * totalUnits;
+            counts[i] = Math.max(1, (int) Math.floor(raw));
+            fractions[i] = raw - Math.floor(raw);
+            assigned += counts[i];
+        }
+        while (assigned > totalUnits) {
+            int idx = indexOfMax(counts);
+            if (idx < 0 || counts[idx] <= 1) break;
+            counts[idx]--;
+            assigned--;
+        }
+        while (assigned < totalUnits) {
+            int idx = indexOfMax(fractions);
+            if (idx < 0) idx = counts.length - 1;
+            counts[idx]++;
+            fractions[idx] = -1.0d;
+            assigned++;
+        }
+        return counts;
+    }
+    private static int findSegmentIndexForAllocatedMora(int[] alloc, int moraIndex) {
+        int sum = 0;
+        for (int i = 0; i < alloc.length; i++) {
+            sum += alloc[i];
+            if (moraIndex < sum) return i;
+        }
+        return Math.max(0, alloc.length - 1);
+    }
+    private static float estimateAverageSegmentFrames(List<ProsodySegment> segments) {
+        if (segments == null || segments.isEmpty()) return 1.0f;
+        float sum = 0.0f;
+        for (ProsodySegment segment : segments) sum += segment.frameCount();
+        return Math.max(1.0f, sum / segments.size());
+    }
+    private static float estimateAverageFramesPerMora(List<ProsodySegment> segments, int[] alloc) {
+        if (segments == null || segments.isEmpty() || alloc == null || alloc.length == 0) return 1.0f;
+        float frames = 0.0f;
+        int moras = 0;
+        int count = Math.min(segments.size(), alloc.length);
+        for (int i = 0; i < count; i++) {
+            frames += segments.get(i).frameCount();
+            moras += Math.max(1, alloc[i]);
+        }
+        return frames <= 0.0f || moras <= 0 ? 1.0f : Math.max(1.0f, frames / moras);
+    }
+    private static float estimateSourceTimingDurationSec(TtsProsodyProfile profile) {
+        if (profile == null || profile.contourStepMs() <= 0) return 0.0f;
+        int len = 0;
+        if (profile.activityContour() != null) len = Math.max(len, profile.activityContour().length);
+        if (profile.voicingContour() != null) len = Math.max(len, profile.voicingContour().length);
+        if (len <= 0) return 0.0f;
+        float fullSec = (len * profile.contourStepMs()) / 1000.0f;
+        float voicedSec = 0.0f;
+        if (profile.voicingContour() != null && profile.voicingContour().length > 0) {
+            for (float v : profile.voicingContour()) {
+                voicedSec += clampVoiceVoxProsody(v, 0.0f, 1.0f);
+            }
+            voicedSec = (voicedSec * profile.contourStepMs()) / 1000.0f;
+        }
+        float activeSec = 0.0f;
+        if (profile.activityContour() != null && profile.activityContour().length > 0) {
+            for (float v : profile.activityContour()) {
+                activeSec += clampVoiceVoxProsody(v, 0.0f, 1.0f);
+            }
+            activeSec = (activeSec * profile.contourStepMs()) / 1000.0f;
+        }
+        float effectiveSec = Math.max(voicedSec, (activeSec > 0.0f) ? (voicedSec + ((activeSec - voicedSec) * 0.35f)) : voicedSec);
+        if (effectiveSec >= 0.18f) {
+            return Math.min(fullSec, effectiveSec);
+        }
+        return fullSec;
+    }
+    private static int indexOfMax(int[] values) {
+        int idx = -1;
+        int best = Integer.MIN_VALUE;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i] > best) {
+                best = values[i];
+                idx = i;
+            }
+        }
+        return idx;
+    }
+    private static int indexOfMax(double[] values) {
+        int idx = -1;
+        double best = Double.NEGATIVE_INFINITY;
+        for (int i = 0; i < values.length; i++) {
+            if (values[i] > best) {
+                best = values[i];
+                idx = i;
+            }
+        }
+        return idx;
+    }
+    private static float[] normalizeContourForVoiceVox(float[] contour) {
+        if (contour == null || contour.length == 0) return new float[0];
+        float mean = 0.0f;
+        for (float v : contour) mean += v;
+        mean /= contour.length;
+        float[] centered = new float[contour.length];
+        for (int i = 0; i < contour.length; i++) {
+            centered[i] = contour[i] - mean;
+        }
+        if (centered.length >= 3) {
+            float[] smoothed = centered.clone();
+            for (int i = 1; i < centered.length - 1; i++) {
+                smoothed[i] = (centered[i - 1] * 0.20f) + (centered[i] * 0.60f) + (centered[i + 1] * 0.20f);
+            }
+            centered = smoothed;
+        }
+        float[] absValues = new float[centered.length];
+        for (int i = 0; i < centered.length; i++) {
+            absValues[i] = Math.abs(centered[i]);
+        }
+        Arrays.sort(absValues);
+        float normBase = absValues[Math.max(0, (int) Math.floor((absValues.length - 1) * 0.90d))];
+        normBase = Math.max(0.85f, normBase);
+        for (int i = 0; i < centered.length; i++) {
+            centered[i] = clampVoiceVoxProsody(centered[i] / normBase, -1.0f, 1.0f);
+        }
+        return centered;
+    }
+    private static String shortenForProsodyLog(String text, int max) {
+        if (text == null) return "";
+        String s = text.replace("\r", " ").replace("\n", " ").trim();
+        return (s.length() <= max) ? s : s.substring(0, max) + "...";
+    }
+    private record TimingUnit(JSONObject mora, boolean pause, boolean voiced) {}
+    private record ProsodySegment(boolean rest, int startFrame, int endFrame, int frameCount, float meanPitch, float meanActivity, float meanVoicing) {
+        private ProsodySegment merge(ProsodySegment other) {
+            int totalFrames = Math.max(1, this.frameCount + other.frameCount);
+            float mergedPitch;
+            if (this.rest && other.rest) {
+                mergedPitch = 0.0f;
+            } else if (this.rest) {
+                mergedPitch = other.meanPitch;
+            } else if (other.rest) {
+                mergedPitch = this.meanPitch;
+            } else {
+                mergedPitch = ((this.meanPitch * this.frameCount) + (other.meanPitch * other.frameCount)) / totalFrames;
+            }
+            return new ProsodySegment(
+                    this.rest && other.rest,
+                    this.startFrame,
+                    other.endFrame,
+                    totalFrames,
+                    mergedPitch,
+                    ((this.meanActivity * this.frameCount) + (other.meanActivity * other.frameCount)) / totalFrames,
+                    ((this.meanVoicing * this.frameCount) + (other.meanVoicing * other.frameCount)) / totalFrames
+            );
         }
     }
     public record VoiceVoxSpeaker(int id, String name) {}
@@ -9617,9 +12003,23 @@ public class MobMateWhisp implements NativeKeyListener {
 
 
     public void speakWindows(String text) {
+        speakWindows(text, null);
+    }
+    public void speakWindows(String text, TtsProsodyProfile ttsProsodyProfile) {
         if (text == null || text.isBlank()) return;
         try {
-            byte[] wavBytes = synthWindowsToWavBytesViaAgent(text);
+            WindowsNarratorProsodySettings settings = buildWindowsNarratorProsodySettings(text, ttsProsodyProfile);
+            byte[] wavBytes;
+            if (settings.ssml() != null && !settings.ssml().isBlank()) {
+                try {
+                    wavBytes = synthWindowsToWavBytesViaAgent(text, settings.ssml(), settings.rate(), settings.volume());
+                } catch (Exception ssmlEx) {
+                    Config.logDebug("[WIN WARN] ssml synth failed -> fallback plain: " + ssmlEx.getMessage());
+                    wavBytes = synthWindowsToWavBytesViaAgent(text, settings.rate(), settings.volume());
+                }
+            } else {
+                wavBytes = synthWindowsToWavBytesViaAgent(text, settings.rate(), settings.volume());
+            }
             if (!looksLikeWav(wavBytes)) {
                 Config.logDebug("[WIN] synth bytes not wav");
                 return;
@@ -9628,6 +12028,295 @@ public class MobMateWhisp implements NativeKeyListener {
         } catch (Exception ex) {
             Config.logDebug("[WIN ERROR] " + ex.getMessage());
         }
+    }
+    private WindowsNarratorProsodySettings buildWindowsNarratorProsodySettings(String text, TtsProsodyProfile profile) {
+        if (text == null || text.isBlank()) {
+            return new WindowsNarratorProsodySettings(0, 100, null, "mode=plain-empty");
+        }
+        if (profile == null || !prefs.getBoolean("tts.reflect_emotion", true) || !profile.isUsable()) {
+            String logLine = "[TTS_PROSODY][WIN] mode=tempo-only-off rate=0 volume=100 text="
+                    + shortenForProsodyLog(text, 80);
+            Config.log(logLine);
+            return new WindowsNarratorProsodySettings(0, 100, null, logLine);
+        }
+
+        float contourStrength = getVoiceVoxContourReflectionStrength();
+        float toneStrength = getVoiceVoxToneEmphasisStrength();
+        String contourMode = prefs.get("tts.reflect.contour_strength", "normal");
+        String toneMode = prefs.get("tts.reflect.tone_emphasis", "normal");
+        boolean strongMode = "strong".equalsIgnoreCase(contourMode) || "strong".equalsIgnoreCase(toneMode);
+        boolean mildMode = !strongMode && ("mild".equalsIgnoreCase(contourMode) || "mild".equalsIgnoreCase(toneMode));
+        float weightFloor = strongMode ? 0.65f : (mildMode ? 0.62f : 0.55f);
+        float weight = windowsProsodyWeight(profile.confidence(), weightFloor);
+        int rateCap = strongMode ? 45 : (mildMode ? 18 : 24);
+        float pitchCap = strongMode ? 6.5f : (mildMode ? 2.5f : 3.5f);
+        float inferredSpeedScale = inferWindowsNarratorSpeedScale(text, profile);
+        float speedSignal = (inferredSpeedScale - 1.0f);
+        float tempoSignal = speedSignal * 140.0f;
+        // Windows narration: keep cadence assists one-way so fast speech is never inverted to slow.
+        float positiveAssist = Math.max(0.0f, profile.energyScore() - 0.35f) * (8.0f * contourStrength);
+        float negativeAssist = Math.max(0.0f, profile.darkScore() - 0.35f) * (6.0f * toneStrength);
+        if (speedSignal >= 0.0f) {
+            tempoSignal += positiveAssist;
+        } else {
+            tempoSignal -= negativeAssist;
+        }
+        int ratePercent = Math.max(-rateCap, Math.min(rateCap,
+                Math.round(clampVoiceVoxProsody(tempoSignal * weight, -rateCap, rateCap))));
+        if (speedSignal >= 0.0f && ratePercent < 0) {
+            ratePercent = 0;
+        } else if (speedSignal <= 0.0f && ratePercent > 0) {
+            ratePercent = 0;
+        }
+        int legacyRate = Math.max(-6, Math.min(6, Math.round(ratePercent / 4.5f)));
+
+        float dark = profile.darkScore();
+        float energy = profile.energyScore();
+        float toneDelta = energy - dark;
+        float contourPitch = clampVoiceVoxProsody(profile.contourRise(), -0.65f, 0.65f);
+        float tonePitch = clampVoiceVoxProsody(toneDelta, -0.55f, 0.55f);
+        float pitchSemitone = 0.0f;
+        if (Math.abs(contourPitch) >= 0.10f || Math.abs(tonePitch) >= 0.14f || Math.abs(profile.pitchScale()) >= 0.012f) {
+            pitchSemitone = clampVoiceVoxProsody(
+                    (contourPitch * 2.2f * contourStrength)
+                            + (tonePitch * 1.3f * toneStrength)
+                            + (profile.pitchScale() * 18.0f),
+                    -pitchCap, pitchCap);
+        }
+
+        int volume = 100;
+        float weightedTone = toneDelta * toneStrength * weight;
+        if (weightedTone >= 0.28f) {
+            volume = 100;
+        } else if (weightedTone <= -0.26f || profile.isDarkLike()) {
+            // Keep dark tone audible on Windows Narrator; avoid dropping to "soft".
+            volume = 96;
+        } else if (weightedTone <= -0.12f) {
+            volume = 98;
+        }
+
+        String ssmlLang = resolveWindowsNarratorSsmlLang();
+        String ssml = buildWindowsNarratorSsml(text, ratePercent, pitchSemitone, volume, ssmlLang);
+
+        String logLine = "[TTS_PROSODY][WIN] mood=" + profile.mood()
+                + " conf=" + String.format(Locale.ROOT, "%.2f", profile.confidence())
+                + " mode=single-ssml"
+                + " rate=" + legacyRate
+                + " ratePct=" + ratePercent + "%"
+                + " pitchSt=" + String.format(Locale.ROOT, "%.2f", pitchSemitone)
+                + " volume=" + volume
+                + " lang=" + ssmlLang
+                + " wFloor=" + String.format(Locale.ROOT, "%.2f", weightFloor)
+                + " w=" + String.format(Locale.ROOT, "%.2f", weight)
+                + " rateCap=" + rateCap
+                + " pitchCap=" + String.format(Locale.ROOT, "%.2f", pitchCap)
+                + " speedSig=" + String.format(Locale.ROOT, "%.3f", speedSignal)
+                + " inferSpeed=" + String.format(Locale.ROOT, "%.3f", inferredSpeedScale)
+                + " posAs=" + String.format(Locale.ROOT, "%.3f", positiveAssist)
+                + " negAs=" + String.format(Locale.ROOT, "%.3f", negativeAssist)
+                + " speed=" + String.format(Locale.ROOT, "%.3f", profile.speedScale())
+                + " rise=" + String.format(Locale.ROOT, "%.3f", profile.contourRise())
+                + " melody=" + String.format(Locale.ROOT, "%.3f", profile.melodyDepth())
+                + " dark=" + String.format(Locale.ROOT, "%.3f", profile.darkScore())
+                + " energy=" + String.format(Locale.ROOT, "%.3f", profile.energyScore())
+                + " text=" + shortenForProsodyLog(text, 80);
+        Config.log(logLine);
+        return new WindowsNarratorProsodySettings(legacyRate, volume, ssml, logLine);
+    }
+    private float inferWindowsNarratorSpeedScale(String text, TtsProsodyProfile profile) {
+        if (profile == null) return 1.0f;
+        float base = profile.speedScale();
+        if (Math.abs(base - 1.0f) >= 0.025f) {
+            return base;
+        }
+        if (!profile.hasTimingContour() || profile.contourStepMs() <= 0) {
+            return base;
+        }
+        int unitCount = estimateSpeechUnits(text);
+        if (unitCount <= 0) {
+            return base;
+        }
+        float[] voicing = profile.voicingContour();
+        float[] activity = profile.activityContour();
+        int frameCount = Math.max(
+                (activity == null) ? 0 : activity.length,
+                (voicing == null) ? 0 : voicing.length
+        );
+        if (frameCount < 6 || unitCount < 5) {
+            return base;
+        }
+        int activeFrames = 0;
+        int voicedFrames = 0;
+        for (int i = 0; i < frameCount; i++) {
+            float a = (activity != null && i < activity.length) ? activity[i] : 0.0f;
+            float v = (voicing != null && i < voicing.length) ? voicing[i] : 0.0f;
+            if (a >= 0.30f || v >= 0.35f) {
+                activeFrames++;
+            }
+            if (v >= 0.35f) {
+                voicedFrames++;
+            }
+        }
+        float activeRatio = activeFrames / (float) frameCount;
+        float voicedRatio = voicedFrames / (float) frameCount;
+        if (activeRatio < 0.35f && voicedRatio < 0.30f) {
+            return base;
+        }
+        float utterMs = frameCount * profile.contourStepMs();
+        float msPerUnit = utterMs / Math.max(1.0f, unitCount);
+        float timingSignal = clampVoiceVoxProsody((115.0f - msPerUnit) / 120.0f, -0.12f, 0.12f);
+        float contourAssist = clampVoiceVoxProsody(profile.contourRise() * 0.03f, -0.02f, 0.02f);
+        float melodyAssist = clampVoiceVoxProsody((profile.melodyDepth() - 0.40f) * 0.03f, -0.02f, 0.02f);
+        return clampVoiceVoxProsody(1.0f + timingSignal + contourAssist + melodyAssist, 0.92f, 1.08f);
+    }
+    private int estimateSpeechUnits(String text) {
+        if (text == null || text.isBlank()) return 0;
+        int units = 0;
+        boolean inLatinWord = false;
+        for (int offset = 0; offset < text.length();) {
+            int cp = text.codePointAt(offset);
+            offset += Character.charCount(cp);
+            if (Character.isWhitespace(cp)) {
+                inLatinWord = false;
+                continue;
+            }
+            if (isSentencePunctuationCp(cp)) {
+                inLatinWord = false;
+                continue;
+            }
+            Character.UnicodeScript script = Character.UnicodeScript.of(cp);
+            if (script == Character.UnicodeScript.HIRAGANA
+                    || script == Character.UnicodeScript.KATAKANA
+                    || script == Character.UnicodeScript.HAN) {
+                units++;
+                inLatinWord = false;
+                continue;
+            }
+            if (Character.isLetterOrDigit(cp)) {
+                if (!inLatinWord) {
+                    units++;
+                    inLatinWord = true;
+                }
+                continue;
+            }
+            inLatinWord = false;
+        }
+        return units;
+    }
+    private boolean isSentencePunctuationCp(int cp) {
+        return switch (cp) {
+            case '.', ',', '!', '?', ';', ':', '。', '、', '！', '？', '，', '．', '・', '…' -> true;
+            default -> false;
+        };
+    }
+    private static float windowsProsodyWeight(float confidence, float floor) {
+        float c = Math.max(0.0f, Math.min(1.0f, confidence));
+        float f = Math.max(0.25f, Math.min(0.8f, floor));
+        return f + ((1.0f - f) * (float) Math.pow(c, 0.7d));
+    }
+    private String buildWindowsNarratorSsml(String text, int ratePercent, float pitchSemitone, int volume, String lang) {
+        String escaped = escapeXmlForSsml(text);
+        String rateAttr = formatSsmlPercent(ratePercent);
+        String pitchAttr = formatSsmlPitchPercent(pitchSemitone);
+        // "soft" is too attenuated for live talkback; keep floor at "medium".
+        String volumeAttr = (volume >= 100) ? "default" : "medium";
+        String xmlLang = (lang == null || lang.isBlank()) ? "ja-JP" : lang;
+        return "<speak version=\"1.0\" xmlns=\"http://www.w3.org/2001/10/synthesis\" xml:lang=\"" + xmlLang + "\">"
+                + "<prosody rate=\"" + rateAttr + "\" pitch=\"" + pitchAttr + "\" volume=\"" + volumeAttr + "\">"
+                + escaped
+                + "</prosody></speak>";
+    }
+    private String resolveWindowsNarratorSsmlLang() {
+        String voiceName = resolveWindowsAutoVoiceName();
+        if (voiceName != null && !voiceName.isBlank() && !"auto".equalsIgnoreCase(voiceName)) {
+            String key = voiceName.trim().toLowerCase(Locale.ROOT);
+            for (WindowsVoiceInfo info : getWindowsVoiceInfos()) {
+                if (info == null || info.name.isBlank()) continue;
+                if (info.name.trim().toLowerCase(Locale.ROOT).equals(key)) {
+                    String culture = normalizeCultureForSsml(info.culture);
+                    if (!culture.isBlank()) return culture;
+                    break;
+                }
+            }
+        }
+        String out = (getTalkOutputLanguage() == null) ? "" : getTalkOutputLanguage().trim().toLowerCase(Locale.ROOT);
+        return switch (out) {
+            case "ja" -> "ja-JP";
+            case "en" -> "en-US";
+            case "ko" -> "ko-KR";
+            case "zh" -> "zh-CN";
+            case "yue" -> "zh-HK";
+            case "fr" -> "fr-FR";
+            case "de" -> "de-DE";
+            case "es" -> "es-ES";
+            case "it" -> "it-IT";
+            case "pt" -> "pt-PT";
+            case "ru" -> "ru-RU";
+            default -> "ja-JP";
+        };
+    }
+    private static String normalizeCultureForSsml(String culture) {
+        if (culture == null) return "";
+        String trimmed = culture.trim();
+        if (trimmed.isBlank()) return "";
+        String normalized = trimmed.replace('_', '-');
+        String[] parts = normalized.split("-");
+        if (parts.length == 1) {
+            String lang = parts[0].toLowerCase(Locale.ROOT);
+            return switch (lang) {
+                case "ja" -> "ja-JP";
+                case "en" -> "en-US";
+                case "ko" -> "ko-KR";
+                case "zh" -> "zh-CN";
+                case "fr" -> "fr-FR";
+                case "de" -> "de-DE";
+                case "es" -> "es-ES";
+                case "it" -> "it-IT";
+                case "pt" -> "pt-PT";
+                case "ru" -> "ru-RU";
+                default -> lang;
+            };
+        }
+        String lang = parts[0].toLowerCase(Locale.ROOT);
+        String region = parts[1].toUpperCase(Locale.ROOT);
+        return lang + "-" + region;
+    }
+    private static String escapeXmlForSsml(String text) {
+        if (text == null) return "";
+        return text
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+                .replace("'", "&apos;");
+    }
+    private static String formatSsmlPercent(int percent) {
+        int clamped = Math.max(-30, Math.min(30, percent));
+        return (clamped >= 0 ? "+" : "") + clamped + "%";
+    }
+    private static String formatSsmlPitchPercent(float semitone) {
+        float clamped = clampVoiceVoxProsody(semitone, -6.5f, 6.5f);
+        double ratio = Math.pow(2.0d, clamped / 12.0d);
+        int percent = (int) Math.round((ratio - 1.0d) * 100.0d);
+        int bounded = Math.max(-45, Math.min(45, percent));
+        return (bounded >= 0 ? "+" : "") + bounded + "%";
+    }
+    private static final class WindowsNarratorProsodySettings {
+        private final Integer rate;
+        private final Integer volume;
+        private final String ssml;
+        private final String logLine;
+        private WindowsNarratorProsodySettings(Integer rate, Integer volume, String ssml, String logLine) {
+            this.rate = rate;
+            this.volume = volume;
+            this.ssml = ssml;
+            this.logLine = logLine;
+        }
+        private Integer rate() { return rate; }
+        private Integer volume() { return volume; }
+        private String ssml() { return ssml; }
+        @SuppressWarnings("unused")
+        private String logLine() { return logLine; }
     }
     private String resolveWindowsAutoVoiceName() {
         String configured = "auto";
@@ -9897,12 +12586,63 @@ public class MobMateWhisp implements NativeKeyListener {
     private int psHealthCounter = 0;
     private static final int PS_HEALTH_CHECK_INTERVAL = 3;
     public void playViaPowerShellAsync(File wavFile) {
+        if (wavFile == null) return;
+        playViaPowerShellPathAsync(wavFile.toPath(), false);
+    }
+    private void playViaPowerShellPathAsync(Path wavPath, boolean deleteAfterPlay) {
+        if (wavPath == null || !Files.isRegularFile(wavPath)) return;
         try {
-            byte[] wavBytes = Files.readAllBytes(wavFile.toPath());
-            playViaPowerShellBytesAsync(wavBytes);
+            updateSpeakerMeterFromWav(Files.readAllBytes(wavPath));
         } catch (Exception e) {
             Config.logDebug("Failed to play wav file: " + e.getMessage());
+            return;
         }
+
+        ttsStartedMs = System.currentTimeMillis();
+        isTtsSpeaking = true;
+        ttsVadSuppressUntilMs = System.currentTimeMillis() + TTS_VAD_SUPPRESS_MS;
+        playExecutor.submit(() -> {
+            synchronized (psLock) {
+                try {
+                    ensurePsServerLocked();
+
+                    String outputDeviceName = prefs.get("audio.output.device", "").trim();
+                    int devIndex = findOutputDeviceIndex(outputDeviceName);
+                    String outputDeviceB64 = encodeOutputDeviceNameForAgent(outputDeviceName);
+                    String escapedPath = wavPath.toAbsolutePath().toString().replace("\"", "\\\"");
+                    StringBuilder cmd = new StringBuilder("PLAY \"")
+                            .append(escapedPath)
+                            .append("\" ")
+                            .append(devIndex);
+                    if (!outputDeviceB64.isEmpty()) {
+                        cmd.append(' ').append(outputDeviceB64);
+                    }
+                    psWriter.write(cmd + "\n");
+                    psWriter.flush();
+
+                    String resp = psReader.readLine();
+                    if (!"DONE".equals(resp)) {
+                        psHealthCounter = 0;
+                        throw new IOException("tts_agent bad response: " + resp);
+                    }
+                    psHealthCounter++;
+                    if (psHealthCounter >= PS_HEALTH_CHECK_INTERVAL) psHealthCounter = 0;
+
+                } catch (Exception e) {
+                    Config.log("TTS agent error: " + e.getMessage());
+                    if (e instanceof IOException) {
+                        Config.log("TTS pipe dead → restarting agent");
+                        stopPsServerLocked();
+                    }
+                } finally {
+                    if (deleteAfterPlay) {
+                        try { Files.deleteIfExists(wavPath); } catch (Exception ignore) {}
+                    }
+                    isTtsSpeaking = false;
+                    ttsEndedMs = System.currentTimeMillis();
+                }
+            }
+        });
     }
     private String encodeOutputDeviceNameForAgent(String deviceName) {
         String name = (deviceName == null) ? "" : deviceName.trim();
@@ -9963,6 +12703,86 @@ public class MobMateWhisp implements NativeKeyListener {
                     }
                 } finally {
                     isTtsSpeaking = false;  // ★ADD: DONE受信後（または例外後）にフラグOFF
+                    ttsEndedMs = System.currentTimeMillis();
+                }
+            }
+        });
+    }
+    public void playViaPowerShellPcm16MonoAsync(byte[] pcmBytes, int sampleRate, long synthSpawnMs, long rawReadMs) {
+        if (pcmBytes == null || pcmBytes.length < 128) return;
+
+        byte[] meterWav;
+        try {
+            meterWav = wrapPcm16MonoAsWav(pcmBytes, sampleRate);
+        } catch (IOException ioEx) {
+            Config.logDebug("[Piper+][PLAY_RAW] wav wrap failed: " + ioEx.getMessage());
+            return;
+        }
+        updateSpeakerMeterFromWav(meterWav);
+
+        ttsStartedMs = System.currentTimeMillis();
+        isTtsSpeaking = true;
+        ttsVadSuppressUntilMs = System.currentTimeMillis() + TTS_VAD_SUPPRESS_MS;
+        playExecutor.submit(() -> {
+            synchronized (psLock) {
+                long ensureStartNs = System.nanoTime();
+                long sendStartNs = 0L;
+                try {
+                    ensurePsServerLocked();
+                    long ensureMs = (System.nanoTime() - ensureStartNs) / 1_000_000L;
+
+                    String outputDeviceName = prefs.get("audio.output.device", "").trim();
+                    int devIndex = findOutputDeviceIndex(outputDeviceName);
+                    String outputDeviceB64 = encodeOutputDeviceNameForAgent(outputDeviceName);
+
+                    String id = Long.toHexString(System.nanoTime());
+                    String b64 = Base64.getEncoder().encodeToString(pcmBytes);
+
+                    StringBuilder cmd = new StringBuilder("PLAYPCM16B64 ")
+                            .append(Math.max(8000, sampleRate))
+                            .append(' ')
+                            .append(devIndex)
+                            .append(' ')
+                            .append(id);
+                    if (!outputDeviceB64.isEmpty()) {
+                        cmd.append(' ').append(outputDeviceB64);
+                    }
+                    psWriter.write(cmd + "\n");
+
+                    sendStartNs = System.nanoTime();
+                    final int CHUNK = 12000;
+                    for (int i = 0; i < b64.length(); i += CHUNK) {
+                        int end = Math.min(b64.length(), i + CHUNK);
+                        psWriter.write("DATA " + id + " " + b64.substring(i, end) + "\n");
+                    }
+                    psWriter.write("ENDPCM " + id + "\n");
+                    psWriter.flush();
+
+                    String resp = psReader.readLine();
+                    long doneNs = System.nanoTime();
+                    if (!"DONE".equals(resp)) {
+                        psHealthCounter = 0;
+                        throw new IOException("tts_agent bad response: " + resp);
+                    }
+                    long sendMs = (doneNs - sendStartNs) / 1_000_000L;
+                    long preSendMs = synthSpawnMs + rawReadMs + sendMs;
+                    Config.logDebug("[Piper+][LAT] spawn_ms=" + synthSpawnMs
+                            + " raw_pcm_read_ms=" + rawReadMs
+                            + " base64_send_ms=" + sendMs
+                            + " pre_send_ms~=" + preSendMs
+                            + " pcm_bytes=" + pcmBytes.length
+                            + " sr=" + sampleRate);
+                    psHealthCounter++;
+                    if (psHealthCounter >= PS_HEALTH_CHECK_INTERVAL) psHealthCounter = 0;
+                } catch (Exception e) {
+                    Config.log("TTS raw agent error: " + e.getMessage());
+                    if (e instanceof IOException) {
+                        Config.log("TTS raw pipe dead → restarting agent");
+                        stopPsServerLocked();
+                    }
+                    playViaPowerShellBytesAsync(meterWav);
+                } finally {
+                    isTtsSpeaking = false;
                     ttsEndedMs = System.currentTimeMillis();
                 }
             }
@@ -11275,6 +14095,15 @@ public class MobMateWhisp implements NativeKeyListener {
             Config.logError("[RESTART] failed", e);
             return;
         }
+        Thread haltWatchdog = new Thread(() -> {
+            try {
+                Thread.sleep(5000L);
+                Runtime.getRuntime().halt(0);
+            } catch (InterruptedException ignore) {
+            }
+        }, "restart-halt-watchdog");
+        haltWatchdog.setDaemon(true);
+        haltWatchdog.start();
         System.exit(0);
     }
     private static int showLanguageSelectDialog() {

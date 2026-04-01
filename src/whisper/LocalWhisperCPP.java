@@ -207,8 +207,6 @@ public class LocalWhisperCPP {
                         WhisperSamplingStrategy.WHISPER_SAMPLING_GREEDY
                 );
         p.print_progress = CBool.FALSE;
-        p.detect_language = CBool.FALSE; // ★FALSEに変更（言語固定の方が安定）
-//        p.detect_language = "auto".equals(this.language) ? CBool.TRUE : CBool.FALSE;
         p.single_segment = longMode ? CBool.FALSE : CBool.TRUE;
         p.no_context     = longMode ? CBool.FALSE : CBool.TRUE;
         p.max_len = 0;
@@ -222,13 +220,13 @@ public class LocalWhisperCPP {
                         Config.getInt("whisper.n_threads", Runtime.getRuntime().availableProcessors() / 2)
                 ) : Math.max(2, Runtime.getRuntime().availableProcessors() / 4);  // lowGpuMode: 1→最低2
 
-        // ★言語と自動検出は「autoのときだけ検出」
-        //   翻訳ON/OFFに関係なく、このルールが一番安定するっす
+        // ★Hearing 側の auto bootstrap は、whisper.cpp の detect_language=true で
+        //   2秒chunkが空返りしやすかったので、まずは従来どおり detect off に戻すっす。
+        //   auto_stable の言語シフト自体は上位ロジックで継続するっす。
         String lang = (this.language == null) ? "auto" : this.language.trim();
         if (lang.isEmpty()) lang = "auto";
-        boolean auto = "auto".equalsIgnoreCase(lang);
         p.language = lang;
-//        p.detect_language = auto ? CBool.TRUE : CBool.FALSE;
+        p.detect_language = CBool.FALSE;
 
         p.initial_prompt = buildInitialPrompt(); // ★Hearing用も専用promptを許可
         // ★翻訳時は言語を明示的に設定
@@ -773,6 +771,17 @@ public class LocalWhisperCPP {
         boolean longMode = numSamples >= (SAMPLE_RATE_HZ * longSec);
         WhisperFullParams params = createGreedyParamsHearing(longMode);
         String raw = whisper.fullTranscribe(params, floats);
+        if (raw == null || raw.trim().isEmpty()) {
+            String lang = (params.language == null || params.language.trim().isEmpty())
+                    ? "<auto>"
+                    : params.language.trim();
+            Config.logDebug("[Whisper][Hearing] blank transcript"
+                    + " longMode=" + longMode
+                    + " detect_language=" + params.detect_language
+                    + " language=" + lang
+                    + " samples=" + numSamples);
+            return "";
+        }
 
         // ★Ignore判定
         if (isIgnored(raw)) {

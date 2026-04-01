@@ -11,6 +11,8 @@ import java.util.Set;
 
 final class LanguageOptions {
 
+    static final String HEARING_AUTO_STABLE = "auto_stable";
+
     static final String[] WHISPER_LANGS = new String[] {
             "auto",
             "en","ja","zh","de","fr","es","ru","ko","it","pt","nl","pl","tr","uk","vi","th","id","sv","fi","da","no","cs","hu","ro","el","he","hi","ar",
@@ -29,10 +31,16 @@ final class LanguageOptions {
     static final String[] TRANSLATION_TARGETS = buildTranslationTargets();
 
     private static final Set<String> TRANSLATION_LANG_SET = new HashSet<>(Arrays.asList(TRANSLATION_LANGS));
-    private static final Set<String> WHISPER_LANG_SET = new HashSet<>(Arrays.asList(WHISPER_LANGS));
+    private static final Set<String> WHISPER_LANG_SET = createWhisperLangSet();
     private static final Map<String, String> LANGUAGE_NAME_OVERRIDES = createLanguageNameOverrides();
 
     private LanguageOptions() {}
+
+    private static Set<String> createWhisperLangSet() {
+        Set<String> set = new HashSet<>(Arrays.asList(WHISPER_LANGS));
+        set.add(HEARING_AUTO_STABLE);
+        return set;
+    }
 
     private static String[] buildTranslationTargets() {
         String[] values = new String[TRANSLATION_LANGS.length + 1];
@@ -77,6 +85,14 @@ final class LanguageOptions {
         return WHISPER_LANGS.clone();
     }
 
+    static String[] hearingWhisperLangs() {
+        String[] values = new String[WHISPER_LANGS.length + 1];
+        values[0] = "auto";
+        values[1] = HEARING_AUTO_STABLE;
+        System.arraycopy(WHISPER_LANGS, 1, values, 2, WHISPER_LANGS.length - 1);
+        return values;
+    }
+
     static String[] translationTargets() {
         return TRANSLATION_TARGETS.clone();
     }
@@ -103,6 +119,9 @@ final class LanguageOptions {
         }
         String normalized = value.trim().toLowerCase(Locale.ROOT);
         if ("off".equals(normalized) || "auto".equals(normalized)) {
+            return "text";
+        }
+        if (HEARING_AUTO_STABLE.equals(normalized)) {
             return "text";
         }
         String name = resolveLanguageName(normalized);
@@ -134,6 +153,9 @@ final class LanguageOptions {
         }
         if ("auto".equals(normalized)) {
             return "Auto detect (auto)";
+        }
+        if (HEARING_AUTO_STABLE.equals(normalized)) {
+            return "Auto detect (stable)";
         }
         String name = resolveLanguageName(normalized);
         if (name == null || name.isBlank() || name.equalsIgnoreCase(normalized)) {
