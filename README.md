@@ -514,9 +514,23 @@ model_sha256=
 - JA: 特に中国語の手動追加モデルでは、配布元リポジトリが一見寛容に見えても、モデル固有の条件が別に設定されている場合があります。
 - ZH: 这一点对手动添加的中文语音尤其重要，因为即使托管仓库看起来较为宽松，模型本身也可能附带单独的条款。
 
+### External model list / 外部モデル一覧 / 外部模型列表
+
+- EN: If you want to browse a broader Piper voice list, start here:
+  **[Rhasspy Piper voices on Hugging Face](https://huggingface.co/rhasspy/piper-voices/tree/main)**
+- JA: Piper 系モデルを広く探したい場合は、まずここを見てください:
+  **[Hugging Face の Rhasspy Piper voices 一覧](https://huggingface.co/rhasspy/piper-voices/tree/main)**
+- ZH: 如果你想先查看较完整的 Piper 语音模型列表，可以从这里开始：
+  **[Hugging Face 上的 Rhasspy Piper voices 列表](https://huggingface.co/rhasspy/piper-voices/tree/main)**
+
+- EN: This link is provided as a convenient reference only. **Downloading, licensing checks, safety review, and redistribution decisions are your own responsibility.**
+- JA: このリンクはあくまで探しやすくするための参考案内です。**ダウンロード、ライセンス確認、安全性確認、再配布判断は自己責任でお願いします。**
+- ZH: 这个链接只是为了方便查找而提供的参考入口。**下载、许可证确认、安全性判断以及再分发决定都需要你自行负责。**
+
 ### Reference links / 参考リンク / 参考链接
 
 - Piper+ GitHub: [ayutaz/piper-plus](https://github.com/ayutaz/piper-plus)
+- Rhasspy Piper voices (all models): [rhasspy/piper-voices/tree/main](https://huggingface.co/rhasspy/piper-voices/tree/main)
 - Rhasspy Piper voices (zh folder): [rhasspy/piper-voices/zh](https://huggingface.co/rhasspy/piper-voices/tree/main/zh)
 - CSS10 6lang model page: [ayousanz/piper-plus-css10-ja-6lang](https://huggingface.co/ayousanz/piper-plus-css10-ja-6lang)
 
