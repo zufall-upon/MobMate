@@ -49,6 +49,7 @@ public class MobMateSettingsFrame extends JDialog {
     private JComboBox<String> inputCombo;
     private JComboBox<String> outputCombo;
     private JCheckBox autoGainCheck;
+    private JCheckBox aiAssistCheck;
     private JComboBox<Choice<String>> audioPrefilterModeCombo;
     private JComboBox<Choice<Float>> inputGainCombo;
 
@@ -82,6 +83,24 @@ public class MobMateSettingsFrame extends JDialog {
     private JLabel piperPlusLicenseLabel;
     private JLabel piperPlusStatusLabel;
     private JLabel piperPlusProsodyLabel;
+    private JPanel ttsForm;
+    private FormRow ttsWindowsVoiceRow;
+    private FormRow ttsPiperPlusModelRow;
+    private FormRow ttsPiperPlusLicenseRow;
+    private FormRow ttsPiperPlusStatusRow;
+    private FormRow ttsPiperPlusProsodyRow;
+    private FormRow ttsVoicevoxSpeakerRow;
+    private FormRow ttsVoicevoxAutoEmotionRow;
+    private FormRow ttsReflectEmotionRow;
+    private FormRow ttsContourStrengthRow;
+    private FormRow ttsToneEmphasisRow;
+    private FormRow ttsVoicegerLangRow;
+    private JLabel ttsSetupSectionLabel;
+    private FormRow ttsSetupButtonsRow;
+    private FormRow ttsSetupNoteRow;
+    private JButton ttsSetupVoicevoxBtn;
+    private JButton ttsSetupXttsBtn;
+    private JButton ttsSetupVoicegerBtn;
 
     // ===== Text / _outtts =====
     private JComboBox<String> whisperLanguageCombo;
@@ -299,6 +318,7 @@ public class MobMateSettingsFrame extends JDialog {
         inputCombo = new JComboBox<>();
         outputCombo = new JComboBox<>();
         autoGainCheck = new JCheckBox(tt("menu.autoGainTuner", "Auto gain"));
+        aiAssistCheck = new JCheckBox(tt("settings.audio.aiAssist", "AI setting assist"));
         audioPrefilterModeCombo = new JComboBox<>(new Choice[]{
                 new Choice<>(tt("settings.audioPrefilter.off", "Off"), "off"),
                 new Choice<>(tt("settings.audioPrefilter.normal", "Normal filter"), "normal"),
@@ -320,6 +340,7 @@ public class MobMateSettingsFrame extends JDialog {
         addRow(form, row++, tt("settings.label.inputDevice", "Input device"), inputCombo);
         addRow(form, row++, tt("settings.label.outputDevice", "Output device"), outputCombo);
         addRow(form, row++, "", autoGainCheck);
+        addRow(form, row++, "", aiAssistCheck);
         addRow(form, row++, tt("settings.label.audioPrefilter", "Voice audio filter"), audioPrefilterModeCombo);
         addRow(form, row++, tt("settings.label.inputGain", "Input gain"), inputGainCombo);
 
@@ -394,11 +415,12 @@ public class MobMateSettingsFrame extends JDialog {
 
     private JPanel buildTtsPage() {
         JPanel form = formPanel();
+        ttsForm = form;
         int row = 0;
 
         ttsEngineCombo = new JComboBox<>(new Choice[]{
                 new Choice<>("Auto", "auto"),
-                new Choice<>("Piper+", "piper_plus"),
+                new Choice<>("piper-plus", "piper_plus"),
                 new Choice<>("VOICEVOX", "voicevox"),
                 new Choice<>("XTTS", "xtts"),
                 new Choice<>("Windows", "windows"),
@@ -460,7 +482,7 @@ public class MobMateSettingsFrame extends JDialog {
 
         form.add(sectionLabel(tt("settings.section.ttsVoice", "Voice Output")), sectionGbc(row++));
         addRow(form, row++, tt("settings.label.ttsEngine", "TTS engine"), ttsEngineCombo);
-        addRow(form, row++, tt("settings.label.windowsVoice", "Windows voice"), windowsVoiceCombo);
+        ttsWindowsVoiceRow = addTrackedRow(form, row++, tt("settings.label.windowsVoice", "Windows voice"), windowsVoiceCombo);
 
         JPanel piperPanel = new JPanel(new BorderLayout(8, 0));
         piperPanel.add(piperPlusModelCombo, BorderLayout.CENTER);
@@ -469,48 +491,52 @@ public class MobMateSettingsFrame extends JDialog {
         piperButtons.add(piperPlusRemoveBtn);
         piperButtons.add(piperPlusOpenBtn);
         piperPanel.add(piperButtons, BorderLayout.EAST);
-        addRow(form, row++, tt("settings.label.piperPlusModel", "Piper+ model"), piperPanel);
+        ttsPiperPlusModelRow = addTrackedRow(form, row++, tt("settings.label.piperPlusModel", "piper-plus model"), piperPanel);
         piperPlusLicenseLabel = new JLabel("License: -");
         piperPlusStatusLabel = new JLabel("Status: -");
         piperPlusProsodyLabel = new JLabel("Prosody: -");
-        addRow(form, row++, "", piperPlusLicenseLabel);
-        addRow(form, row++, "", piperPlusStatusLabel);
-        addRow(form, row++, "", piperPlusProsodyLabel);
+        ttsPiperPlusLicenseRow = addTrackedRow(form, row++, "", piperPlusLicenseLabel);
+        ttsPiperPlusStatusRow = addTrackedRow(form, row++, "", piperPlusStatusLabel);
+        ttsPiperPlusProsodyRow = addTrackedRow(form, row++, "", piperPlusProsodyLabel);
 
         JPanel vvPanel = new JPanel(new BorderLayout(8, 0));
         vvPanel.add(voicevoxSpeakerCombo, BorderLayout.CENTER);
         vvPanel.add(reloadVoicevoxBtn, BorderLayout.EAST);
-        addRow(form, row++, tt("settings.label.voicevoxSpeaker", "VOICEVOX speaker"), vvPanel);
+        ttsVoicevoxSpeakerRow = addTrackedRow(form, row++, tt("settings.label.voicevoxSpeaker", "VOICEVOX speaker"), vvPanel);
 
-        addRow(form, row++, "", voicevoxAutoEmotionCheck);
-        addRow(form, row++, "", ttsReflectEmotionCheck);
-        addRow(form, row++, tt("settings.label.ttsContourStrength", "Cadence reflection"), ttsContourStrengthCombo);
-        addRow(form, row++, tt("settings.label.ttsToneEmphasis", "Bright / dark tone emphasis"), ttsToneEmphasisCombo);
-        addRow(form, row++, tt("settings.label.voicegerLang", "Voiceger TTS language"), voicegerLangCombo);
+        ttsVoicevoxAutoEmotionRow = addTrackedRow(form, row++, "", voicevoxAutoEmotionCheck);
+        ttsReflectEmotionRow = addTrackedRow(form, row++, "", ttsReflectEmotionCheck);
+        ttsContourStrengthRow = addTrackedRow(form, row++, tt("settings.label.ttsContourStrength", "Cadence reflection"), ttsContourStrengthCombo);
+        ttsToneEmphasisRow = addTrackedRow(form, row++, tt("settings.label.ttsToneEmphasis", "Bright / dark tone emphasis"), ttsToneEmphasisCombo);
+        ttsVoicegerLangRow = addTrackedRow(form, row++, tt("settings.label.voicegerLang", "Voiceger TTS language"), voicegerLangCombo);
 
-        form.add(sectionLabel(tt("settings.section.ttsSetup", "Setup / Advanced")), sectionGbc(row++));
+        ttsSetupSectionLabel = sectionLabel(tt("settings.section.ttsSetup", "Setup / Advanced"));
+        form.add(ttsSetupSectionLabel, sectionGbc(row++));
 
         JPanel setupButtons = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
-        JButton voicevoxBtn = new JButton(tt("settings.util.voicevox", "VOICEVOX"));
-        voicevoxBtn.addActionListener(e -> openVoiceVoxSetup());
+        ttsSetupVoicevoxBtn = new JButton(tt("settings.util.voicevox", "VOICEVOX"));
+        ttsSetupVoicevoxBtn.addActionListener(e -> openVoiceVoxSetup());
 
-        JButton xttsBtn = new JButton(tt("settings.util.xtts", "XTTS"));
-        xttsBtn.addActionListener(e -> openXttsSetup());
+        ttsSetupXttsBtn = new JButton(tt("settings.util.xtts", "XTTS"));
+        ttsSetupXttsBtn.addActionListener(e -> openXttsSetup());
 
-        JButton voicegerBtn = new JButton(tt("settings.util.voiceger", "Voiceger"));
-        voicegerBtn.addActionListener(e -> openVoicegerSetup());
+        ttsSetupVoicegerBtn = new JButton(tt("settings.util.voiceger", "Voiceger"));
+        ttsSetupVoicegerBtn.addActionListener(e -> openVoicegerSetup());
 
-        setupButtons.add(voicevoxBtn);
-        setupButtons.add(xttsBtn);
-        setupButtons.add(voicegerBtn);
+        setupButtons.add(ttsSetupVoicevoxBtn);
+        setupButtons.add(ttsSetupXttsBtn);
+        setupButtons.add(ttsSetupVoicegerBtn);
 
-        addRow(form, row++, tt("settings.label.ttsSetup", "Open setup"), setupButtons);
+        ttsSetupButtonsRow = addTrackedRow(form, row++, tt("settings.label.ttsSetup", "Open setup"), setupButtons);
 
         JLabel note = new JLabel("<html><span style='color:#888888;'>"
                 + tt("settings.ttsSetup.note",
                 "Open VOICEVOX / XTTS / Voiceger setup pages when you need advanced setup.")
                 + "</span></html>");
-        addRow(form, row++, "", note);
+        ttsSetupNoteRow = addTrackedRow(form, row++, "", note);
+
+        ttsEngineCombo.addActionListener(e -> updateTtsUiState());
+        updateTtsUiState();
 
         return wrapPage(
                 tt("settings.page.tts.title", "TTS / Voice"),
@@ -768,6 +794,7 @@ public class MobMateSettingsFrame extends JDialog {
         outputCombo.setSelectedItem(MobMateWhisp.prefs.get("audio.output.device", ""));
 
         autoGainCheck.setSelected(MobMateWhisp.prefs.getBoolean("audio.autoGain", true));
+        aiAssistCheck.setSelected(MobMateWhisp.prefs.getBoolean("audio.ai_assist", false));
         selectChoice(audioPrefilterModeCombo, MobMateWhisp.getAudioPrefilterMode());
         selectChoice(inputGainCombo, MobMateWhisp.prefs.getFloat("audio.inputGainMultiplier", 1.0f));
 
@@ -827,6 +854,7 @@ public class MobMateSettingsFrame extends JDialog {
         selectChoice(ttsToneEmphasisCombo, MobMateWhisp.prefs.get("tts.reflect.tone_emphasis", "normal"));
         selectChoice(voicegerLangCombo, MobMateWhisp.prefs.get("voiceger.tts.lang", "all_ja"));
         updatePiperPlusSelectionDetails();
+        updateTtsUiState();
 
         // ===== Text / _outtts =====
         selectStringComboValue(whisperLanguageCombo, app.getTalkLanguage(), app.getTalkLanguage());
@@ -1113,6 +1141,11 @@ public class MobMateSettingsFrame extends JDialog {
         if (oldAutoGain != newAutoGain) {
             MobMateWhisp.prefs.putBoolean("audio.autoGain", newAutoGain);
         }
+        boolean oldAiAssist = MobMateWhisp.prefs.getBoolean("audio.ai_assist", false);
+        boolean newAiAssist = aiAssistCheck.isSelected();
+        if (oldAiAssist != newAiAssist) {
+            MobMateWhisp.prefs.putBoolean("audio.ai_assist", newAiAssist);
+        }
 
         Float gainVal = selectedValue(inputGainCombo);
         if (gainVal != null) {
@@ -1379,7 +1412,7 @@ public class MobMateSettingsFrame extends JDialog {
     private void showPiperPlusGuideFallbackDialog(String reason) {
         StringBuilder message = new StringBuilder(tt(
                 "settings.piperPlus.guideDialog",
-                "Open this Piper+ model guide in your browser:"
+                "Open this piper-plus model guide in your browser:"
         )).append("\n")
                 .append(PIPER_PLUS_MODEL_GUIDE_URL);
         if (reason != null && !reason.isBlank()) {
@@ -1417,7 +1450,7 @@ public class MobMateSettingsFrame extends JDialog {
         } catch (Exception ex) {
             JOptionPane.showMessageDialog(
                     this,
-                    tt("settings.piperPlus.modelCardDialog", "Open this Piper+ model page in your browser:")
+                    tt("settings.piperPlus.modelCardDialog", "Open this piper-plus model page in your browser:")
                             + "\n" + entry.sourcePageUrl()
                             + "\n\n" + tt("settings.common.reason", "Reason") + ": " + ex.getMessage(),
                     tt("settings.piperPlus.guideTitle", "MobMate"),
@@ -1427,7 +1460,7 @@ public class MobMateSettingsFrame extends JDialog {
         }
         JOptionPane.showMessageDialog(
                 this,
-                tt("settings.piperPlus.modelCardDialog", "Open this Piper+ model page in your browser:")
+                tt("settings.piperPlus.modelCardDialog", "Open this piper-plus model page in your browser:")
                         + "\n" + entry.sourcePageUrl(),
                 tt("settings.piperPlus.guideTitle", "MobMate"),
                 JOptionPane.INFORMATION_MESSAGE
@@ -1550,7 +1583,7 @@ public class MobMateSettingsFrame extends JDialog {
             piperPlusDownloadBtn.setEnabled(manualOnly || modelCardOnly || entry.isDownloadable());
             piperPlusDownloadBtn.setToolTipText(manualOnly
                     ? tt("settings.piperPlus.guide.tooltip",
-                    "Open the Piper+ Model Guide on GitHub for manual Chinese model setup.")
+                    "Open the piper-plus Model Guide on GitHub for manual Chinese model setup.")
                     : modelCardOnly
                     ? tt("settings.piperPlus.modelCard.tooltip",
                     "This model is manual/local. Open its model card instead of downloading from MobMate.")
@@ -1566,7 +1599,7 @@ public class MobMateSettingsFrame extends JDialog {
     private void downloadSelectedPiperPlusModel() {
         PiperPlusCatalog.Entry entry = PiperPlusCatalog.findById(selectedPiperPlusModelId());
         if (entry == null) {
-            JOptionPane.showMessageDialog(this, "No Piper+ model selected.");
+            JOptionPane.showMessageDialog(this, "No piper-plus model selected.");
             return;
         }
         piperPlusStatusLabel.setText("Status: Downloading " + entry.displayName() + " ...");
@@ -1597,7 +1630,7 @@ public class MobMateSettingsFrame extends JDialog {
             PiperPlusModelManager.deleteInstalled(entry);
             updatePiperPlusSelectionDetails();
         } catch (IOException ex) {
-            JOptionPane.showMessageDialog(this, "Failed to remove Piper+ model:\n" + ex.getMessage());
+            JOptionPane.showMessageDialog(this, "Failed to remove piper-plus model:\n" + ex.getMessage());
         }
     }
 
@@ -2120,6 +2153,118 @@ public class MobMateSettingsFrame extends JDialog {
             );
         }
 
+    }
+
+    private void updateTtsUiState() {
+        String engine = selectedValue(ttsEngineCombo);
+        String normalized = (engine == null || engine.isBlank()) ? "auto" : engine.toLowerCase(Locale.ROOT);
+
+        boolean autoMode = "auto".equals(normalized);
+        boolean windowsMode = "windows".equals(normalized);
+        boolean piperMode = "piper_plus".equals(normalized);
+        boolean voicevoxMode = "voicevox".equals(normalized);
+        boolean xttsMode = "xtts".equals(normalized);
+        boolean voicegerVcMode = "voiceger_vc".equals(normalized) || "voiceger".equals(normalized);
+        boolean voicegerTtsMode = "voiceger_tts".equals(normalized);
+
+        boolean showWindows = autoMode || windowsMode;
+        boolean showPiper = piperMode;
+        boolean showVoicevox = autoMode || voicevoxMode;
+        boolean showEmotionReflect = autoMode || windowsMode || piperMode || voicevoxMode;
+        boolean showVoicegerLang = voicegerTtsMode;
+        boolean showSetupSection = autoMode || voicevoxMode || xttsMode || voicegerVcMode || voicegerTtsMode;
+
+        setRowVisible(ttsWindowsVoiceRow, showWindows);
+        setRowVisible(ttsPiperPlusModelRow, showPiper);
+        setRowVisible(ttsPiperPlusLicenseRow, showPiper);
+        setRowVisible(ttsPiperPlusStatusRow, showPiper);
+        setRowVisible(ttsPiperPlusProsodyRow, showPiper);
+        setRowVisible(ttsVoicevoxSpeakerRow, showVoicevox);
+        setRowVisible(ttsVoicevoxAutoEmotionRow, showVoicevox);
+        setRowVisible(ttsReflectEmotionRow, showEmotionReflect);
+        setRowVisible(ttsContourStrengthRow, showEmotionReflect);
+        setRowVisible(ttsToneEmphasisRow, showEmotionReflect);
+        setRowVisible(ttsVoicegerLangRow, showVoicegerLang);
+
+        if (ttsSetupVoicevoxBtn != null) ttsSetupVoicevoxBtn.setVisible(autoMode || voicevoxMode);
+        if (ttsSetupXttsBtn != null) ttsSetupXttsBtn.setVisible(autoMode || xttsMode);
+        if (ttsSetupVoicegerBtn != null) ttsSetupVoicegerBtn.setVisible(voicegerVcMode || voicegerTtsMode);
+
+        boolean hasVisibleSetupButton =
+                (ttsSetupVoicevoxBtn != null && ttsSetupVoicevoxBtn.isVisible())
+                        || (ttsSetupXttsBtn != null && ttsSetupXttsBtn.isVisible())
+                        || (ttsSetupVoicegerBtn != null && ttsSetupVoicegerBtn.isVisible());
+        boolean showSetupRows = showSetupSection && hasVisibleSetupButton;
+
+        if (ttsSetupSectionLabel != null) ttsSetupSectionLabel.setVisible(showSetupRows);
+        setRowVisible(ttsSetupButtonsRow, showSetupRows);
+        setRowVisible(ttsSetupNoteRow, showSetupRows);
+
+        if (ttsForm != null) {
+            ttsForm.revalidate();
+            ttsForm.repaint();
+        }
+    }
+
+    private FormRow addTrackedRow(JPanel form, int row, String label, Component comp) {
+        GridBagConstraints lc = new GridBagConstraints();
+        lc.gridx = 0;
+        lc.gridy = row;
+        lc.insets = new Insets(6, 0, 6, 10);
+        lc.anchor = GridBagConstraints.NORTHWEST;
+        lc.fill = GridBagConstraints.HORIZONTAL;
+        lc.weightx = 0.0;
+
+        JLabel l = new JLabel(label == null ? "" : label);
+        l.setPreferredSize(new Dimension(180, 26));
+        form.add(l, lc);
+
+        GridBagConstraints cc = new GridBagConstraints();
+        cc.gridx = 1;
+        cc.gridy = row;
+        cc.insets = new Insets(6, 0, 6, 0);
+        cc.anchor = GridBagConstraints.NORTHWEST;
+        cc.fill = GridBagConstraints.HORIZONTAL;
+        cc.weightx = 1.0;
+        form.add(comp, cc);
+        return new FormRow(l, comp);
+    }
+
+    private void setRowVisible(FormRow row, boolean visible) {
+        if (row == null) return;
+        row.setVisible(visible);
+        if (row.label != null) row.label.setEnabled(visible);
+        setComponentTreeEnabled(row.component, visible);
+    }
+
+    private void setComponentTreeEnabled(Component comp, boolean enabled) {
+        if (comp == null) return;
+        comp.setEnabled(enabled);
+        if (comp instanceof Container container) {
+            for (Component child : container.getComponents()) {
+                setComponentTreeEnabled(child, enabled);
+            }
+        }
+    }
+
+    private static final class FormRow {
+        final JLabel label;
+        final Component component;
+
+        FormRow(JLabel label, Component component) {
+            this.label = label;
+            this.component = component;
+        }
+
+        void setVisible(boolean visible) {
+            if (label != null) label.setVisible(visible);
+            if (component != null) component.setVisible(visible);
+        }
+
+        void setEnabled(boolean enabled) {
+            if (label != null) label.setEnabled(enabled);
+            if (component != null) component.setEnabled(enabled);
+        }
     }
 }
 

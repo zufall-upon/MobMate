@@ -123,12 +123,17 @@ public class HearingFrame extends JFrame {
     private static final double HEARING_NOISE_FLOOR_MAX_RMS = 280.0;
     private static final double HEARING_NOISE_FLOOR_UPTRACK_RATIO = 1.18;
     private static final int HEARING_VOICE_HOLD_MAX_CHUNKS = 2;
+    private static final long HEARING_LOOPBACK_SE_COOLDOWN_MS = 4500L;
+    private static final long HEARING_LOOPBACK_STATUS_LOG_MS = 10000L;
     private double hearingNoiseFloorRms = 120.0;
     private int hearingVoiceHoldChunks = 0;
     private int hearingGateRejectStreak = 0;
     private long hearingMainBusySinceMs = 0L;
     private int hearingMainBusySkipCount = 0;
     private long hearingMainBusyBypassLogMs = 0L;
+    private long hearingLastLoopbackStatusLogMs = 0L;
+    private long hearingLastSeAtMs = 0L;
+    private String hearingLastSeKind = "";
     private long pendingMergeStartedAtMs = 0L;
     private final StringBuilder autoDetectProbeBuffer = new StringBuilder();
     private final java.util.ArrayDeque<AutoDetectVote> autoDetectVotes = new java.util.ArrayDeque<>();
@@ -215,6 +220,10 @@ public class HearingFrame extends JFrame {
             }
             cleanup();
         } catch (Throwable ignore) {}
+    }
+
+    public boolean isMonitoringActive() {
+        return running;
     }
 
     private void forceFullRepaint() {
@@ -459,7 +468,6 @@ public class HearingFrame extends JFrame {
         repaint();
         pack();
         forceFullRepaint();
-        ensureOverlayVisible();
 
         int minW = Math.max(computedWindowWidth(), getPreferredSize().width);
         int minH = Math.max(getHeight(), getPreferredSize().height);
@@ -840,6 +848,9 @@ public class HearingFrame extends JFrame {
         }
         persistVisibleState(true);
         setVisible(true);
+        if (toggle == null || !toggle.isSelected()) {
+            hideOverlay();
+        }
         toFront();
         requestFocus();
     }
@@ -1096,6 +1107,7 @@ public class HearingFrame extends JFrame {
     private void stopMonitor(boolean updateToggleUi) {
         intentionalStop = true;  // ★crash handler抑制
         running = false;
+        host.syncCompanionDesktopAudioRouteAsync();
         hearingPrefilterState.reset();
         stopWasapiProc(); // ★WASAPI ps1 を確実に止める
 
@@ -1157,6 +1169,9 @@ public class HearingFrame extends JFrame {
             resetAutoDetectState("stop");
             hearingNoiseFloorRms = 120.0;
             hearingVoiceHoldChunks = 0;
+            hearingLastLoopbackStatusLogMs = 0L;
+            hearingLastSeAtMs = 0L;
+            hearingLastSeKind = "";
             hearingPrefilterState.reset();
 
             // ★ここが肝：startMonitor() 経由の stop では toggle を触らない
@@ -1297,6 +1312,11 @@ public class HearingFrame extends JFrame {
         if (partialHistory.size() >= maxSize) partialHistory.pollFirst();
         HearingHistoryItem added = new HearingHistoryItem(s, System.currentTimeMillis(), null, 0L);
         partialHistory.addLast(added);
+        Config.log("[Hearing][Loopback][Caption] accepted text=" + added.sourceText);
+        try {
+            host.noteDesktopAudioCaptionForCompanion("hearing_shared", added.sourceText);
+        } catch (Throwable ignore) {
+        }
         return added;
     }
     private void replaceLatestHistory(long sourceAtMs, String sourceText, String translatedText) {
@@ -2392,6 +2412,8 @@ public class HearingFrame extends JFrame {
             }
             floorSnapshot = hearingNoiseFloorRms;
         }
+        maybeLogLoopbackChunkStatus(voiceMetrics, voiceLike, floorSnapshot);
+        maybeDetectLoopbackSeEvent(voiceMetrics, floorSnapshot);
         if (!voiceLike) {
             Config.logDebug(String.format(
                     java.util.Locale.ROOT,
@@ -2427,6 +2449,105 @@ public class HearingFrame extends JFrame {
 
         int len = (lastPartial == null) ? 0 : lastPartial.length();
         Config.logDebug("[Hearing][REC] chunk ok (" + "LOOPBACK" + ") partialLen=" + len);
+    }
+
+    private void maybeLogLoopbackChunkStatus(AudioPrefilter.VoiceMetrics voiceMetrics, boolean voiceLike, double floorSnapshot) {
+        if (voiceMetrics == null) return;
+        long now = System.currentTimeMillis();
+        if ((now - hearingLastLoopbackStatusLogMs) < HEARING_LOOPBACK_STATUS_LOG_MS) {
+            return;
+        }
+        hearingLastLoopbackStatusLogMs = now;
+        Config.log(String.format(
+                java.util.Locale.ROOT,
+                "[Hearing][Loopback] chunk voiceLike=%s rms=%.1f zcr=%.3f vbr=%.3f peak=%d floor=%.1f running=%s",
+                voiceLike,
+                voiceMetrics.rms,
+                voiceMetrics.zcr,
+                voiceMetrics.voiceBandRatio,
+                voiceMetrics.peak,
+                floorSnapshot,
+                running
+        ));
+    }
+
+    private void maybeDetectLoopbackSeEvent(AudioPrefilter.VoiceMetrics voiceMetrics, double floorSnapshot) {
+        if (voiceMetrics == null) return;
+        String eventKind = classifyLoopbackSeEvent(voiceMetrics, floorSnapshot);
+        if (eventKind.isBlank()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if ((now - hearingLastSeAtMs) < HEARING_LOOPBACK_SE_COOLDOWN_MS
+                && eventKind.equals(hearingLastSeKind)) {
+            return;
+        }
+        hearingLastSeAtMs = now;
+        hearingLastSeKind = eventKind;
+        Config.log(String.format(
+                java.util.Locale.ROOT,
+                "[Hearing][Loopback][SE] detected kind=%s rms=%.1f zcr=%.3f vbr=%.3f peak=%d floor=%.1f",
+                eventKind,
+                voiceMetrics.rms,
+                voiceMetrics.zcr,
+                voiceMetrics.voiceBandRatio,
+                voiceMetrics.peak,
+                floorSnapshot
+        ));
+        try {
+            host.noteDesktopAudioEventForCompanion(
+                    "hearing_shared",
+                    eventKind,
+                    voiceMetrics.rms,
+                    voiceMetrics.zcr,
+                    voiceMetrics.voiceBandRatio,
+                    voiceMetrics.peak,
+                    floorSnapshot
+            );
+        } catch (Throwable ignore) {
+        }
+    }
+
+    private String classifyLoopbackSeEvent(AudioPrefilter.VoiceMetrics metrics, double floorSnapshot) {
+        double rms = metrics.rms;
+        double zcr = metrics.zcr;
+        double vbr = metrics.voiceBandRatio;
+        int peak = metrics.peak;
+        double floor = Math.max(40.0, floorSnapshot);
+
+        boolean impactLike = peak >= 18500
+                && rms >= Math.max(1500.0, floor * 6.0)
+                && vbr <= 0.22
+                && zcr <= 0.14;
+        if (impactLike) {
+            return "impact_like";
+        }
+
+        boolean crowdLike = peak >= 14000
+                && rms >= Math.max(1200.0, floor * 5.0)
+                && zcr >= 0.05
+                && zcr <= 0.26
+                && vbr >= 0.16
+                && vbr <= 0.46;
+        if (crowdLike) {
+            return "crowd_like";
+        }
+
+        boolean alarmLike = peak >= 12500
+                && rms >= Math.max(1000.0, floor * 4.5)
+                && zcr >= 0.16
+                && vbr >= 0.08
+                && vbr <= 0.34;
+        if (alarmLike) {
+            return "alarm_like";
+        }
+
+        boolean intenseNonVoice = peak >= 20000
+                && rms >= Math.max(1600.0, floor * 6.5);
+        if (intenseNonVoice) {
+            return "intense_nonvoice";
+        }
+        return "";
     }
 
     private void gentlyRecoverHearingNoiseFloor(double speechRms) {
@@ -3882,6 +4003,7 @@ public class HearingFrame extends JFrame {
 
         intentionalStop = false;  // ★新規開始時にリセット
         running = true;
+        host.syncCompanionDesktopAudioRouteAsync();
 
         // UIで選ばれてる表示名（LoopbackトークンでもOK）
         Object sel = (outputCombo != null) ? outputCombo.getSelectedItem() : null;
@@ -3933,6 +4055,7 @@ public class HearingFrame extends JFrame {
         } catch (Exception ex) {
             Config.logError("[Hearing] WASAPI helper start failed", ex);
             running = false;
+            host.syncCompanionDesktopAudioRouteAsync();
             return;
         }
 
@@ -4067,6 +4190,7 @@ public class HearingFrame extends JFrame {
                 }
             } finally {
                 if (!intentionalStop) running = false;
+                host.syncCompanionDesktopAudioRouteAsync();
                 try { if (p != null) p.destroyForcibly(); } catch (Exception ignore) {}
                 SwingUtilities.invokeLater(() -> {
                     if (meter != null) meter.setValue(0, -60.0, false, 1f, 1f, false);

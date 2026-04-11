@@ -188,6 +188,85 @@ public final class AudioPrefilter {
         return out;
     }
 
+    public static byte[] processForMultimodal(byte[] pcm16le, int bytes, int sampleRateHz) {
+        return processForMultimodal(pcm16le, bytes, sampleRateHz, Profile.NORMAL);
+    }
+
+    public static byte[] processForMultimodal(byte[] pcm16le,
+                                              int bytes,
+                                              int sampleRateHz,
+                                              String profileKey) {
+        return processForMultimodal(pcm16le, bytes, sampleRateHz, Profile.fromKey(profileKey));
+    }
+
+    public static byte[] processForMultimodal(byte[] pcm16le,
+                                              int bytes,
+                                              int sampleRateHz,
+                                              Profile profile) {
+        if (pcm16le == null || bytes <= 0) return pcm16le;
+        if (bytes < 4) {
+            byte[] tiny = new byte[bytes];
+            System.arraycopy(pcm16le, 0, tiny, 0, bytes);
+            return tiny;
+        }
+
+        Profile useProfile = (profile == null) ? Profile.NORMAL : profile;
+        if (useProfile == Profile.OFF) {
+            byte[] copy = new byte[bytes];
+            System.arraycopy(pcm16le, 0, copy, 0, bytes);
+            return copy;
+        }
+
+        int sampleRate = Math.max(8000, sampleRateHz);
+        byte[] out = new byte[bytes];
+        State state = new State();
+        int samples = bytes / 2;
+        double[] working = new double[samples];
+
+        double dt = 1.0 / sampleRate;
+        double hpCutoff = (useProfile == Profile.STRONG) ? 160.0 : 110.0;
+        double lpCutoff = (useProfile == Profile.STRONG)
+                ? Math.min(4200.0, sampleRate * 0.27)
+                : Math.min(5600.0, sampleRate * 0.36);
+        double preEmphasisAlpha = (useProfile == Profile.STRONG) ? 0.28 : 0.18;
+        double limitDrive = (useProfile == Profile.STRONG) ? 0.84 : 0.90;
+        double hpRc = 1.0 / (2.0 * Math.PI * hpCutoff);
+        double hpAlpha = hpRc / (hpRc + dt);
+        double lpRc = 1.0 / (2.0 * Math.PI * lpCutoff);
+        double lpAlpha = dt / (lpRc + dt);
+
+        double hpPrevX = 0.0;
+        double hpPrevY = 0.0;
+        double lpPrevY = 0.0;
+        double prePrevX = 0.0;
+
+        for (int i = 0; i < samples; i++) {
+            int offset = i * 2;
+            double x = readPcm16le(pcm16le, offset);
+            working[i] = applyHumNotches(x, sampleRate, state);
+        }
+        if (samples >= STRONG_SPECTRAL_FRAME_SIZE) {
+            working = applyStrongSpectralEnhance(working, sampleRate, state);
+        }
+
+        for (int i = 0; i < samples; i++) {
+            int offset = i * 2;
+            double x = working[i];
+            double hp = hpAlpha * (hpPrevY + x - hpPrevX);
+            double emphasized = hp - (preEmphasisAlpha * prePrevX);
+            prePrevX = hp;
+            hpPrevX = x;
+            hpPrevY = hp;
+            double y = lpPrevY + lpAlpha * (emphasized - lpPrevY);
+            lpPrevY = y;
+            int v = (int) Math.round(softLimit(y, limitDrive));
+            if (v > Short.MAX_VALUE) v = Short.MAX_VALUE;
+            if (v < Short.MIN_VALUE) v = Short.MIN_VALUE;
+            writePcm16le(out, offset, v);
+        }
+        return out;
+    }
+
     public static VoiceMetrics analyzeVoiceLike(byte[] pcm16le, int bytes, int sampleRateHz) {
         if (pcm16le == null || bytes < 4) {
             return new VoiceMetrics(0.0, 0.0, 0.0, 0);

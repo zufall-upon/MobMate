@@ -38,6 +38,7 @@ public class SpeakerProfile {
     private double threshold;
     private double initialThreshold;
     private double targetThreshold;
+    private transient Double sessionThresholdOverride;
     private int totalAccepted;
     private int totalRejected;
     // ★ADD: 連続REJECT救済カウンタ
@@ -124,7 +125,13 @@ public class SpeakerProfile {
 
     public int getEnrollCount() { return enrollCount; }
     public int getRequiredSamples() { return requiredSamples; }
-    public double getThreshold() { return threshold; }
+    public synchronized double getThreshold() {
+        return sessionThresholdOverride != null ? sessionThresholdOverride : threshold;
+    }
+
+    public synchronized void setSessionThresholdOverride(Double override) {
+        this.sessionThresholdOverride = override;
+    }
     public int getTotalAccepted() { return totalAccepted; }
     public int getTotalRejected() { return totalRejected; }
 
@@ -560,32 +567,33 @@ public class SpeakerProfile {
         double score = similarity(voiced);
         int voicedSamples = voiced.length / 2;
         double voicedMs = (voicedSamples * 1000.0) / SAMPLE_RATE;
+        double effectiveThreshold = getThreshold();
         if (effectiveRms < MIN_RMS_FOR_SPEAKER_CHECK) {
             boolean lowEnergyPass = false;
             if (effectiveRms >= SOFT_MIN_RMS_FOR_SPEAKER_PASS
                     && voicedMs >= 700.0
-                    && score >= (threshold + 0.05)) {
+                    && score >= (effectiveThreshold + 0.05)) {
                 lowEnergyPass = true;
             } else if (effectiveRms >= HARD_MIN_RMS_FOR_SPEAKER_PASS
                     && voicedMs >= 1000.0
-                    && score >= (threshold + LOW_ENERGY_SCORE_MARGIN)) {
+                    && score >= (effectiveThreshold + LOW_ENERGY_SCORE_MARGIN)) {
                 lowEnergyPass = true;
             } else if (effectiveRms >= SHORT_PHRASE_MIN_RMS_FOR_SPEAKER_PASS
                     && voicedMs >= 1200.0
-                    && score >= (threshold + SHORT_PHRASE_SCORE_MARGIN)) {
+                    && score >= (effectiveThreshold + SHORT_PHRASE_SCORE_MARGIN)) {
                 lowEnergyPass = true;
             }
             if (!lowEnergyPass) {
                 Config.logDebug(String.format("★Speaker: ENERGY_REJECT score=%.3f thr=%.3f rms=%.1f window=%.1f voicedMs=%.0f < %.1f",
-                        score, threshold, rms, windowRms, voicedMs, MIN_RMS_FOR_SPEAKER_CHECK));
+                        score, effectiveThreshold, rms, windowRms, voicedMs, MIN_RMS_FOR_SPEAKER_CHECK));
                 totalRejected++;
                 return false;
             }
             consecutiveRejects = 0;
             Config.logDebug(String.format("★Speaker: LOW_ENERGY_PASS score=%.3f thr=%.3f rms=%.1f window=%.1f voicedMs=%.0f",
-                    score, threshold, rms, windowRms, voicedMs));
+                    score, effectiveThreshold, rms, windowRms, voicedMs));
         }
-        boolean match = score >= threshold;
+        boolean match = score >= effectiveThreshold;
 
         if (!match) {
             totalRejected++;
@@ -604,7 +612,7 @@ public class SpeakerProfile {
         }
 
         Config.logDebug(String.format("★Speaker: score=%.3f thr=%.3f spread=%.3f rms=%.1f window=%.1f %s (ok=%d ng=%d)",
-                score, threshold, enrollmentSpread, rms, windowRms, match ? "PASS" : "REJECT",
+                score, effectiveThreshold, enrollmentSpread, rms, windowRms, match ? "PASS" : "REJECT",
                 totalAccepted, totalRejected));
         return match;
     }

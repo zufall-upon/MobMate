@@ -4,8 +4,10 @@ import java.util.List;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Set;
 
 final class PiperPlusCatalog {
+    private static final Set<String> PIPER_TEXT_LANGS = Set.of("ja", "en", "zh", "es", "fr", "pt");
 
     private static final List<String> PICKER_PRIMARY_ORDER = List.of(
             "css10-ja-6lang-ja",
@@ -34,7 +36,7 @@ final class PiperPlusCatalog {
                 new Entry(
                         "css10-ja-6lang-ja",
                         "css10-ja-6lang-fp16",
-                        "Piper+ CSS10 6lang - Japanese",
+                        "piper-plus CSS10 6lang - Japanese",
                         "ja",
                         "ja-en-zh-es-fr-pt",
                         "Multilingual CSS10 voice routed through the shared 6-language model. Natural model-side intonation is expected, but fine-grained prosody transfer is not guaranteed.",
@@ -47,7 +49,7 @@ final class PiperPlusCatalog {
                 new Entry(
                         "css10-ja-6lang-en",
                         "css10-ja-6lang-fp16",
-                        "Piper+ CSS10 6lang - English",
+                        "piper-plus CSS10 6lang - English",
                         "en",
                         "en",
                         "Multilingual CSS10 voice routed through the shared 6-language model. English path is useful for dependency-light cross-language playback, though voice identity stays shared with the Japanese base model.",
@@ -60,7 +62,7 @@ final class PiperPlusCatalog {
                 new Entry(
                         "css10-ja-6lang-zh",
                         "css10-ja-6lang-fp16",
-                        "Piper+ CSS10 6lang - Chinese",
+                        "piper-plus CSS10 6lang - Chinese",
                         "zh",
                         "zh",
                         "Multilingual CSS10 voice routed through the shared 6-language model. Chinese text mode uses the same shared multilingual frontend path.",
@@ -73,7 +75,7 @@ final class PiperPlusCatalog {
                 new Entry(
                         "css10-ja-6lang-es",
                         "css10-ja-6lang-fp16",
-                        "Piper+ CSS10 6lang - Spanish",
+                        "piper-plus CSS10 6lang - Spanish",
                         "es",
                         "es",
                         "Multilingual CSS10 voice routed through the shared 6-language model. Spanish text mode uses the same shared multilingual frontend path.",
@@ -86,7 +88,7 @@ final class PiperPlusCatalog {
                 new Entry(
                         "css10-ja-6lang-fr",
                         "css10-ja-6lang-fp16",
-                        "Piper+ CSS10 6lang - French",
+                        "piper-plus CSS10 6lang - French",
                         "fr",
                         "fr",
                         "Multilingual CSS10 voice routed through the shared 6-language model. French text mode uses the same shared multilingual frontend path.",
@@ -99,7 +101,7 @@ final class PiperPlusCatalog {
                 new Entry(
                         "css10-ja-6lang-pt",
                         "css10-ja-6lang-fp16",
-                        "Piper+ CSS10 6lang - Portuguese",
+                        "piper-plus CSS10 6lang - Portuguese",
                         "pt",
                         "pt",
                         "Multilingual CSS10 voice routed through the shared 6-language model. Portuguese text mode uses the same shared multilingual frontend path.",
@@ -112,7 +114,7 @@ final class PiperPlusCatalog {
                 new Entry(
                         "rhasspy-fr-fr-gilles-low",
                         "rhasspy-fr-fr-gilles-low",
-                        "Piper+ French - Gilles",
+                        "piper-plus French - Gilles",
                         "fr",
                         "fr",
                         "Curated default French voice based on Rhasspy Piper voices. Dataset license verified as CC0 from the model card on 2026-04-01.",
@@ -125,7 +127,7 @@ final class PiperPlusCatalog {
                 new Entry(
                         "rhasspy-pt-br-cadu-medium",
                         "rhasspy-pt-br-cadu-medium",
-                        "Piper+ Portuguese - Cadu",
+                        "piper-plus Portuguese - Cadu",
                         "pt",
                         "pt",
                         "Curated default Portuguese voice based on Rhasspy Piper voices. Dataset license verified as CC0 from the model card on 2026-04-01.",
@@ -235,6 +237,25 @@ final class PiperPlusCatalog {
         return id.isBlank() ? null : findById(id);
     }
 
+    static Entry preferredInstalledChineseEntry() {
+        Entry preferred = findById("huayan");
+        if (preferred != null && "zh".equalsIgnoreCase(preferred.language()) && PiperPlusModelManager.isInstalled(preferred)) {
+            return preferred;
+        }
+        preferred = findById("css10-ja-6lang-zh");
+        if (preferred != null && "zh".equalsIgnoreCase(preferred.language()) && PiperPlusModelManager.isInstalled(preferred)) {
+            return preferred;
+        }
+        for (Entry entry : entries()) {
+            if (!"zh".equalsIgnoreCase(entry.language())) continue;
+            if (!PiperPlusModelManager.isInstalled(entry)) continue;
+            String id = entry.id().toLowerCase(Locale.ROOT);
+            if ("xiao_ya".equals(id)) continue;
+            return entry;
+        }
+        return null;
+    }
+
     static String normalizeOutputLanguage(String value) {
         if (value == null || value.isBlank()) return "";
         String normalized = value.trim().toLowerCase(Locale.ROOT).replace('_', '-');
@@ -245,6 +266,31 @@ final class PiperPlusCatalog {
         if (normalized.startsWith("fr")) return "fr";
         if (normalized.startsWith("pt")) return "pt";
         if (normalized.startsWith("ko")) return "ko";
+        return normalized;
+    }
+
+    static String canonicalizeCliTextLanguageTag(String value) {
+        if (value == null || value.isBlank()) return "";
+        String normalized = value.trim().toLowerCase(Locale.ROOT).replace('_', '-');
+        String[] parts = normalized.split("-");
+        boolean looksCombined = parts.length > 1;
+        if (looksCombined) {
+            for (String part : parts) {
+                if (!PIPER_TEXT_LANGS.contains(part)) {
+                    looksCombined = false;
+                    break;
+                }
+            }
+        }
+        if (looksCombined) {
+            return String.join("-", parts);
+        }
+        if (normalized.startsWith("zh")) return "zh";
+        if (normalized.startsWith("fr")) return "fr";
+        if (normalized.startsWith("pt")) return "pt";
+        if (normalized.startsWith("ja")) return "ja";
+        if (normalized.startsWith("en")) return "en";
+        if (normalized.startsWith("es")) return "es";
         return normalized;
     }
 
@@ -282,8 +328,8 @@ final class PiperPlusCatalog {
         }
 
         String cliTextLanguage() {
-            if (textModeLanguageTag == null || textModeLanguageTag.isBlank()) return language;
-            return textModeLanguageTag;
+            String raw = (textModeLanguageTag == null || textModeLanguageTag.isBlank()) ? language : textModeLanguageTag;
+            return canonicalizeCliTextLanguageTag(raw);
         }
 
         boolean isDownloadable() {

@@ -3,6 +3,7 @@ package whisper;
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OrtEnvironment;
 import ai.onnxruntime.OrtException;
+import ai.onnxruntime.OrtLoggingLevel;
 import ai.onnxruntime.OrtSession;
 import org.json.JSONObject;
 
@@ -97,19 +98,28 @@ class TranslatorCore {
         if (loadError != null) return false;
         try {
             if (exeDir != null) {
+                System.setProperty("onnxruntime.native.path", exeDir.getAbsolutePath());
                 String[] preload = {
+                        "DirectML.dll",
+                        "onnxruntime_providers_shared.dll",
                         "libiomp5md.dll",
                         "libgcc_s_seh-1.dll",
                         "libstdc++-6.dll",
                         "libgomp-1.dll",
                         "libwinpthread-1.dll",
                         "onnxruntime.dll",
+                        "onnxruntime4j_jni.dll",
                         "translatorcore.dll"
                 };
                 for (String name : preload) {
                     File dll = new File(exeDir, name);
                     if (!dll.isFile()) continue;
                     System.load(dll.getAbsolutePath());
+                    if ("onnxruntime.dll".equalsIgnoreCase(name)) {
+                        System.setProperty("onnxruntime.native.onnxruntime.skip", "true");
+                    } else if ("onnxruntime4j_jni.dll".equalsIgnoreCase(name)) {
+                        System.setProperty("onnxruntime.native.onnxruntime4j_jni.skip", "true");
+                    }
                     Config.log("[Translator] Force-loaded " + name + " from: " + dll);
                 }
             }
@@ -282,41 +292,55 @@ class OrtTranslator implements AutoCloseable {
 
     private static final int MAX_NEW_TOKENS        = 32;
     private static final int MAX_REPEAT_TOKEN_STREAK = 8;
+    private static final int M2M100_LAYER_COUNT = 12;
 
     private final int numThreads;
+    private final Object runLock = new Object();
     private OrtEnvironment  env;
     private OrtSession      encoderSession;
     private OrtSession      decoderSession;
+    private OrtSession      decoderWithPastSession;
     private M2M100Tokenizer tokenizer;       // m2m100用
     private Mt5Tokenizer    mt5Tokenizer;    // ★mt5用
     private boolean         isMt5 = false;  // ★モデルタイプフラグ
+    private boolean         useDirectML = false;
+    private boolean         useDecoderWithPast = true;
 
     OrtTranslator(int numThreads) { this.numThreads = numThreads; }
 
     public boolean load(File modelDir, File exeDir) {
         try {
             env = OrtEnvironment.getEnvironment();
-            OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
-            if (numThreads > 0) opts.setIntraOpNumThreads(numThreads);
-
-            // ★spiece.model の有無で mt5 か判定
             isMt5 = new File(modelDir, "spiece.model").isFile();
-
-            // ★quantizedサフィックス付きファイルを自動選択
             String encFile = pickOnnxFile(modelDir, "encoder_model");
             String decFile = pickOnnxFile(modelDir, "decoder_model");
+            String decWithPastFile = isMt5 ? null : pickOptionalOnnxFile(modelDir, "decoder_with_past_model");
+            useDecoderWithPast = !"false".equalsIgnoreCase(
+                    System.getProperty("mobmate.decoder.withpast", "true"));
+            boolean tryDirectML = shouldTryDirectML();
 
-            encoderSession = env.createSession(
-                    new File(modelDir, encFile).getAbsolutePath(), opts);
-            decoderSession = env.createSession(
-                    new File(modelDir, decFile).getAbsolutePath(), opts);
+            if (tryDirectML) {
+                if (!createSessions(modelDir, encFile, decFile, decWithPastFile, true)) {
+                    closeSessions();
+                    if (!createSessions(modelDir, encFile, decFile, decWithPastFile, false)) {
+                        return false;
+                    }
+                }
+            } else {
+                if (!createSessions(modelDir, encFile, decFile, decWithPastFile, false)) {
+                    return false;
+                }
+            }
 
             if (isMt5) {
                 mt5Tokenizer = new Mt5Tokenizer(modelDir);
-                Config.log("[OrtTranslator] mt5 loaded: " + modelDir);
+                Config.log("[OrtTranslator] mt5 loaded: " + modelDir
+                        + " directml=" + useDirectML);
             } else {
                 tokenizer = new M2M100Tokenizer(modelDir);
-                Config.log("[OrtTranslator] m2m100 loaded: " + modelDir);
+                Config.log("[OrtTranslator] m2m100 loaded: " + modelDir
+                        + " decoder_with_past=" + (decoderWithPastSession != null && useDecoderWithPast)
+                        + " directml=" + useDirectML);
             }
             return true;
         } catch (Throwable e) {
@@ -328,9 +352,17 @@ class OrtTranslator implements AutoCloseable {
     /** 振り分けエントリーポイント */
     public String translate(String text, String srcLang, String tgtLang)
             throws OrtException {
-        return isMt5
-                ? translateMt5(text, srcLang)
-                : translateM2M100(text, srcLang, tgtLang);
+        if (useDirectML) {
+            synchronized (runLock) {
+                return translateInternal(text, srcLang, tgtLang);
+            }
+        }
+        return translateInternal(text, srcLang, tgtLang);
+    }
+
+    private String translateInternal(String text, String srcLang, String tgtLang)
+            throws OrtException {
+        return isMt5 ? translateMt5(text, srcLang) : translateM2M100(text, srcLang, tgtLang);
     }
 
     // ---- m2m100翻訳（既存ロジックそのまま） ----
@@ -356,22 +388,16 @@ class OrtTranslator implements AutoCloseable {
         generated.add(tokenizer.getEosId()); // decoder_start=2
         long prevTokenId = Long.MIN_VALUE;
         int repeatTokenStreak = 0;
+        DecoderStep initialStep = runM2M100Decoder(toArray(generated), attnMask, encoderHidden, true, null);
+        generated.add(tgtLangId); // forced_bos
+        M2M100Past past = initialStep.past();
 
-        for (int step = 0; step < MAX_NEW_TOKENS; step++) {
-            long nextTokenId;
-            try (OnnxTensor decTensor    = OnnxTensor.createTensor(env,
-                    new long[][]{toArray(generated)});
-                 OnnxTensor encHidTensor = OnnxTensor.createTensor(env, encoderHidden);
-                 OnnxTensor encAttTensor = OnnxTensor.createTensor(env,
-                         new long[][]{attnMask});
-                 OrtSession.Result decOut = decoderSession.run(Map.of(
-                         "input_ids",              decTensor,
-                         "encoder_hidden_states",  encHidTensor,
-                         "encoder_attention_mask", encAttTensor))) {
-                float[][][] logits = (float[][][]) decOut.get("logits").get().getValue();
-                nextTokenId = argmax(logits[0][logits[0].length - 1]);
-            }
-            if (step == 0) { generated.add(tgtLangId); continue; } // forced_bos
+        for (int step = 1; step < MAX_NEW_TOKENS; step++) {
+            DecoderStep decoderStep = (useDecoderWithPast && decoderWithPastSession != null && past != null)
+                    ? runM2M100DecoderWithPast(generated.get(generated.size() - 1), attnMask, past)
+                    : runM2M100Decoder(toArray(generated), attnMask, encoderHidden, false, past);
+            long nextTokenId = decoderStep.nextTokenId();
+            past = decoderStep.past();
             if (nextTokenId == tokenizer.getEosId()) break;
             if (nextTokenId == prevTokenId) repeatTokenStreak++;
             else { repeatTokenStreak = 1; prevTokenId = nextTokenId; }
@@ -447,14 +473,277 @@ class OrtTranslator implements AutoCloseable {
     public void close() {
         try { if (mt5Tokenizer  != null) mt5Tokenizer.close();  } catch (Exception ignore) {}
         try { if (tokenizer     != null) tokenizer.close();     } catch (Exception ignore) {}
+        closeSessions();
+    }
+
+    private boolean shouldTryDirectML() {
+        return Boolean.parseBoolean(
+                System.getProperty("mobmate.translator.directml", "false"));
+    }
+
+    private OrtLoggingLevel resolveSessionLogLevel() {
+        String raw = System.getProperty("mobmate.translator.ort.loglevel", "").trim();
+        if (raw.isEmpty()) return null;
+        String normalized = raw.toUpperCase(Locale.ROOT);
+        if (!normalized.startsWith("ORT_LOGGING_LEVEL_")) {
+            normalized = "ORT_LOGGING_LEVEL_" + normalized;
+        }
+        try {
+            return OrtLoggingLevel.valueOf(normalized);
+        } catch (IllegalArgumentException e) {
+            Config.log("[OrtTranslator] Invalid ORT log level '" + raw + "', disabling session log override");
+            return null;
+        }
+    }
+
+    private int resolveSessionLogVerbosityLevel() {
+        String raw = System.getProperty("mobmate.translator.ort.logverbosity", "1").trim();
+        try {
+            return Integer.parseInt(raw);
+        } catch (NumberFormatException e) {
+            Config.log("[OrtTranslator] Invalid ORT log verbosity '" + raw + "', falling back to 1");
+            return 1;
+        }
+    }
+
+    private File resolveOptionalDirectory(String propertyName) {
+        String raw = System.getProperty(propertyName, "").trim();
+        if (raw.isEmpty()) return null;
+        File dir = new File(raw);
+        if (!dir.exists() && !dir.mkdirs()) {
+            Config.log("[OrtTranslator] Failed to create directory for " + propertyName + ": " + dir);
+            return null;
+        }
+        return dir;
+    }
+
+    private OrtSession.SessionOptions newSessionOptions(String sessionTag, boolean preferDirectML)
+            throws OrtException {
+        OrtSession.SessionOptions opts = new OrtSession.SessionOptions();
+        if (numThreads > 0) opts.setIntraOpNumThreads(numThreads);
+
+        OrtLoggingLevel sessionLogLevel = resolveSessionLogLevel();
+        if (sessionLogLevel != null) {
+            int verbosity = resolveSessionLogVerbosityLevel();
+            opts.setLoggerId("MobMate-" + sessionTag);
+            opts.setSessionLogLevel(sessionLogLevel);
+            opts.setSessionLogVerbosityLevel(verbosity);
+            Config.log("[OrtTranslator] ORT session logging enabled: session="
+                    + sessionTag + " level=" + sessionLogLevel + " verbosity=" + verbosity);
+        }
+
+        File profileDir = resolveOptionalDirectory("mobmate.translator.ort.profileDir");
+        if (profileDir != null) {
+            String prefix = new File(profileDir, sessionTag + "_").getAbsolutePath();
+            opts.enableProfiling(prefix);
+            Config.log("[OrtTranslator] ORT profiling enabled: session="
+                    + sessionTag + " prefix=" + prefix);
+        }
+
+        File optimizedDir = resolveOptionalDirectory("mobmate.translator.ort.optimizedDir");
+        if (optimizedDir != null) {
+            String optimizedPath = new File(optimizedDir, sessionTag + ".onnx").getAbsolutePath();
+            opts.setOptimizedModelFilePath(optimizedPath);
+            Config.log("[OrtTranslator] ORT optimized model dump enabled: session="
+                    + sessionTag + " path=" + optimizedPath);
+        }
+
+        if (preferDirectML) {
+            OrtSession.SessionOptions.OptLevel directMlOptLevel = resolveDirectMlOptLevel();
+            opts.setOptimizationLevel(directMlOptLevel);
+            opts.setMemoryPatternOptimization(false);
+            opts.setExecutionMode(OrtSession.SessionOptions.ExecutionMode.SEQUENTIAL);
+            opts.addDirectML(0);
+            Config.log("[OrtTranslator] DirectML requested for translator session "
+                    + sessionTag + " opt=" + directMlOptLevel);
+        }
+        return opts;
+    }
+
+    private static void closeSessionOptions(OrtSession.SessionOptions opts) {
+        if (opts == null) return;
+        try { opts.close(); } catch (Exception ignore) {}
+    }
+
+    private OrtSession.SessionOptions.OptLevel resolveDirectMlOptLevel() {
+        String raw = System.getProperty("mobmate.translator.directml.opt", "NO_OPT");
+        try {
+            return OrtSession.SessionOptions.OptLevel.valueOf(raw.trim().toUpperCase(Locale.ROOT));
+        } catch (IllegalArgumentException e) {
+            Config.log("[OrtTranslator] Invalid DirectML opt level '" + raw
+                    + "', falling back to NO_OPT");
+            return OrtSession.SessionOptions.OptLevel.NO_OPT;
+        }
+    }
+
+    private boolean createSessions(File modelDir, String encFile, String decFile,
+                                   String decWithPastFile, boolean preferDirectML) {
+        closeSessions();
+        useDirectML = false;
+        OrtSession.SessionOptions encoderOpts = null;
+        OrtSession.SessionOptions decoderOpts = null;
+        OrtSession.SessionOptions decoderWithPastOpts = null;
+        try {
+            if (preferDirectML) {
+                try {
+                    encoderOpts = newSessionOptions("encoder", true);
+                    decoderOpts = newSessionOptions("decoder", true);
+                    if (decWithPastFile != null) {
+                        decoderWithPastOpts = newSessionOptions("decoder_with_past", true);
+                    }
+                    useDirectML = true;
+                } catch (Throwable t) {
+                    Config.log("[OrtTranslator] DirectML unavailable, falling back to CPU: "
+                            + t.getClass().getSimpleName() + ": " + t.getMessage());
+                    closeSessionOptions(decoderWithPastOpts);
+                    closeSessionOptions(decoderOpts);
+                    closeSessionOptions(encoderOpts);
+                    encoderOpts = null;
+                    decoderOpts = null;
+                    decoderWithPastOpts = null;
+                }
+            }
+            if (encoderOpts == null || decoderOpts == null) {
+                encoderOpts = newSessionOptions("encoder", false);
+                decoderOpts = newSessionOptions("decoder", false);
+                if (decWithPastFile != null) {
+                    decoderWithPastOpts = newSessionOptions("decoder_with_past", false);
+                }
+                useDirectML = false;
+            }
+            encoderSession = env.createSession(new File(modelDir, encFile).getAbsolutePath(), encoderOpts);
+            decoderSession = env.createSession(new File(modelDir, decFile).getAbsolutePath(), decoderOpts);
+            if (decWithPastFile != null) {
+                decoderWithPastSession = env.createSession(
+                        new File(modelDir, decWithPastFile).getAbsolutePath(), decoderWithPastOpts);
+            }
+            return true;
+        } catch (Throwable t) {
+            Config.log("[OrtTranslator] session init failed"
+                    + (preferDirectML ? " with DirectML" : " on CPU")
+                    + ": " + t.getClass().getSimpleName() + ": " + t.getMessage());
+            closeSessions();
+            useDirectML = false;
+            return false;
+        } finally {
+            closeSessionOptions(decoderWithPastOpts);
+            closeSessionOptions(decoderOpts);
+            closeSessionOptions(encoderOpts);
+        }
+    }
+
+    private void closeSessions() {
+        try { if (decoderWithPastSession != null) decoderWithPastSession.close(); } catch (Exception ignore) {}
         try { if (decoderSession!= null) decoderSession.close();} catch (Exception ignore) {}
         try { if (encoderSession!= null) encoderSession.close();} catch (Exception ignore) {}
+        decoderWithPastSession = null;
+        decoderSession = null;
+        encoderSession = null;
+    }
+
+    private DecoderStep runM2M100Decoder(long[] inputIds, long[] attnMask, float[][][] encoderHidden,
+                                         boolean includeEncoderPast, M2M100Past existingPast)
+            throws OrtException {
+        List<OnnxTensor> tensors = new ArrayList<>();
+        try {
+            OnnxTensor decTensor = OnnxTensor.createTensor(env, new long[][]{inputIds});
+            OnnxTensor encHidTensor = OnnxTensor.createTensor(env, encoderHidden);
+            OnnxTensor encAttTensor = OnnxTensor.createTensor(env, new long[][]{attnMask});
+            tensors.add(decTensor);
+            tensors.add(encHidTensor);
+            tensors.add(encAttTensor);
+
+            Map<String, OnnxTensor> inputs = new LinkedHashMap<>();
+            inputs.put("input_ids", decTensor);
+            inputs.put("encoder_hidden_states", encHidTensor);
+            inputs.put("encoder_attention_mask", encAttTensor);
+
+            try (OrtSession.Result decOut = decoderSession.run(inputs)) {
+                float[][][] logits = (float[][][]) decOut.get("logits").orElseThrow().getValue();
+                long nextTokenId = argmax(logits[0][logits[0].length - 1]);
+                M2M100Past past = extractM2M100Past(decOut, includeEncoderPast, existingPast);
+                return new DecoderStep(nextTokenId, past);
+            }
+        } finally {
+            closeTensors(tensors);
+        }
+    }
+
+    private DecoderStep runM2M100DecoderWithPast(long inputId, long[] attnMask, M2M100Past past)
+            throws OrtException {
+        List<OnnxTensor> tensors = new ArrayList<>();
+        try {
+            Map<String, OnnxTensor> inputs = new LinkedHashMap<>();
+            OnnxTensor decTensor = OnnxTensor.createTensor(env, new long[][]{{inputId}});
+            OnnxTensor encAttTensor = OnnxTensor.createTensor(env, new long[][]{attnMask});
+            tensors.add(decTensor);
+            tensors.add(encAttTensor);
+            inputs.put("input_ids", decTensor);
+            inputs.put("encoder_attention_mask", encAttTensor);
+
+            for (int i = 0; i < M2M100_LAYER_COUNT; i++) {
+                OnnxTensor decoderKey = OnnxTensor.createTensor(env, past.decoderKeys()[i]);
+                OnnxTensor decoderValue = OnnxTensor.createTensor(env, past.decoderValues()[i]);
+                OnnxTensor encoderKey = OnnxTensor.createTensor(env, past.encoderKeys()[i]);
+                OnnxTensor encoderValue = OnnxTensor.createTensor(env, past.encoderValues()[i]);
+                tensors.add(decoderKey);
+                tensors.add(decoderValue);
+                tensors.add(encoderKey);
+                tensors.add(encoderValue);
+                inputs.put("past_key_values." + i + ".decoder.key", decoderKey);
+                inputs.put("past_key_values." + i + ".decoder.value", decoderValue);
+                inputs.put("past_key_values." + i + ".encoder.key", encoderKey);
+                inputs.put("past_key_values." + i + ".encoder.value", encoderValue);
+            }
+
+            try (OrtSession.Result decOut = decoderWithPastSession.run(inputs)) {
+                float[][][] logits = (float[][][]) decOut.get("logits").orElseThrow().getValue();
+                long nextTokenId = argmax(logits[0][logits[0].length - 1]);
+                M2M100Past nextPast = extractM2M100Past(decOut, false, past);
+                return new DecoderStep(nextTokenId, nextPast);
+            }
+        } finally {
+            closeTensors(tensors);
+        }
+    }
+
+    private static M2M100Past extractM2M100Past(OrtSession.Result result, boolean includeEncoderPast,
+                                                M2M100Past existingPast) throws OrtException {
+        Object[] encoderKeys = (existingPast != null && !includeEncoderPast)
+                ? existingPast.encoderKeys().clone() : new Object[M2M100_LAYER_COUNT];
+        Object[] encoderValues = (existingPast != null && !includeEncoderPast)
+                ? existingPast.encoderValues().clone() : new Object[M2M100_LAYER_COUNT];
+        Object[] decoderKeys = new Object[M2M100_LAYER_COUNT];
+        Object[] decoderValues = new Object[M2M100_LAYER_COUNT];
+
+        for (int i = 0; i < M2M100_LAYER_COUNT; i++) {
+            decoderKeys[i] = result.get("present." + i + ".decoder.key").orElseThrow().getValue();
+            decoderValues[i] = result.get("present." + i + ".decoder.value").orElseThrow().getValue();
+            if (includeEncoderPast) {
+                encoderKeys[i] = result.get("present." + i + ".encoder.key").orElseThrow().getValue();
+                encoderValues[i] = result.get("present." + i + ".encoder.value").orElseThrow().getValue();
+            }
+        }
+        return new M2M100Past(encoderKeys, encoderValues, decoderKeys, decoderValues);
+    }
+
+    private static void closeTensors(List<OnnxTensor> tensors) {
+        for (OnnxTensor tensor : tensors) {
+            try { tensor.close(); } catch (Exception ignore) {}
+        }
     }
 
     // ---- utils ----
     private static String pickOnnxFile(File dir, String base) {
         String q = base + "_quantized.onnx";
         return new File(dir, q).exists() ? q : base + ".onnx";
+    }
+
+    private static String pickOptionalOnnxFile(File dir, String base) {
+        String q = base + "_quantized.onnx";
+        if (new File(dir, q).exists()) return q;
+        String plain = base + ".onnx";
+        return new File(dir, plain).exists() ? plain : null;
     }
 
     private static long[] ones(int len) {
@@ -545,6 +834,10 @@ class OrtTranslator implements AutoCloseable {
         if (isClearlyBrokenTranslation(cleaned)) return original;
         return cleaned;
     }
+
+    private record DecoderStep(long nextTokenId, M2M100Past past) {}
+    private record M2M100Past(Object[] encoderKeys, Object[] encoderValues,
+                              Object[] decoderKeys, Object[] decoderValues) {}
 }
 
 // ============================================================

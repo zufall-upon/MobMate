@@ -176,15 +176,14 @@ final class PiperPlusModelManager {
             }
 
             JSONObject config = new JSONObject(Files.readString(configPath));
-            JSONObject language = config.optJSONObject("language");
-            String configLang = language != null ? language.optString("code", "") : "";
+            String configLang = inferConfigLanguage(config);
 
             String id = propOr(props, "id", dir.getFileName().toString());
             String installId = propOr(props, "install_id", dir.getFileName().toString());
-            String displayName = propOr(props, "display_name", "Piper+ Local - " + dir.getFileName());
+            String displayName = propOr(props, "display_name", "piper-plus Local - " + dir.getFileName());
             String lang = normalizeModelLanguage(propOr(props, "language", configLang));
             String textModeLanguageTag = resolveLocalTextModeLanguageTag(props, config, lang);
-            String summary = "User-provided local Piper+ model. License and quality depend on the files you placed here.";
+            String summary = "User-provided local piper-plus model. License and quality depend on the files you placed here.";
             String license = propOr(props, "license", "user-provided");
             String sourcePageUrl = propOr(props, "source_page_url", "");
             String modelUrl = propOr(props, "model_url", modelPath.getFileName().toString());
@@ -226,7 +225,7 @@ final class PiperPlusModelManager {
                 StandardOpenOption.CREATE,
                 StandardOpenOption.TRUNCATE_EXISTING,
                 StandardOpenOption.WRITE)) {
-            props.store(out, "MobMate Piper+ model metadata");
+            props.store(out, "MobMate piper-plus model metadata");
         }
     }
 
@@ -279,12 +278,18 @@ final class PiperPlusModelManager {
         if (lang == null || lang.isBlank()) return "ja";
         String trimmed = lang.trim().toLowerCase();
         if ("multilingual".equals(trimmed)) return "ja";
+        if (trimmed.startsWith("zh")) return "zh";
+        if (trimmed.startsWith("ja")) return "ja";
+        if (trimmed.startsWith("en")) return "en";
+        if (trimmed.startsWith("es")) return "es";
+        if (trimmed.startsWith("fr")) return "fr";
+        if (trimmed.startsWith("pt")) return "pt";
         return trimmed;
     }
 
     private static String resolveLocalTextModeLanguageTag(Properties props, JSONObject config, String lang) {
         String configured = propOr(props, "text_mode_language_tag", "");
-        String normalizedConfigured = configured == null ? "" : configured.trim().toLowerCase();
+        String normalizedConfigured = normalizeCliLanguageTag(configured);
         String inferredCombined = inferCombinedLanguageTag(config);
         if (!inferredCombined.isBlank()) {
             // User-provided local multilingual models often arrive with a simple "ja" fallback in metadata.
@@ -294,7 +299,41 @@ final class PiperPlusModelManager {
             }
         }
         if (!normalizedConfigured.isBlank()) return normalizedConfigured;
-        return lang;
+        String inferredSingle = inferSingleLanguageTextTag(config);
+        if (!inferredSingle.isBlank()) return inferredSingle;
+        return normalizeCliLanguageTag(lang);
+    }
+
+    private static String inferConfigLanguage(JSONObject config) {
+        if (config == null) return "";
+        JSONObject language = config.optJSONObject("language");
+        String configLang = language != null ? language.optString("code", "") : "";
+        if (!configLang.isBlank()) return normalizeModelLanguage(configLang);
+
+        JSONObject espeak = config.optJSONObject("espeak");
+        String espeakVoice = espeak != null ? espeak.optString("voice", "") : "";
+        if (!espeakVoice.isBlank()) return normalizeModelLanguage(espeakVoice);
+
+        String phonemeType = config.optString("phoneme_type", "").trim().toLowerCase();
+        if ("pinyin".equals(phonemeType)) return "zh";
+        return "";
+    }
+
+    private static String inferSingleLanguageTextTag(JSONObject config) {
+        return normalizeCliLanguageTag(inferConfigLanguage(config));
+    }
+
+    private static String normalizeCliLanguageTag(String tag) {
+        if (tag == null || tag.isBlank()) return "";
+        String normalized = tag.trim().toLowerCase();
+        if (normalized.contains("-")) return normalized;
+        if (normalized.startsWith("zh")) return "zh";
+        if (normalized.startsWith("ja")) return "ja";
+        if (normalized.startsWith("en")) return "en";
+        if (normalized.startsWith("es")) return "es";
+        if (normalized.startsWith("fr")) return "fr";
+        if (normalized.startsWith("pt")) return "pt";
+        return normalized;
     }
 
     private static String inferCombinedLanguageTag(JSONObject config) {

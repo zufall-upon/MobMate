@@ -5,9 +5,12 @@ import com.sun.jna.platform.win32.Shell32;
 import javax.sound.sampled.*;
 import java.io.ByteArrayInputStream;
 import java.awt.event.*;
+import java.awt.image.BufferedImage;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.Duration;
 import java.util.concurrent.*;
 import java.awt.*;
@@ -37,6 +40,7 @@ import javax.swing.Timer;
 import javax.swing.event.ChangeEvent;
 import javax.swing.event.ChangeListener;
 import javax.swing.plaf.FontUIResource;
+import javax.imageio.ImageIO;
 
 import com.github.kwhat.jnativehook.GlobalScreen;
 import com.github.kwhat.jnativehook.NativeHookException;
@@ -52,13 +56,18 @@ public class MobMateWhisp implements NativeKeyListener {
     private static final AtomicBoolean shutdownHookOnce = new AtomicBoolean(false);
     private static final PiperPlusPersistentSessionManager piperPlusSessionManager = new PiperPlusPersistentSessionManager();
     private static final String OUTTTS_MARKER = "↑Settings↓Logs below";
+    private static final String COMPANION_DEBUG_UI_MARKER = "mobecho/debug/ENABLE_DEBUG_UI.txt";
     private static final long PIPER_PLUS_DOWNLOAD_DECLINE_COOLDOWN_MS = 10 * 60 * 1000L;
     private static final long PIPER_PLUS_SESSION_PREWARM_COOLDOWN_MS = 45_000L;
+    private static final String PREF_COMPANION_LAST_LAUNCH_MS = "companion.context.last_launch_ms";
+    private static final String PREF_COMPANION_LAST_LAUNCH_DAY = "companion.context.last_launch_day";
+    private static final String PREF_COMPANION_LAUNCH_COUNT_TODAY = "companion.context.launch_count_today";
     private static LinkedHashMap<String, String> createPresetKeys() {
         LinkedHashMap<String, String> keys = new LinkedHashMap<>();
         keys.put("audio.device", "");
         keys.put("audio.output.device", "");
         keys.put("audio.prefilter.mode", "normal");
+        keys.put("audio.ai_assist", "true");
         keys.put("recog.engine", "whisper");
         keys.put("model", "");
         keys.put("moonshine.model_path", "");
@@ -69,6 +78,8 @@ public class MobMateWhisp implements NativeKeyListener {
         keys.put("piper.plus.model_id", "");
         keys.put("tts.windows.voice", "auto");
         keys.put("tts.voice", "3");
+        keys.put("tts.monitor.enabled", "false");
+        keys.put("tts.monitor.volume_percent", "0");
         keys.put("voicevox.auto_emotion", "true");
         keys.put("tts.reflect_emotion", "true");
         keys.put("tts.reflect_emotion.user_touched", "false");
@@ -82,6 +93,25 @@ public class MobMateWhisp implements NativeKeyListener {
         keys.put("hearing.initial_prompt", "");
         keys.put("hearing.output", "");
         keys.put("ui.hearing.visible", "false");
+        keys.put("companion.enabled", "false");
+        keys.put("ui.companion.visible", "false");
+        keys.put("companion.tone", "desu");
+        keys.put("companion.windows.voice", "auto");
+        keys.put("companion.voicevox.speaker", "auto");
+        keys.put("companion.piper.plus.model_id", "auto");
+        keys.put("companion.voiceger.lang", "auto");
+        keys.put("companion.output.device", "");
+        keys.put("companion.volume.percent", "100");
+        keys.put("companion.output.mode", "voice");
+        keys.put("companion.tts.engine", "windows");
+        keys.put("companion.tts.enabled", "true");
+        keys.put("companion.avatar.path", "");
+        keys.put("companion.autonomous.enabled", "true");
+        keys.put("companion.autonomous.frequency", "normal");
+        keys.put("companion.mic.style", "partner");
+        keys.put("companion.mm.audio.prefilter", "normal");
+        keys.put("companion.debug.mode", "false");
+        keys.put("companion.debug.capture_images", "false");
         keys.put("hearing.overlay.font_size", "18");
         keys.put("hearing.overlay.bg_color", "green");
         keys.put("hearing.overlay.opacity", "72");
@@ -195,6 +225,360 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
 
+    private static final class CompanionContextMessage {
+        final String role;
+        final String text;
+
+        CompanionContextMessage(String role, String text) {
+            this.role = (role == null || role.isBlank()) ? "user" : role;
+            this.text = (text == null) ? "" : text.trim();
+        }
+    }
+
+    private static final class CompanionObservation {
+        final long utteranceSeq;
+        final long speechDurationMs;
+        final long trailingSilenceMs;
+        final int trailingSilenceFrames;
+        final int silenceThresholdFrames;
+        final int maxPeak;
+        final int maxAvg;
+        final int rawPeak;
+        final double rawRms;
+        final int procPeak;
+        final double procRms;
+        final boolean rescuedFromPartial;
+
+        CompanionObservation(long utteranceSeq,
+                             long speechDurationMs,
+                             long trailingSilenceMs,
+                             int trailingSilenceFrames,
+                             int silenceThresholdFrames,
+                             int maxPeak,
+                             int maxAvg,
+                             int rawPeak,
+                             double rawRms,
+                             int procPeak,
+                             double procRms,
+                             boolean rescuedFromPartial) {
+            this.utteranceSeq = utteranceSeq;
+            this.speechDurationMs = speechDurationMs;
+            this.trailingSilenceMs = trailingSilenceMs;
+            this.trailingSilenceFrames = trailingSilenceFrames;
+            this.silenceThresholdFrames = silenceThresholdFrames;
+            this.maxPeak = maxPeak;
+            this.maxAvg = maxAvg;
+            this.rawPeak = rawPeak;
+            this.rawRms = rawRms;
+            this.procPeak = procPeak;
+            this.procRms = procRms;
+            this.rescuedFromPartial = rescuedFromPartial;
+        }
+
+        JSONObject toJson() {
+            JSONObject json = new JSONObject();
+            json.put("utterance_seq", utteranceSeq);
+            json.put("speech_duration_ms", speechDurationMs);
+            json.put("trailing_silence_ms", trailingSilenceMs);
+            json.put("trailing_silence_frames", trailingSilenceFrames);
+            json.put("silence_threshold_frames", silenceThresholdFrames);
+            json.put("max_peak", maxPeak);
+            json.put("max_avg", maxAvg);
+            json.put("raw_peak", rawPeak);
+            json.put("raw_rms", rawRms);
+            json.put("proc_peak", procPeak);
+            json.put("proc_rms", procRms);
+            json.put("rescued_from_partial", rescuedFromPartial);
+            return json;
+        }
+
+        String summary() {
+            return "utt=" + utteranceSeq
+                    + " dur=" + speechDurationMs + "ms"
+                    + " tailSil=" + trailingSilenceMs + "ms"
+                    + " tailFrames=" + trailingSilenceFrames + "/" + silenceThresholdFrames
+                    + " peak=" + maxPeak
+                    + " avg=" + maxAvg
+                    + " rawPeak=" + rawPeak
+                    + " rawRms=" + String.format(Locale.ROOT, "%.1f", rawRms)
+                    + " procPeak=" + procPeak
+                    + " procRms=" + String.format(Locale.ROOT, "%.1f", procRms)
+                    + " rescue=" + rescuedFromPartial;
+        }
+    }
+
+    private static final class CompanionStimulus {
+        final String kind;
+        final String sourceText;
+        final String sourceKindHint;
+        final String directReplyText;
+        final CompanionObservation observation;
+        final long createdAtMs;
+        final long readyAtMs;
+        final int priority;
+        final String dedupeKey;
+
+        CompanionStimulus(String kind,
+                          String sourceText,
+                          String sourceKindHint,
+                          String directReplyText,
+                          CompanionObservation observation,
+                          long createdAtMs,
+                          long readyAtMs,
+                          int priority,
+                          String dedupeKey) {
+            this.kind = kind;
+            this.sourceText = sourceText;
+            this.sourceKindHint = sourceKindHint;
+            this.directReplyText = directReplyText;
+            this.observation = observation;
+            this.createdAtMs = createdAtMs;
+            this.readyAtMs = readyAtMs;
+            this.priority = priority;
+            this.dedupeKey = dedupeKey;
+        }
+
+        CompanionStimulus(String kind,
+                          String sourceText,
+                          String directReplyText,
+                          CompanionObservation observation,
+                          long createdAtMs,
+                          long readyAtMs,
+                          int priority,
+                          String dedupeKey) {
+            this(kind, sourceText, null, directReplyText, observation, createdAtMs, readyAtMs, priority, dedupeKey);
+        }
+    }
+
+    private static final class CompanionSituationSample {
+        final long createdAtMs;
+        final String userText;
+        final CompanionObservation observation;
+        final String mood;
+        final float energyScore;
+        final float darkScore;
+        final float speedScale;
+
+        CompanionSituationSample(long createdAtMs,
+                                 String userText,
+                                 CompanionObservation observation,
+                                 String mood,
+                                 float energyScore,
+                                 float darkScore,
+                                 float speedScale) {
+            this.createdAtMs = createdAtMs;
+            this.userText = userText == null ? "" : userText.trim();
+            this.observation = observation;
+            this.mood = mood == null ? "neutral" : mood.trim();
+            this.energyScore = energyScore;
+            this.darkScore = darkScore;
+            this.speedScale = speedScale;
+        }
+    }
+
+    private static final class CompanionHearingCaption {
+        final long createdAtMs;
+        final String route;
+        final String text;
+        final String locale;
+        final int priority;
+
+        CompanionHearingCaption(long createdAtMs, String route, String text, String locale, int priority) {
+            this.createdAtMs = createdAtMs;
+            this.route = route == null ? "" : route.trim();
+            this.text = text == null ? "" : text.trim();
+            this.locale = locale == null ? "" : locale.trim();
+            this.priority = priority;
+        }
+    }
+
+    private static final class CompanionSituationSummary {
+        final String windowTitle;
+        final long elapsedMin;
+        final String weekday;
+        final String timeBand;
+        final long sinceLastLaunchHours;
+        final int launchCountToday;
+        final String appKind;
+        final String windowStability;
+        final String energyTrend;
+        final String utteranceTrend;
+        final String moodDominant;
+        final String fatigueLevel;
+        final int sighCount;
+        final boolean stuckDetected;
+        final boolean excitementBurst;
+        final boolean longSilence;
+        final int utteranceCount5Min;
+        final String sceneMemo;
+        final String audioMemo;
+        final String hearingContext;
+        final int hearingCaptionCount;
+        final String hearingLocaleMix;
+        final String lastUserText;
+        final String lastEchoText;
+        final String lastPartialText;
+        final String reactionStyle;
+        final boolean ttsSpeaking;
+        final String lastTtsText;
+
+        CompanionSituationSummary(String windowTitle,
+                                  long elapsedMin,
+                                  String weekday,
+                                  String timeBand,
+                                  long sinceLastLaunchHours,
+                                  int launchCountToday,
+                                  String appKind,
+                                  String windowStability,
+                                  String energyTrend,
+                                  String utteranceTrend,
+                                  String moodDominant,
+                                  String fatigueLevel,
+                                  int sighCount,
+                                  boolean stuckDetected,
+                                  boolean excitementBurst,
+                                  boolean longSilence,
+                                  int utteranceCount5Min,
+                                  String sceneMemo,
+                                  String audioMemo,
+                                  String hearingContext,
+                                  int hearingCaptionCount,
+                                  String hearingLocaleMix,
+                                  String lastUserText,
+                                  String lastEchoText,
+                                  String lastPartialText,
+                                  String reactionStyle,
+                                  boolean ttsSpeaking,
+                                  String lastTtsText) {
+            this.windowTitle = windowTitle == null ? "" : windowTitle.trim();
+            this.elapsedMin = Math.max(0L, elapsedMin);
+            this.weekday = weekday == null ? "" : weekday.trim();
+            this.timeBand = timeBand == null ? "unknown" : timeBand.trim();
+            this.sinceLastLaunchHours = sinceLastLaunchHours;
+            this.launchCountToday = Math.max(0, launchCountToday);
+            this.appKind = appKind == null ? "unknown" : appKind.trim();
+            this.windowStability = windowStability == null ? "unknown" : windowStability.trim();
+            this.energyTrend = energyTrend == null ? "stable" : energyTrend.trim();
+            this.utteranceTrend = utteranceTrend == null ? "unknown" : utteranceTrend.trim();
+            this.moodDominant = moodDominant == null ? "neutral" : moodDominant.trim();
+            this.fatigueLevel = fatigueLevel == null ? "low" : fatigueLevel.trim();
+            this.sighCount = Math.max(0, sighCount);
+            this.stuckDetected = stuckDetected;
+            this.excitementBurst = excitementBurst;
+            this.longSilence = longSilence;
+            this.utteranceCount5Min = Math.max(0, utteranceCount5Min);
+            this.sceneMemo = sceneMemo == null ? "" : sceneMemo.trim();
+            this.audioMemo = audioMemo == null ? "" : audioMemo.trim();
+            this.hearingContext = hearingContext == null ? "" : hearingContext.trim();
+            this.hearingCaptionCount = Math.max(0, hearingCaptionCount);
+            this.hearingLocaleMix = hearingLocaleMix == null ? "" : hearingLocaleMix.trim();
+            this.lastUserText = lastUserText == null ? "" : lastUserText.trim();
+            this.lastEchoText = lastEchoText == null ? "" : lastEchoText.trim();
+            this.lastPartialText = lastPartialText == null ? "" : lastPartialText.trim();
+            this.reactionStyle = reactionStyle == null || reactionStyle.isBlank() ? "partner" : reactionStyle.trim();
+            this.ttsSpeaking = ttsSpeaking;
+            this.lastTtsText = lastTtsText == null ? "" : lastTtsText.trim();
+        }
+
+        JSONObject toJson() {
+            JSONObject json = new JSONObject();
+            json.put("window_title", windowTitle);
+            json.put("elapsed_min", elapsedMin);
+            json.put("weekday", weekday);
+            json.put("time_band", timeBand);
+            json.put("since_last_launch_hours", sinceLastLaunchHours);
+            json.put("launch_count_today", launchCountToday);
+            json.put("app_kind", appKind);
+            json.put("window_stability", windowStability);
+            json.put("energy_trend", energyTrend);
+            json.put("utterance_trend", utteranceTrend);
+            json.put("mood_dominant", moodDominant);
+            json.put("fatigue_level", fatigueLevel);
+            json.put("sigh_count", sighCount);
+            json.put("stuck_detected", stuckDetected);
+            json.put("excitement_burst", excitementBurst);
+            json.put("long_silence", longSilence);
+            json.put("utterance_count_5min", utteranceCount5Min);
+            json.put("scene_memo", sceneMemo);
+            json.put("screen_caption", sceneMemo);
+            json.put("audio_memo", audioMemo);
+            json.put("hearing_context", hearingContext);
+            json.put("hearing_caption_count", hearingCaptionCount);
+            json.put("hearing_locale_mix", hearingLocaleMix);
+            json.put("last_user_text", lastUserText);
+            json.put("last_echo_text", lastEchoText);
+            json.put("last_partial_text", lastPartialText);
+            json.put("reaction_style", reactionStyle);
+            json.put("tts_speaking", ttsSpeaking);
+            json.put("last_tts_text", lastTtsText);
+            return json;
+        }
+
+        String summaryLine() {
+            return "window=" + shortenForLog(windowTitle, 24)
+                    + " elapsed=" + elapsedMin + "m"
+                    + " weekday=" + shortenForLog(weekday, 8)
+                    + " time=" + timeBand
+                    + " gap=" + (sinceLastLaunchHours >= 0L ? sinceLastLaunchHours + "h" : "?")
+                    + " launches=" + launchCountToday
+                    + " app=" + appKind
+                    + " stability=" + windowStability
+                    + " energy=" + energyTrend
+                    + " uttTrend=" + utteranceTrend
+                    + " mood=" + moodDominant
+                    + " fatigue=" + fatigueLevel
+                    + " sigh=" + sighCount
+                    + " stuck=" + stuckDetected
+                    + " burst=" + excitementBurst
+                    + " longSilence=" + longSilence
+                    + " utt5m=" + utteranceCount5Min
+                    + " style=" + reactionStyle
+                    + " scene=" + shortenForLog(sceneMemo, 24)
+                    + " audio=" + shortenForLog(audioMemo, 24)
+                    + " hearing=" + shortenForLog(hearingContext, 28)
+                    + " lastUser=" + shortenForLog(lastUserText, 24)
+                    + " lastEcho=" + shortenForLog(lastEchoText, 24);
+        }
+    }
+
+    private static final class CompanionWindowSample {
+        final long createdAtMs;
+        final String windowTitle;
+
+        CompanionWindowSample(long createdAtMs, String windowTitle) {
+            this.createdAtMs = createdAtMs;
+            this.windowTitle = windowTitle == null ? "" : windowTitle.trim();
+        }
+    }
+
+    private record CompanionMultimodalPayload(JSONObject json, String summaryLine) {}
+    private record CompanionObserverSnapshot(
+            String traceId,
+            String memo,
+            String detail,
+            long observedAtMs,
+            long completedAtMs
+    ) {}
+    private record CompanionCoherentSnapshot(
+            String traceId,
+            long turnStartedAtMs,
+            long waitedMs,
+            boolean visionWaited,
+            boolean visionReady,
+            boolean visionObservedThisTurn,
+            boolean audioWaited,
+            boolean audioReady,
+            boolean audioObservedThisTurn,
+            long visionCompletedAtMs,
+            long audioCompletedAtMs
+    ) {}
+
+    private record CompanionScreenshotFrame(byte[] jpegBytes,
+                                            int width,
+                                            int height,
+                                            long capturedAtMs,
+                                            long contentHash) {}
+
     // ローカル翻訳
     private LocalTranslator localTranslator = null;
     private final Object talkTranslatorLock = new Object();
@@ -243,6 +627,29 @@ public class MobMateWhisp implements NativeKeyListener {
     public static Preferences prefs;
     private static volatile String audioPrefilterMode = "normal";
     private static volatile String hearingAudioPrefilterMode = null;
+    private volatile String sessionAudioPrefilterOverride = null;
+    private volatile float sessionInputGainOverride = Float.NaN;
+    private volatile float sessionSpeakerThresholdOverride = Float.NaN;
+    private final Object recognitionAssistLock = new Object();
+    private final ArrayDeque<CompanionObservation> recognitionAssistHistory = new ArrayDeque<>();
+    private volatile boolean recognitionAssistSessionActive = false;
+    private volatile long recognitionAssistSessionStartedAtMs = 0L;
+    private volatile int recognitionAssistAdjustments = 0;
+    private volatile float recognitionAssistBaseInputGain = 1.0f;
+    private volatile String recognitionAssistBasePrefilter = "normal";
+    private volatile int recognitionAssistCollapsedFinalCount = 0;
+    private volatile long recognitionAssistLastCollapsedFinalAtMs = 0L;
+    private volatile int recognitionAssistSpeakerRejectCount = 0;
+    private volatile int recognitionAssistSpeakerPassCount = 0;
+    private volatile boolean recognitionAssistSessionEverPassed = false;
+    private static final float RECOGNITION_ASSIST_UNTRUSTED_GAIN_CAP = 4.2f;
+    private static final float RECOGNITION_ASSIST_TRUSTED_GAIN_CAP = 9.4f;
+    private static final long RECOGNITION_ASSIST_COLLAPSE_GUARD_WINDOW_MS = 15_000L;
+    private static final long RECOGNITION_ASSIST_SHORT_UTTERANCE_MS = 1_200L;
+    private volatile String recognitionAssistUiText = "○AIA";
+    private volatile String recognitionAssistUiTooltip = "AI Assist: OFF";
+    private volatile String recognitionAssistUiMode = "off";
+    private volatile Color recognitionAssistUiColor = Color.GRAY;
     private String lastOutput = null;
     private final Object windowsVoiceCacheLock = new Object();
     private volatile List<WindowsVoiceInfo> windowsVoiceInfoCache = Collections.emptyList();
@@ -262,8 +669,10 @@ public class MobMateWhisp implements NativeKeyListener {
     private final Random rnd = new Random();
     private String[] laughOptions;
     private HistoryFrame historyFrame;
+    private CompanionFrame companionFrame;
     private boolean suppressHistoryCloseCallbacks = false;
     private Boolean pendingHistoryRestore = null;
+    private Boolean pendingCompanionRestore = null;
     private MobMateSettingsFrame settingsCenterFrame;
     private static final int CONFIRM_DEFAULT_SEC = 3;
     private static final int CONFIRM_QUEUE_MAX = 4;
@@ -371,6 +780,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private static final String PUSH_TO_TALK = "push_to_talk";
     public JFrame window;
     private JButton button = null;
+    private JButton companionButton = null;
     final JLabel label = new JLabel(UiText.t("ui.main.ready"));
     // ===== ステータスバー用 =====
     private JLabel statusLabel;
@@ -385,12 +795,153 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile long gpuVramTotalBytes = -1;
     private JLabel modelLabel;         // 利用モデル（★追加）
     private JLabel speakerStatusLabel; // ★話者照合ステータス
+    private JLabel aiAssistStatusLabel; // ★AI認識補正ステータス
+    private JLabel ttsMonitorLabel;
+    private JComboBox<String> ttsMonitorVolumeCombo;
+    private boolean updatingTtsMonitorVolumeCombo = false;
     private Timer statusUpdateTimer;   // ステータスバー更新タイマー
     private long recordingStartTime2 = 0; // 録音開始時刻
     private JPanel statusBar;          // ★ステータスバー本体（再構築用）
     private volatile boolean startupBusy = true;
     private volatile String startupStatusText = "BOOT";
     private volatile boolean ignorePreloadPending = false;
+    private volatile String lastTalkTtsRecommendationSignature = "";
+    private volatile long lastTalkTtsRecommendationAtMs = 0L;
+    private final CompanionSidecarClient companionSidecarClient = new CompanionSidecarClient(this);
+    private final ExecutorService companionExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "mobmate-companion");
+        t.setDaemon(true);
+        return t;
+    });
+    private final ExecutorService companionVisionObserverExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "mobmate-companion-vision");
+        t.setDaemon(true);
+        return t;
+    });
+    private final ExecutorService companionAudioObserverExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "mobmate-companion-audio");
+        t.setDaemon(true);
+        return t;
+    });
+    private final ScheduledExecutorService companionAutoScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "mobmate-companion-auto");
+        t.setDaemon(true);
+        return t;
+    });
+    private final CompanionLoopbackMonitor companionLoopbackMonitor = new CompanionLoopbackMonitor(this);
+    private final ArrayDeque<CompanionContextMessage> companionContext = new ArrayDeque<>();
+    private final Object companionContextLock = new Object();
+    private final ArrayDeque<CompanionSituationSample> companionSituationHistory = new ArrayDeque<>();
+    private final Object companionSituationLock = new Object();
+    private final ArrayDeque<CompanionWindowSample> companionWindowHistory = new ArrayDeque<>();
+    private final Object companionWindowHistoryLock = new Object();
+    private final ArrayDeque<CompanionHearingCaption> companionHearingCaptions = new ArrayDeque<>();
+    private final Object companionHearingCaptionLock = new Object();
+    private final ArrayDeque<CompanionStimulus> companionStimuli = new ArrayDeque<>();
+    private final Object companionStimulusLock = new Object();
+    private final Map<String, Long> companionStimulusSeenAtMs = new HashMap<>();
+    private static final ThreadLocal<Boolean> companionSuppressedForCurrentFinal =
+            ThreadLocal.withInitial(() -> false);
+    private volatile long companionSuppressUntilMs = 0L;
+    private volatile String lastCompanionReplyText = "";
+    private volatile long lastCompanionReplyAtMs = 0L;
+    private volatile String lastCompanionHeardText = "";
+    private volatile long lastCompanionHeardAtMs = 0L;
+    private final long companionSessionStartedAtMs = System.currentTimeMillis();
+    private volatile long lastCompanionObservationSeq = -1L;
+    private volatile CompanionObservation lastCompanionObservation = null;
+    private final AtomicBoolean companionTurnRunning = new AtomicBoolean(false);
+    private volatile long lastCompanionAutonomousAtMs = 0L;
+    private volatile long lastUserMicTurnAtMs = 0L;
+    private volatile long lastHearingCaptionAtMs = 0L;
+    private volatile long lastCompanionHearingContextQueuedAtMs = 0L;
+    private static final long COMPANION_AUTO_GLOBAL_COOLDOWN_MS = 12_000L;
+    private static final long COMPANION_AUTO_AFTER_DIRECT_REPLY_MS = 8_000L;
+    private static final long COMPANION_AUTO_AFTER_DIRECT_REPLY_MIC_LOCAL_MS = 2_500L;
+    private static final long COMPANION_AUTO_AFTER_MIC_MS = 4_500L;
+    private static final long COMPANION_AUTO_STIMULUS_MAX_AGE_MS = 25_000L;
+    private static final long COMPANION_AUTO_HEARING_DELAY_MS = 1_500L;
+    private static final long COMPANION_AUTO_HEARING_SE_DELAY_MS = 900L;
+    private static final long COMPANION_AUTO_DESKTOP_AUDIO_DELAY_MS = 1_400L;
+    private static final long COMPANION_AUTO_DESKTOP_AUDIO_DEDUPE_MS = 8_000L;
+    private static final long COMPANION_AUTO_MIC_DELAY_MS = 8_000L;
+    private static final long COMPANION_HEARING_CONTEXT_WINDOW_MS = 18_000L;
+    private static final long COMPANION_HEARING_CONTEXT_TRIGGER_COOLDOWN_MS = 9_000L;
+    private static final long COMPANION_HEARING_CONTEXT_SOLO_MIN_AGE_MS = 6_000L;
+    private static final long COMPANION_HEARING_CONTEXT_STRONG_MIN_AGE_MS = 3_500L;
+    private static final long COMPANION_HEARING_CONTEXT_MIN_SPAN_MS = 2_200L;
+    private static final long COMPANION_SUMMARY_WINDOW_MS = 10 * 60_000L;
+    private static final long COMPANION_SUMMARY_MOOD_WINDOW_MS = 2 * 60_000L;
+    private static final long COMPANION_WINDOW_STABILITY_WINDOW_MS = 2 * 60_000L;
+    private static final long COMPANION_SUMMARY_LONG_SILENCE_MS = 45_000L;
+    private static final long COMPANION_SUMMARY_RECENT_ACTIVITY_GUARD_MS = 20_000L;
+    private static final long COMPANION_SUMMARY_WINDOW_TITLE_REFRESH_MS = 7_000L;
+    private static final long COMPANION_MM_SCREENSHOT_CACHE_MS = 8_000L;
+    private static final long COMPANION_AUDIO_OBSERVER_INTERVAL_MS = 3_000L;
+    private static final long COMPANION_VISION_OBSERVER_INTERVAL_MS = 3_000L;
+    private static final long COMPANION_COHERENCE_WAIT_MAX_MS = 7_000L;
+    private static final long COMPANION_COHERENCE_POLL_MS = 120L;
+    private static final long COMPANION_SCENE_MEMO_TTL_MS = 20_000L;
+    private static final long COMPANION_AUDIO_MEMO_TTL_MS = 20_000L;
+    private static final int COMPANION_MM_AUDIO_WINDOW_MS = 6000;
+    private static final int COMPANION_MM_VISUAL_HISTORY_TARGET = 10;
+    private static final int COMPANION_MM_SPEECH_HISTORY_TARGET = 6;
+    private static final long COMPANION_LOW_VALUE_VISION_AUDIO_GRACE_MS = 1200L;
+    private static final long COMPANION_MM_MIC_AUDIO_TTL_MS = 25_000L;
+    private static final boolean COMPANION_MM_ENABLE_IMAGE = false;
+    private static final boolean COMPANION_VISION_OBSERVER_ENABLED = true;
+    private static final int COMPANION_MM_SCREEN_MAX_WIDTH_DEFAULT = 512;
+    private static final int COMPANION_MM_SCREEN_MAX_WIDTH_768 = 768;
+    private static final int COMPANION_MM_SCREEN_MAX_WIDTH_960 = 960;
+    private static final int COMPANION_MM_MEMORY_MAX_ITEMS = 10;
+    private static final int COMPANION_SPEECH_SEMANTIC_MAX_SNIPPETS = 6;
+    private static final long COMPANION_ASYNC_TICK_READY_DELAY_MS = 250L;
+    private static final int COMPANION_PRIORITY_ASYNC_TICK = 76;
+    private static final int COMPANION_PRIORITY_MIC_OBSERVATION = 90;
+    private static final int COMPANION_PRIORITY_HEARING_CAPTION = 70;
+    private static final int COMPANION_PRIORITY_HEARING_AUDIO_EVENT = 82;
+    private static final int COMPANION_PRIORITY_DESKTOP_AUDIO_DIRECT = 66;
+    private volatile String companionCachedWindowTitle = "";
+    private volatile long companionCachedWindowTitleAtMs = 0L;
+    private volatile long companionPreviousLaunchAtMs = -1L;
+    private volatile int companionLaunchCountToday = 1;
+    private final Object companionRecentMicAudioLock = new Object();
+    private volatile byte[] companionRecentMicAudioPcm = new byte[0];
+    private volatile long companionRecentMicAudioAtMs = 0L;
+    private volatile int companionRecentMicAudioSampleRate = 16000;
+    private volatile String companionLatestSceneMemo = "";
+    private volatile long companionLatestSceneMemoAtMs = 0L;
+    private volatile String companionLatestSceneDetail = "";
+    private volatile long companionLatestSceneDetailAtMs = 0L;
+    private volatile String companionLatestAudioMemo = "";
+    private volatile String companionLatestAudioDetail = "";
+    private volatile long companionLatestAudioMemoAtMs = 0L;
+    private volatile String companionLastObservedAudioTraceId = "";
+    private volatile String companionLastObservedAudioMemo = "";
+    private volatile String companionLastObservedAudioDetail = "";
+    private volatile long companionLastObservedAudioMemoAtMs = 0L;
+    private volatile long companionLastAudioObserveRequestedAtMs = 0L;
+    private volatile long companionLastVisionObservedFrameAtMs = 0L;
+    private static final int COMPANION_VISION_LOW_VALUE_HASH_MAX_DISTANCE = 6;
+    private volatile long companionLastVisionObservedFrameHash = 0L;
+    private volatile boolean companionLastVisionObservedLowValue = false;
+    private volatile long companionLastVisionObserveCompletedAtMs = 0L;
+    private volatile long companionLastAudioObserveCompletedAtMs = 0L;
+    private volatile boolean companionVisionObserverInFlight = false;
+    private volatile boolean companionAudioObserverInFlight = false;
+    private volatile String companionDesktopAudioRoute = "off";
+    private volatile String companionUiWindowTitle = "";
+    private volatile String companionUiMoodDominant = "neutral";
+    private volatile String companionUiEnergyTrend = "stable";
+    private volatile String companionUiUtteranceTrend = "unknown";
+    private volatile String companionUiFatigueLevel = "low";
+    private volatile boolean companionUiExcitementBurst = false;
+    private volatile boolean companionUiLongSilence = false;
+    private volatile boolean companionUiStuckDetected = false;
+    private volatile int companionUiSighCount = 0;
+    private volatile long companionUiSummaryAtMs = 0L;
+    private volatile CompanionScreenshotFrame companionCachedScreenshotFrame =
+            new CompanionScreenshotFrame(new byte[0], 0, 0, 0L, 0);
 
     private Process psProcess;
     private BufferedWriter psWriter;
@@ -577,6 +1128,8 @@ public class MobMateWhisp implements NativeKeyListener {
                 new WString("MobMate.MobMateWhispTalk")
         );
         prefs = Preferences.userRoot().node("MobMateWhispTalk");
+        enforceCompanionDebugPrivacyDefaults();
+        initCompanionFriendContextPrefs();
         migrateTtsReflectEmotionDefaultIfNeeded();
         audioPrefilterMode = normalizeAudioPrefilterMode(prefs.get("audio.prefilter.mode", "normal"));
         hearingAudioPrefilterMode = loadHearingAudioPrefilterMode(prefs);
@@ -704,6 +1257,19 @@ public class MobMateWhisp implements NativeKeyListener {
         } else {
             Config.log("MobMateWhispTalk using remote speech to text service : " + remoteUrl);
         }
+        companionAutoScheduler.scheduleWithFixedDelay(() -> {
+            try {
+                ensureCompanionDesktopAudioMonitorState();
+                String tone = prefs.get("companion.tone", "desu");
+                String locale = resolveCompanionLocale("");
+                CompanionSituationSummary summary = buildCompanionSituationSummary("", null);
+                maybeScheduleCompanionVisionObservation("", tone, locale, summary);
+                maybeScheduleCompanionAudioObservation();
+                drainCompanionStimuli();
+            } catch (Throwable t) {
+                Config.logError("[Companion][Auto] scheduler failed", t);
+            }
+        }, 1500L, 1200L, TimeUnit.MILLISECONDS);
     }
     private LocalWhisperCPP getOrCreateHearingWhisper() throws FileNotFoundException {
         LocalWhisperCPP cur = wHearing;
@@ -798,6 +1364,248 @@ public class MobMateWhisp implements NativeKeyListener {
             return target.toLowerCase(Locale.ROOT);
         }
         return getTalkLanguage();
+    }
+
+    private record TalkTtsRouteOption(
+            String engineId,
+            String label,
+            String detail,
+            boolean immediatelyUsable,
+            boolean selectable
+    ) {}
+
+    private String normalizedTalkOutputLanguage() {
+        return PiperPlusCatalog.normalizeOutputLanguage(getTalkOutputLanguage());
+    }
+
+    private String getConfiguredVoicegerBaseUrl() {
+        String baseUrl = "";
+        try {
+            if (prefs != null) {
+                baseUrl = prefs.get("voiceger.api.base", "");
+                if (baseUrl == null || baseUrl.isBlank()) {
+                    baseUrl = prefs.get("voiceger.api_base", "");
+                }
+            }
+        } catch (Exception ignore) {}
+        if (baseUrl == null) return "";
+        baseUrl = baseUrl.trim();
+        if (!baseUrl.isBlank() && !baseUrl.endsWith("/")) {
+            baseUrl += "/";
+        }
+        return baseUrl;
+    }
+
+    private static String tt(String key) {
+        return UiText.t(key);
+    }
+
+    private static String ttf(String key, Object... args) {
+        try {
+            return String.format(tt(key), args);
+        } catch (Exception ignore) {
+            return tt(key);
+        }
+    }
+
+    private boolean isVoicegerTtsSupportedForLanguage(String lang) {
+        return mapTalkLangToVoicegerPref(lang) != null;
+    }
+
+    private boolean isVoicegerTtsAvailableForLanguage(String lang) {
+        if (!isVoicegerTtsSupportedForLanguage(lang)) return false;
+        String baseUrl = getConfiguredVoicegerBaseUrl();
+        if (baseUrl.isBlank()) return false;
+        return voicegerHealthOkCached(baseUrl);
+    }
+
+    private PiperPlusCatalog.Entry resolveTalkPiperPlusEntry(String outputLang) {
+        String modelId = "";
+        try {
+            if (prefs != null) modelId = prefs.get("piper.plus.model_id", "").trim();
+        } catch (Exception ignore) {}
+        return PiperPlusCatalog.resolveForLanguage(modelId, outputLang);
+    }
+
+    private List<TalkTtsRouteOption> buildTalkTtsRouteOptions(String outputLang) {
+        String normalized = PiperPlusCatalog.normalizeOutputLanguage(outputLang);
+        LinkedHashMap<String, TalkTtsRouteOption> options = new LinkedHashMap<>();
+        java.util.function.Consumer<TalkTtsRouteOption> add = option -> {
+            if (option == null || option.engineId() == null || option.engineId().isBlank()) return;
+            options.putIfAbsent(option.engineId(), option);
+        };
+
+        WindowsVoiceInfo windowsVoice = findBestWindowsVoiceForLanguage(normalized);
+        PiperPlusCatalog.Entry piperEntry = resolveTalkPiperPlusEntry(normalized);
+        boolean piperSelectable = piperEntry != null && PiperPlusModelManager.isRuntimeAvailable();
+        boolean piperImmediate = piperSelectable && PiperPlusModelManager.isInstalled(piperEntry);
+        String piperDetail = "";
+        if (piperEntry != null) {
+            piperDetail = piperImmediate
+                    ? ttf("talk.ttsChooser.detail.piper.ready", piperEntry.displayName())
+                    : ttf("talk.ttsChooser.detail.piper.download", piperEntry.displayName());
+        }
+
+        switch (normalized) {
+            case "ja" -> {
+                add.accept(new TalkTtsRouteOption("voicevox", "VOICEVOX", tt("talk.ttsChooser.detail.voicevox.ready"), isVoiceVoxAvailable(), isVoiceVoxAvailable()));
+                add.accept(new TalkTtsRouteOption("windows", "Windows", windowsVoice != null ? ttf("talk.ttsChooser.detail.windows.match", windowsVoice.name) : tt("talk.ttsChooser.detail.windows.none"), windowsVoice != null, windowsVoice != null));
+                add.accept(new TalkTtsRouteOption("piper_plus", "piper-plus", piperDetail, piperImmediate, piperSelectable));
+                add.accept(new TalkTtsRouteOption("voiceger_tts", "Voiceger (TTS)", tt("talk.ttsChooser.detail.voiceger.sync"), isVoicegerTtsAvailableForLanguage(normalized), isVoicegerTtsSupportedForLanguage(normalized)));
+                add.accept(new TalkTtsRouteOption("xtts", "XTTS", tt("talk.ttsChooser.detail.xtts.generic"), isXttsAvailable(), isXttsAvailable()));
+            }
+            case "zh" -> {
+                add.accept(new TalkTtsRouteOption("windows", "Windows", windowsVoice != null ? ttf("talk.ttsChooser.detail.windows.match", windowsVoice.name) : tt("talk.ttsChooser.detail.windows.none"), windowsVoice != null, windowsVoice != null));
+                add.accept(new TalkTtsRouteOption("piper_plus", "piper-plus", piperDetail, piperImmediate, piperSelectable));
+                add.accept(new TalkTtsRouteOption("voiceger_tts", "Voiceger (TTS)", tt("talk.ttsChooser.detail.voiceger.sync"), isVoicegerTtsAvailableForLanguage(normalized), isVoicegerTtsSupportedForLanguage(normalized)));
+                add.accept(new TalkTtsRouteOption("xtts", "XTTS", tt("talk.ttsChooser.detail.xtts.generic"), isXttsAvailable(), isXttsAvailable()));
+            }
+            case "ko", "yue" -> {
+                add.accept(new TalkTtsRouteOption("windows", "Windows", windowsVoice != null ? ttf("talk.ttsChooser.detail.windows.match", windowsVoice.name) : tt("talk.ttsChooser.detail.windows.none"), windowsVoice != null, windowsVoice != null));
+                add.accept(new TalkTtsRouteOption("voiceger_tts", "Voiceger (TTS)", tt("talk.ttsChooser.detail.voiceger.sync"), isVoicegerTtsAvailableForLanguage(normalized), isVoicegerTtsSupportedForLanguage(normalized)));
+                add.accept(new TalkTtsRouteOption("xtts", "XTTS", tt("talk.ttsChooser.detail.xtts.generic"), isXttsAvailable(), isXttsAvailable()));
+            }
+            default -> {
+                add.accept(new TalkTtsRouteOption("windows", "Windows", windowsVoice != null ? ttf("talk.ttsChooser.detail.windows.match", windowsVoice.name) : tt("talk.ttsChooser.detail.windows.none"), windowsVoice != null, windowsVoice != null));
+                add.accept(new TalkTtsRouteOption("piper_plus", "piper-plus", piperDetail, piperImmediate, piperSelectable));
+                add.accept(new TalkTtsRouteOption("voiceger_tts", "Voiceger (TTS)", tt("talk.ttsChooser.detail.voiceger.sync"), isVoicegerTtsAvailableForLanguage(normalized), isVoicegerTtsSupportedForLanguage(normalized)));
+                add.accept(new TalkTtsRouteOption("xtts", "XTTS", tt("talk.ttsChooser.detail.xtts.generic"), isXttsAvailable(), isXttsAvailable()));
+            }
+        }
+        return new ArrayList<>(options.values());
+    }
+
+    private TalkTtsRouteOption chooseBestTalkTtsRoute(String outputLang) {
+        List<TalkTtsRouteOption> options = buildTalkTtsRouteOptions(outputLang);
+        for (TalkTtsRouteOption option : options) {
+            if (option.immediatelyUsable()) return option;
+        }
+        for (TalkTtsRouteOption option : options) {
+            if (option.selectable()) return option;
+        }
+        return null;
+    }
+
+    private boolean isCurrentTalkTtsRouteSuitable(String engineId, String outputLang) {
+        String normalized = PiperPlusCatalog.normalizeOutputLanguage(outputLang);
+        if (engineId == null || engineId.isBlank()) return false;
+        return switch (engineId.toLowerCase(Locale.ROOT)) {
+            case "auto" -> true;
+            case "voicevox" -> "ja".equals(normalized) && isVoiceVoxAvailable();
+            case "windows" -> findBestWindowsVoiceForLanguage(normalized) != null;
+            case "piper_plus" -> resolveTalkPiperPlusEntry(normalized) != null;
+            case "voiceger_tts" -> isVoicegerTtsSupportedForLanguage(normalized);
+            case "xtts" -> isXttsAvailable();
+            case "voiceger_vc", "voiceger" -> true;
+            default -> false;
+        };
+    }
+
+    private String resolveAutoTtsEngineForTalkOutput() {
+        String outputLang = normalizedTalkOutputLanguage();
+        TalkTtsRouteOption best = chooseBestTalkTtsRoute(outputLang);
+        String chosen = (best != null && best.selectable()) ? best.engineId() : "windows";
+        Config.logDebug("[Talk][TTS] auto route output=" + outputLang
+                + " -> " + chosen
+                + (best != null && best.detail() != null && !best.detail().isBlank() ? " (" + best.detail() + ")" : ""));
+        return chosen;
+    }
+
+    private void applyTalkTtsRouteOption(TalkTtsRouteOption option) {
+        if (option == null || prefs == null) return;
+        try {
+            prefs.put("tts.engine", option.engineId());
+            if ("windows".equals(option.engineId())) {
+                prefs.put("tts.windows.voice", "auto");
+            } else if ("piper_plus".equals(option.engineId())) {
+                PiperPlusCatalog.Entry entry = resolveTalkPiperPlusEntry(normalizedTalkOutputLanguage());
+                if (entry != null) {
+                    prefs.put("piper.plus.model_id", entry.id());
+                }
+            }
+            try { prefs.sync(); } catch (Exception ignore) {}
+        } catch (Exception ignore) {}
+        syncVoicegerTtsLangWithTalkOutput();
+        if (settingsCenterFrame != null && settingsCenterFrame.isDisplayable()) {
+            settingsCenterFrame.refreshLinkedSelections();
+        }
+        Config.log("[Talk][TTS] switched route -> " + option.engineId() + " for output=" + normalizedTalkOutputLanguage());
+    }
+
+    public void maybeRecommendTalkTtsRoute(Component parent, String triggerReason) {
+        String currentEngine = "auto";
+        try {
+            if (prefs != null) currentEngine = prefs.get("tts.engine", "auto").toLowerCase(Locale.ROOT);
+        } catch (Exception ignore) {}
+        if ("auto".equals(currentEngine)) {
+            return;
+        }
+
+        String outputLang = normalizedTalkOutputLanguage();
+        if (isCurrentTalkTtsRouteSuitable(currentEngine, outputLang)) {
+            return;
+        }
+        TalkTtsRouteOption best = chooseBestTalkTtsRoute(outputLang);
+        if (best == null || !best.selectable() || currentEngine.equals(best.engineId())) {
+            return;
+        }
+
+        String signature = outputLang + "|" + currentEngine + "|" + best.engineId();
+        long now = System.currentTimeMillis();
+        if (signature.equals(lastTalkTtsRecommendationSignature) && (now - lastTalkTtsRecommendationAtMs) < 12_000L) {
+            return;
+        }
+        lastTalkTtsRecommendationSignature = signature;
+        lastTalkTtsRecommendationAtMs = now;
+
+        List<TalkTtsRouteOption> options = buildTalkTtsRouteOptions(outputLang);
+        List<TalkTtsRouteOption> selectable = new ArrayList<>();
+        for (TalkTtsRouteOption option : options) {
+            if (option.selectable()) selectable.add(option);
+            if (selectable.size() >= 2) break;
+        }
+        if (selectable.isEmpty()) {
+            return;
+        }
+
+        String langLabel = LanguageOptions.displayTranslationTarget(outputLang);
+        StringBuilder message = new StringBuilder()
+                .append(ttf("talk.ttsChooser.message.output", langLabel))
+                .append("\n")
+                .append(tt(selectable.size() > 1
+                        ? "talk.ttsChooser.message.recommendedPlural"
+                        : "talk.ttsChooser.message.recommendedSingle"))
+                .append("\n");
+        for (int i = 0; i < selectable.size(); i++) {
+            TalkTtsRouteOption option = selectable.get(i);
+            message.append(i + 1).append(". ").append(option.label());
+            if (option.detail() != null && !option.detail().isBlank()) {
+                message.append(" - ").append(option.detail());
+            }
+            message.append("\n");
+        }
+        message.append("\n").append(tt("talk.ttsChooser.message.switch"));
+
+        java.util.List<String> labels = new ArrayList<>();
+        for (TalkTtsRouteOption option : selectable) {
+            labels.add(option.label());
+        }
+        labels.add(tt("talk.ttsChooser.keepCurrent"));
+        int choice = JOptionPane.showOptionDialog(
+                parent,
+                message.toString(),
+                tt("talk.ttsChooser.title"),
+                JOptionPane.DEFAULT_OPTION,
+                JOptionPane.PLAIN_MESSAGE,
+                null,
+                labels.toArray(),
+                labels.get(0)
+        );
+        if (choice >= 0 && choice < selectable.size()) {
+            applyTalkTtsRouteOption(selectable.get(choice));
+        } else {
+            Config.logDebug("[Talk][TTS] keep current route after " + triggerReason + ": " + currentEngine + " output=" + outputLang);
+        }
     }
 
     private String mapTalkLangToVoicegerPref(String lang) {
@@ -1001,6 +1809,7 @@ public class MobMateWhisp implements NativeKeyListener {
             );
             return false;
         }
+        maybeRecommendTalkTtsRoute(parent, "talk-language-change");
         softRestart();
         return true;
     }
@@ -2867,6 +3676,14 @@ public class MobMateWhisp implements NativeKeyListener {
         return normalizeAudioPrefilterMode(audioPrefilterMode);
     }
 
+    private String getEffectiveTalkAudioPrefilterMode() {
+        String override = sessionAudioPrefilterOverride;
+        if (override != null && !override.isBlank()) {
+            return normalizeAudioPrefilterMode(override);
+        }
+        return getAudioPrefilterMode();
+    }
+
     public static void setAudioPrefilterMode(String mode) {
         String normalized = normalizeAudioPrefilterMode(mode);
         audioPrefilterMode = normalized;
@@ -2891,6 +3708,98 @@ public class MobMateWhisp implements NativeKeyListener {
     }
     private static boolean isStrongAudioPrefilterMode(String mode) {
         return "strong".equalsIgnoreCase(normalizeAudioPrefilterMode(mode));
+    }
+
+    private boolean isRecognitionAssistEnabled() {
+        return prefs != null && prefs.getBoolean("audio.ai_assist", false);
+    }
+
+    private float getEffectiveInputGainMultiplier() {
+        float override = sessionInputGainOverride;
+        if (Float.isFinite(override) && override > 0.0f) {
+            return override;
+        }
+        return prefs == null ? 1.0f : prefs.getFloat("audio.inputGainMultiplier", 1.0f);
+    }
+
+    private float getEffectiveSpeakerThreshold() {
+        float override = sessionSpeakerThresholdOverride;
+        if (Float.isFinite(override) && override > 0.0f) {
+            return override;
+        }
+        if (speakerProfile != null) {
+            return (float) speakerProfile.getThreshold();
+        }
+        return prefs == null ? 0.60f : prefs.getFloat("speaker.threshold_initial", 0.60f);
+    }
+
+    private void applyRecognitionAssistStatus(String text, Color color, String tooltip) {
+        recognitionAssistUiText = text;
+        recognitionAssistUiColor = color;
+        recognitionAssistUiTooltip = tooltip;
+        if (aiAssistStatusLabel == null) {
+            return;
+        }
+        SwingUtilities.invokeLater(() -> {
+            if (aiAssistStatusLabel == null) {
+                return;
+            }
+            aiAssistStatusLabel.setText(recognitionAssistUiText);
+            aiAssistStatusLabel.setForeground(recognitionAssistUiColor);
+            aiAssistStatusLabel.setToolTipText(recognitionAssistUiTooltip);
+        });
+    }
+
+    private void refreshRecognitionAssistStatusLocked(String hint) {
+        String text;
+        Color color;
+        String tooltip;
+        if (!isRecognitionAssistEnabled()) {
+            recognitionAssistUiMode = "off";
+            text = "○AIA";
+            color = Color.GRAY;
+            tooltip = "AI Assist: OFF";
+        } else if (!recognitionAssistSessionActive) {
+            recognitionAssistUiMode = "idle";
+            text = recognitionAssistAdjustments > 0 ? ("AIA" + recognitionAssistAdjustments) : "○AIA";
+            color = new Color(120, 120, 120);
+            tooltip = "AI Assist: idle";
+        } else {
+            boolean hasWarning = recognitionAssistCollapsedFinalCount > 0
+                    || recognitionAssistSpeakerRejectCount > (recognitionAssistSpeakerPassCount + 1);
+            boolean tuned = recognitionAssistAdjustments > 0
+                    || Float.isFinite(sessionSpeakerThresholdOverride)
+                    || Float.isFinite(sessionInputGainOverride)
+                    || (sessionAudioPrefilterOverride != null && !sessionAudioPrefilterOverride.isBlank());
+            String mode = recognitionAssistUiMode == null ? "collecting" : recognitionAssistUiMode;
+            text = "AIA" + recognitionAssistAdjustments;
+            if ("adjusting".equals(mode)) {
+                color = new Color(255, 193, 7);
+            } else if ("monitoring".equals(mode)) {
+                color = new Color(33, 150, 243);
+            } else if (tuned) {
+                color = new Color(76, 175, 80);
+            } else {
+                color = hasWarning ? new Color(255, 193, 7) : new Color(33, 150, 243);
+            }
+            StringBuilder sb = new StringBuilder("AI Assist");
+            if (hint != null && !hint.isBlank()) {
+                sb.append(": ").append(hint);
+            } else {
+                sb.append(": active");
+            }
+            sb.append(" / mode=").append(mode);
+            sb.append(" / gain=").append(String.format(Locale.ROOT, "%.1f", getEffectiveInputGainMultiplier()));
+            sb.append(" / prefilter=").append(getEffectiveTalkAudioPrefilterMode());
+            if (prefs != null && prefs.getBoolean("speaker.enabled", false) && speakerProfile != null && speakerProfile.isReady()) {
+                sb.append(" / spk=").append(String.format(Locale.ROOT, "%.2f", getEffectiveSpeakerThreshold()));
+            }
+            sb.append(" / adj=").append(recognitionAssistAdjustments);
+            sb.append(" / collapse=").append(recognitionAssistCollapsedFinalCount);
+            sb.append(" / reject=").append(recognitionAssistSpeakerRejectCount);
+            tooltip = sb.toString();
+        }
+        applyRecognitionAssistStatus(text, color, tooltip);
     }
     private static final double STRONG_FINAL_COLLAPSE_RMS_RATIO = 0.33;
     private static final double STRONG_FINAL_COLLAPSE_PEAK_RATIO = 0.42;
@@ -3284,53 +4193,54 @@ public class MobMateWhisp implements NativeKeyListener {
 
         popup.addSeparator();
 
-        JMenu debugMenu = new JMenu(uiOr("ui.main.delta.debug", "Debug"));
-        boolean readyToZip = Config.getBool("log.debug", false);
+        if (isInternalCompanionDebugUiEnabled()) {
+            JMenu debugMenu = new JMenu(uiOr("ui.main.delta.debug", "Debug"));
+            boolean readyToZip = Config.getBool("log.debug", false);
 
-        if (!readyToZip) {
-            JMenuItem enableDebugItem = new JMenuItem(UiText.t("menu.debug.enableLog"));
-            enableDebugItem.addActionListener(e -> {
-                try {
-                    Config.appendOutTts("log.debug=true");
-                    Config.appendOutTts("log.vad.detailed=true");
-                    JOptionPane.showMessageDialog(
-                            window,
-                            uiOr("ui.main.delta.debug.enable.msg",
-                                    "Debug logging enabled temporarily.\n"
-                                            + "Restart the app and reproduce the issue.\n"
-                                            + "(Automatically turns off after ~500 messages.)"),
-                            "MobMate",
-                            JOptionPane.INFORMATION_MESSAGE
-                    );
-                    restartSelf(true);
-                } catch (Exception ex) {
-                    Config.log("Failed to Debug Log Output ON.");
-                }
-            });
-            debugMenu.add(enableDebugItem);
-        } else {
-            JMenuItem zipLogsItem = new JMenuItem(UiText.t("menu.debug.createZip"));
-            zipLogsItem.addActionListener(e -> {
-                try {
-                    File zip = DebugLogZipper.createZip();
-                    JOptionPane.showMessageDialog(
-                            window,
-                            uiOr("ui.main.delta.debug.zip.msg",
-                                    "Debug logs have been collected.\n\n"
-                                            + "Please attach this zip file and send it to support.\n\n")
-                                    + zip.getAbsolutePath(),
-                            "MobMate",
-                            JOptionPane.INFORMATION_MESSAGE
-                    );
-                } catch (Exception ex) {
-                    Config.log("Failed to Debug Log Output Zipping.");
-                }
-            });
-            debugMenu.add(zipLogsItem);
+            if (!readyToZip) {
+                JMenuItem enableDebugItem = new JMenuItem(UiText.t("menu.debug.enableLog"));
+                enableDebugItem.addActionListener(e -> {
+                    try {
+                        Config.appendOutTts("log.debug=true");
+                        Config.appendOutTts("log.vad.detailed=true");
+                        JOptionPane.showMessageDialog(
+                                window,
+                                uiOr("ui.main.delta.debug.enable.msg",
+                                        "Debug logging enabled temporarily.\n"
+                                                + "Restart the app and reproduce the issue.\n"
+                                                + "(Automatically turns off after ~500 messages.)"),
+                                "MobMate",
+                                JOptionPane.INFORMATION_MESSAGE
+                        );
+                        restartSelf(true);
+                    } catch (Exception ex) {
+                        Config.log("Failed to Debug Log Output ON.");
+                    }
+                });
+                debugMenu.add(enableDebugItem);
+            } else {
+                JMenuItem zipLogsItem = new JMenuItem(UiText.t("menu.debug.createZip"));
+                zipLogsItem.addActionListener(e -> {
+                    try {
+                        File zip = DebugLogZipper.createZip();
+                        JOptionPane.showMessageDialog(
+                                window,
+                                uiOr("ui.main.delta.debug.zip.msg",
+                                        "Debug logs have been collected.\n\n"
+                                                + "Please attach this zip file and send it to support.\n\n")
+                                        + zip.getAbsolutePath(),
+                                "MobMate",
+                                JOptionPane.INFORMATION_MESSAGE
+                        );
+                    } catch (Exception ex) {
+                        Config.log("Failed to Debug Log Output Zipping.");
+                    }
+                });
+                debugMenu.add(zipLogsItem);
+            }
+            popup.add(debugMenu);
+            popup.addSeparator();
         }
-        popup.add(debugMenu);
-
-        popup.addSeparator();
 
         JMenuItem softRestartItem = new JMenuItem(uiOr("ui.main.delta.softRestart", "Soft Restart"));
         softRestartItem.addActionListener(e -> softRestart());
@@ -3341,7 +4251,7 @@ public class MobMateWhisp implements NativeKeyListener {
         JMenuItem exitItem = new JMenuItem(UiText.t("menu.exit"));
         exitItem.addActionListener(e -> {
             try { VoicegerManager.stopIfRunning(MobMateWhisp.prefs); } catch (Throwable ignore) {}
-            Config.mirrorAllToCloud();
+            prepareForExit();
             System.exit(0);
         });
         popup.add(exitItem);
@@ -3384,51 +4294,52 @@ public class MobMateWhisp implements NativeKeyListener {
 
         popup.addSeparator();
 
-        boolean readyToZip = Config.getBool("log.debug", false);
-        Menu debugMenu = new Menu("MobMateWhispTalk v" + Version.APP_VERSION);
+        if (isInternalCompanionDebugUiEnabled()) {
+            boolean readyToZip = Config.getBool("log.debug", false);
+            Menu debugMenu = new Menu("MobMateWhispTalk v" + Version.APP_VERSION);
 
-        if (!readyToZip) {
-            MenuItem enableDebugItem = new MenuItem(trayText("menu.debug.enableLog"));
-            enableDebugItem.addActionListener(e -> {
-                try {
-                    Config.appendOutTts("log.debug=true");
-                    Config.appendOutTts("log.vad.detailed=true");
-                    JOptionPane.showMessageDialog(
-                            null,
-                            "Debug logging enabled temporarily.\n"
-                                    + "Restart the app and reproduce the issue.\n"
-                                    + "(Automatically turns off after ~500 messages.)",
-                            "MobMate",
-                            JOptionPane.INFORMATION_MESSAGE
-                    );
-                    restartSelf(true);
-                } catch (Exception ex) {
-                    Config.log("Failed to Debug Log Output ON..");
-                }
-            });
-            debugMenu.add(enableDebugItem);
-        } else {
-            MenuItem zipLogsItem = new MenuItem(trayText("menu.debug.createZip"));
-            zipLogsItem.addActionListener(e -> {
-                try {
-                    File zip = DebugLogZipper.createZip();
-                    JOptionPane.showMessageDialog(
-                            null,
-                            "Debug logs have been collected.\n\n"
-                                    + "Please attach this zip file and send it to support.\n\n"
-                                    + zip.getAbsolutePath(),
-                            "MobMate",
-                            JOptionPane.INFORMATION_MESSAGE
-                    );
-                } catch (Exception ex) {
-                    Config.log("Failed to Debug Log Output Zipping..");
-                }
-            });
-            debugMenu.add(zipLogsItem);
+            if (!readyToZip) {
+                MenuItem enableDebugItem = new MenuItem(trayText("menu.debug.enableLog"));
+                enableDebugItem.addActionListener(e -> {
+                    try {
+                        Config.appendOutTts("log.debug=true");
+                        Config.appendOutTts("log.vad.detailed=true");
+                        JOptionPane.showMessageDialog(
+                                null,
+                                "Debug logging enabled temporarily.\n"
+                                        + "Restart the app and reproduce the issue.\n"
+                                        + "(Automatically turns off after ~500 messages.)",
+                                "MobMate",
+                                JOptionPane.INFORMATION_MESSAGE
+                        );
+                        restartSelf(true);
+                    } catch (Exception ex) {
+                        Config.log("Failed to Debug Log Output ON..");
+                    }
+                });
+                debugMenu.add(enableDebugItem);
+            } else {
+                MenuItem zipLogsItem = new MenuItem(trayText("menu.debug.createZip"));
+                zipLogsItem.addActionListener(e -> {
+                    try {
+                        File zip = DebugLogZipper.createZip();
+                        JOptionPane.showMessageDialog(
+                                null,
+                                "Debug logs have been collected.\n\n"
+                                        + "Please attach this zip file and send it to support.\n\n"
+                                        + zip.getAbsolutePath(),
+                                "MobMate",
+                                JOptionPane.INFORMATION_MESSAGE
+                        );
+                    } catch (Exception ex) {
+                        Config.log("Failed to Debug Log Output Zipping..");
+                    }
+                });
+                debugMenu.add(zipLogsItem);
+            }
+            popup.add(debugMenu);
+            popup.addSeparator();
         }
-        popup.add(debugMenu);
-
-        popup.addSeparator();
 
         MenuItem softRestartItem = new MenuItem("Soft Restart");
         softRestartItem.addActionListener(e -> softRestart());
@@ -4339,6 +5250,34 @@ public class MobMateWhisp implements NativeKeyListener {
         return names;
     }
 
+    public List<String> getCompanionOutputDeviceChoices() {
+        List<String> safe = new ArrayList<>();
+        for (String name : getOutputMixerNames()) {
+            if (!looksLikeVirtualAudioDeviceName(name)) {
+                safe.add(name);
+            }
+        }
+        if (safe.isEmpty()) {
+            safe.addAll(getOutputMixerNames());
+        }
+        return safe;
+    }
+
+    public String getPreferredCompanionOutputDevice() {
+        String current = prefs.get("companion.output.device", "").trim();
+        if (!current.isBlank()) {
+            return current;
+        }
+
+        String mainOutput = prefs.get("audio.output.device", "").trim();
+        if (!mainOutput.isBlank() && !looksLikeVirtualAudioDeviceName(mainOutput)) {
+            return mainOutput;
+        }
+
+        List<String> choices = getCompanionOutputDeviceChoices();
+        return choices.isEmpty() ? "" : choices.get(0);
+    }
+
     public List<String> getVirtualAudioOutputCandidates() {
         List<String> names = new ArrayList<>();
         for (String name : getOutputMixerNames()) {
@@ -4698,6 +5637,9 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile long lastRescueUtteranceSeq = -1L;
     private volatile long lastRescueAtMs = 0L;
     private volatile String lastRescueNorm = "";
+    private volatile long lastSpokenUtteranceSeq = -1L;
+    private volatile long lastSpokenUtteranceAtMs = 0L;
+    private volatile String lastSpokenUtteranceText = "";
     private volatile long pendingMoonshineCompleteUtteranceSeq = -1L;
     private volatile String pendingMoonshineCompleteText = "";
     volatile boolean isSpeaking = false;
@@ -4812,6 +5754,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     probeMicOnce(targetDataLine);
 
                     isStartingRecording.set(false);
+                    beginRecognitionAssistSession();
                     setRecording(true); // ここで初めて録音状態へ（UIもここで切り替わる）
                     try {
                         // --- VAD再キャリブレーション ---
@@ -4955,13 +5898,16 @@ public class MobMateWhisp implements NativeKeyListener {
                             long primingSinceMs = 0L;
                             boolean micWarned = false;
                             long lastAudibleMs = System.currentTimeMillis();
+                            int utteranceMaxPeak = 0;
+                            int utteranceMaxAvg = 0;
                             final boolean micDump = Config.getBool("log.debug", false);
                             while (isRecording()) {
                                 int n = targetDataLine.read(data, 0, data.length);
                                 if (n <= 0) continue;
+                                rememberCompanionRecentMicAudio(data, n, (int) audioFormat.getSampleRate());
 
                                 // ---- [ADD] VAD/Whisper用にだけ増幅したPCMを用意 ----
-                                float userGain = prefs.getFloat("audio.inputGainMultiplier", 1.0f);
+                                float userGain = getEffectiveInputGainMultiplier();
                                 float gain = userGain * autoGainMultiplier;
 
                                 byte[] pcm = data; // デフォは生PCM
@@ -4970,7 +5916,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                     System.arraycopy(data, 0, pcm, 0, n);
                                     applyPcmGain16leInPlace(pcm, n, gain);
                                 }
-                                String audioPrefilterModeNow = getAudioPrefilterMode();
+                                String audioPrefilterModeNow = getEffectiveTalkAudioPrefilterMode();
                                 String realtimeAudioPrefilterMode = isStrongAudioPrefilterMode(audioPrefilterModeNow)
                                         ? "normal"
                                         : audioPrefilterModeNow;
@@ -5308,6 +6254,8 @@ public class MobMateWhisp implements NativeKeyListener {
                                         clearMoonshineCompleteCandidate(-1L);
                                         lastPartialUpdateMs = 0L; // partial更新時刻もリセット
                                         preSpeechMoonFeedFrames = 0;
+                                        utteranceMaxPeak = 0;
+                                        utteranceMaxAvg = 0;
                                         Config.logDebug("★発話開始");
                                         // ★FIX: preRollをMoonshineに送る（発声冒頭の欠落防止）
                                         // streamはFinal時にresetStream済みなのでここではresetは不要
@@ -5329,6 +6277,8 @@ public class MobMateWhisp implements NativeKeyListener {
 //                                    }
                                     buffer.write(pcmForAsr, 0, n);
                                     rawSpeechBuffer.write(pcm, 0, n);
+                                    utteranceMaxPeak = Math.max(utteranceMaxPeak, peak);
+                                    utteranceMaxAvg = Math.max(utteranceMaxAvg, avg);
                                     appendActiveTalkProsodyTail(currentUtteranceSeq, pcm, n, now);
                                     partialBuf.write(pcmForAsr, 0, n);
                                     lastSpeechEndTime = now;
@@ -5595,6 +6545,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                                         + " filteredRms=" + String.format(java.util.Locale.ROOT, "%.1f", filteredMetrics.rms)
                                                         + " rawPeak=" + rawMetrics.peak
                                                         + " filteredPeak=" + filteredMetrics.peak);
+                                                noteRecognitionAssistCollapsedFinal(rawMetrics, filteredMetrics);
                                                 procChunk = AudioPrefilter.processForAsr(
                                                         trimmedRawChunk,
                                                         trimmedRawChunk.length,
@@ -5614,6 +6565,18 @@ public class MobMateWhisp implements NativeKeyListener {
                                         }
                                         final byte[] finalProcChunk = procChunk;
                                         final byte[] finalSpeakerChunk = trimmedRawChunk;
+                                        final CompanionObservation companionObservation = buildCompanionObservation(
+                                                currentUtteranceSeq,
+                                                nowMs - speechStartTime,
+                                                silenceFrames,
+                                                SILENCE_FRAMES_FOR_FINAL,
+                                                utteranceMaxPeak,
+                                                utteranceMaxAvg,
+                                                finalSpeakerChunk,
+                                                finalProcChunk,
+                                                useRescueText
+                                        );
+                                        rememberCompanionObservation(companionObservation);
 
                                         // ---- 状態リセット ----
                                         buffer.reset();
@@ -5644,6 +6607,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                                     if (prefs.getBoolean("speaker.enabled", false)
                                                             && speakerProfile.isReady()) {
                                                         speakerOk = speakerProfile.isMatchingSpeaker(finalSpeakerChunk);
+                                                        noteRecognitionAssistSpeakerGate(speakerOk);
                                                         if (!speakerOk) {
                                                             AudioPrefilter.VoiceMetrics rawSpeakerMetrics =
                                                                     AudioPrefilter.analyzeVoiceLike(
@@ -5840,6 +6804,7 @@ public class MobMateWhisp implements NativeKeyListener {
                         }
                     } catch (Exception ignore) {
                     }
+                    clearCompanionRecentMicAudio();
 
                     SwingUtilities.invokeLater(() -> {
                         window.setTitle(UiText.t("ui.title.idle"));
@@ -6030,6 +6995,3381 @@ public class MobMateWhisp implements NativeKeyListener {
     }
     // === Final確定の共通処理（rescueでも必ずここを通す） ===
     private volatile String lastSpeakStr = "";
+    private void maybeSubmitCompanionTurn(String sourceText, Action action, long utteranceSeq) {
+        if (!isCompanionEnabled()) {
+            Config.logDebug("[Companion] skipped: disabled");
+            return;
+        }
+        if (companionSuppressedForCurrentFinal.get()) {
+            Config.logDebug("[Companion] skipped: suppressed for current final");
+            return;
+        }
+        if (sourceText == null || sourceText.isBlank()) {
+            Config.logDebug("[Companion] skipped: blank source");
+            return;
+        }
+
+        final String text = sourceText.trim();
+        long now = System.currentTimeMillis();
+        lastUserMicTurnAtMs = now;
+        if (isLikelyCompanionEcho(text, now)) {
+            Config.logDebug("[Companion] skip likely echo: " + text);
+            return;
+        }
+        if (!shouldAcceptCompanionHeardText(text, now)) {
+            Config.logDebug("[Companion] skip duplicate heard text: " + text);
+            return;
+        }
+
+        rememberCompanionContext("user", text);
+        CompanionObservation observation = consumeCompanionObservation(utteranceSeq);
+        rememberCompanionSituation(text, observation);
+        if (observation != null) {
+            Config.logDebug("[Companion] submit turn: action=" + action + " text=" + text
+                    + " / obs=" + observation.summary());
+        } else {
+            Config.logDebug("[Companion] submit turn: action=" + action + " text=" + text);
+        }
+        SwingUtilities.invokeLater(() -> {
+            if (companionFrame != null) {
+                companionFrame.updateExchange(text, lastCompanionReplyText);
+            }
+        });
+
+        companionExecutor.submit(() -> runCompanionTurn(text, observation));
+        maybeQueueMicAutonomousStimulus(text, observation);
+    }
+
+    void noteHearingCaptionForCompanion(String text) {
+        noteDesktopAudioCaptionForCompanion("hearing_shared", text);
+    }
+
+    void noteDesktopAudioCaptionForCompanion(String route, String text) {
+        if (!isCompanionEnabled() || !isCompanionAutonomousEnabled()) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing reason=disabled route=" + route);
+            return;
+        }
+        if (text == null) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing reason=null route=" + route);
+            return;
+        }
+        String caption = text.trim();
+        if (caption.isBlank()) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing reason=blank route=" + route);
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (isTtsSpeaking || now < companionSuppressUntilMs || (ttsEndedMs > 0L && (now - ttsEndedMs) < 2000L)) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing reason=tts_guard route=" + route + " text=" + caption);
+            return;
+        }
+        if (isLikelyCompanionEcho(caption, now) || isShortPhoneticToken(caption)) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing reason=echo_or_short route=" + route + " text=" + caption);
+            return;
+        }
+        String dedupeKey = "hearing:" + normForNearDup(caption);
+        if (dedupeKey.endsWith(":")) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing reason=dedupe_blank route=" + route + " text=" + caption);
+            return;
+        }
+        int priority = estimateHearingStimulusPriority(caption);
+        lastHearingCaptionAtMs = now;
+        rememberCompanionHearingCaption(route, caption, priority, now);
+        CompanionStimulus stimulus = buildHearingContextStimulus(route, caption, priority, dedupeKey, now);
+        if (stimulus == null) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing reason=context_waiting route=" + route + " text=" + caption);
+            return;
+        }
+        Config.logDebug("[Companion][Stimulus] queued kind=hearing route=" + route
+                + " priority=" + stimulus.priority
+                + " text=" + stimulus.sourceText);
+        offerCompanionStimulus(stimulus);
+    }
+
+    void noteHearingAudioEventForCompanion(String eventKind,
+                                           double rms,
+                                           double zcr,
+                                           double voiceBandRatio,
+                                           int peak,
+                                           double floor) {
+        noteDesktopAudioEventForCompanion("hearing_shared", eventKind, rms, zcr, voiceBandRatio, peak, floor);
+    }
+
+    void noteDesktopAudioEventForCompanion(String route,
+                                           String eventKind,
+                                           double rms,
+                                           double zcr,
+                                           double voiceBandRatio,
+                                           int peak,
+                                           double floor) {
+        if (!isCompanionEnabled() || !isCompanionAutonomousEnabled()) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing_se reason=disabled route=" + route + " event=" + eventKind);
+            return;
+        }
+        String normalizedKind = (eventKind == null) ? "" : eventKind.trim().toLowerCase(Locale.ROOT);
+        if (normalizedKind.isBlank()) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing_se reason=blank_event route=" + route);
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (isTtsSpeaking || now < companionSuppressUntilMs || (ttsEndedMs > 0L && (now - ttsEndedMs) < 2000L)) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing_se reason=tts_guard route=" + route + " event=" + normalizedKind);
+            return;
+        }
+        String directReply = buildAutonomousHearingSeComment(normalizedKind);
+        if (directReply == null || directReply.isBlank()) {
+            Config.logDebug("[Companion][Stimulus] skip kind=hearing_se reason=no_match route=" + route + " event=" + normalizedKind);
+            return;
+        }
+        String sourceText = buildHearingSeSourceText(normalizedKind, rms, zcr, voiceBandRatio, peak);
+        String dedupeKey = "hearing_se:" + normalizedKind + ":" + (now / 8000L);
+        lastHearingCaptionAtMs = now;
+        Config.logDebug(String.format(
+                Locale.ROOT,
+                "[Companion][Stimulus] queued kind=hearing_se route=%s event=%s rms=%.1f zcr=%.3f vbr=%.3f peak=%d floor=%.1f text=%s",
+                route, normalizedKind, rms, zcr, voiceBandRatio, peak, floor, directReply
+        ));
+        offerCompanionStimulus(new CompanionStimulus(
+                "hearing_se",
+                sourceText,
+                directReply.trim(),
+                null,
+                now,
+                now + COMPANION_AUTO_HEARING_SE_DELAY_MS,
+                COMPANION_PRIORITY_HEARING_AUDIO_EVENT,
+                dedupeKey
+        ));
+    }
+
+    boolean shouldCompanionLoopbackUseCaptionPath() {
+        return (hearingFrame != null && hearingFrame.isMonitoringActive())
+                || shouldCompanionUseSpeechSemanticLane();
+    }
+
+    boolean shouldCompanionUseSpeechSemanticLane() {
+        return isCompanionEnabled() && isCompanionAutonomousEnabled();
+    }
+
+    void noteDesktopAudioPresenceForCompanion(String route,
+                                              double rms,
+                                              double voiceBandRatio,
+                                              int peak) {
+        if (!isCompanionEnabled() || !isCompanionAutonomousEnabled()) {
+            Config.logDebug("[Companion][Stimulus] skip kind=desktop_audio reason=disabled route=" + route);
+            return;
+        }
+        String normalizedRoute = route == null ? "" : route.trim().toLowerCase(Locale.ROOT);
+        if (!"companion_owned".equals(normalizedRoute)) {
+            Config.logDebug("[Companion][Stimulus] skip kind=desktop_audio reason=route_not_direct route=" + route);
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (isTtsSpeaking || now < companionSuppressUntilMs || (ttsEndedMs > 0L && (now - ttsEndedMs) < 2000L)) {
+            Config.logDebug("[Companion][Stimulus] skip kind=desktop_audio reason=tts_guard route=" + route);
+            return;
+        }
+        String sourceText = String.format(
+                Locale.ROOT,
+                "[desktop_audio_presence] route=%s rms=%.0f vbr=%.2f peak=%d",
+                normalizedRoute, rms, voiceBandRatio, peak
+        );
+        String dedupeKey = "desktop_audio:" + normalizedRoute + ":" + (now / COMPANION_AUTO_DESKTOP_AUDIO_DEDUPE_MS);
+        Config.logDebug(String.format(
+                Locale.ROOT,
+                "[Companion][Stimulus] queued kind=desktop_audio route=%s rms=%.1f vbr=%.3f peak=%d",
+                normalizedRoute, rms, voiceBandRatio, peak
+        ));
+        offerCompanionStimulus(new CompanionStimulus(
+                "desktop_audio",
+                sourceText,
+                null,
+                null,
+                now,
+                now + COMPANION_AUTO_DESKTOP_AUDIO_DELAY_MS,
+                COMPANION_PRIORITY_DESKTOP_AUDIO_DIRECT,
+                dedupeKey
+        ));
+    }
+
+    private void rememberCompanionHearingCaption(String route, String caption, int priority, long now) {
+        String locale = resolveCompanionLocale(caption);
+        synchronized (companionHearingCaptionLock) {
+            trimCompanionHearingCaptionHistory(now);
+            companionHearingCaptions.addLast(new CompanionHearingCaption(now, route, caption, locale, priority));
+        }
+    }
+
+    private CompanionStimulus buildHearingContextStimulus(String route,
+                                                          String latestCaption,
+                                                          int latestPriority,
+                                                          String latestDedupeKey,
+                                                          long now) {
+        List<CompanionHearingCaption> recent = snapshotRecentCompanionHearingCaptions(now);
+        if (recent.isEmpty()) {
+            return null;
+        }
+        List<String> uniqueTexts = new ArrayList<>();
+        LinkedHashSet<String> localeSet = new LinkedHashSet<>();
+        int strongestPriority = latestPriority;
+        int totalCodePoints = 0;
+        long oldestAtMs = Long.MAX_VALUE;
+        long newestAtMs = 0L;
+        for (CompanionHearingCaption item : recent) {
+            if (item == null || item.text.isBlank()) {
+                continue;
+            }
+            oldestAtMs = Math.min(oldestAtMs, item.createdAtMs);
+            newestAtMs = Math.max(newestAtMs, item.createdAtMs);
+            String norm = normForNearDup(item.text);
+            if (norm.isBlank()) {
+                continue;
+            }
+            boolean duplicate = uniqueTexts.stream().anyMatch(prev -> similarityRatio(prev, item.text) >= 0.90d);
+            if (!duplicate) {
+                uniqueTexts.add(item.text.trim());
+                totalCodePoints += item.text.codePointCount(0, item.text.length());
+            }
+            if (item.locale != null && !item.locale.isBlank()) {
+                localeSet.add(item.locale);
+            }
+            strongestPriority = Math.max(strongestPriority, item.priority);
+        }
+        if (uniqueTexts.isEmpty()) {
+            return null;
+        }
+        boolean mixedLocale = localeSet.size() >= 2;
+        long contextAgeMs = oldestAtMs == Long.MAX_VALUE ? 0L : Math.max(0L, now - oldestAtMs);
+        long contextSpanMs = oldestAtMs == Long.MAX_VALUE ? 0L : Math.max(0L, newestAtMs - oldestAtMs);
+        boolean strongCue = strongestPriority >= (COMPANION_PRIORITY_HEARING_CAPTION + 15);
+        boolean enoughUnique = uniqueTexts.size() >= (mixedLocale ? 3 : 2);
+        boolean soloLongEnough = !mixedLocale
+                && uniqueTexts.size() == 1
+                && totalCodePoints >= 42
+                && contextAgeMs >= COMPANION_HEARING_CONTEXT_SOLO_MIN_AGE_MS;
+        boolean strongCueReady = strongCue && (uniqueTexts.size() >= 2 || contextAgeMs >= COMPANION_HEARING_CONTEXT_STRONG_MIN_AGE_MS);
+        boolean shouldTrigger = enoughUnique || soloLongEnough || strongCueReady;
+        if (!shouldTrigger) {
+            return null;
+        }
+        if (!soloLongEnough && !strongCueReady && contextSpanMs < COMPANION_HEARING_CONTEXT_MIN_SPAN_MS) {
+            return null;
+        }
+        if ((now - lastCompanionHearingContextQueuedAtMs) < COMPANION_HEARING_CONTEXT_TRIGGER_COOLDOWN_MS) {
+            return null;
+        }
+
+        List<String> snippets = uniqueTexts.size() > 3
+                ? uniqueTexts.subList(Math.max(0, uniqueTexts.size() - 3), uniqueTexts.size())
+                : uniqueTexts;
+        String localeMix = localeSet.isEmpty() ? resolveCompanionLocale(latestCaption) : String.join("+", localeSet);
+        String aggregatedText = buildCompanionHearingPromptText(
+                route,
+                snippets,
+                localeMix,
+                mixedLocale,
+                strongCue,
+                contextAgeMs,
+                contextSpanMs
+        );
+        String aggregatedNorm = normForNearDup(aggregatedText);
+        if (aggregatedNorm.isBlank()) {
+            return null;
+        }
+        lastCompanionHearingContextQueuedAtMs = now;
+        return new CompanionStimulus(
+                "hearing",
+                aggregatedText,
+                null,
+                null,
+                now,
+                now + COMPANION_AUTO_HEARING_DELAY_MS,
+                strongestPriority + Math.min(10, uniqueTexts.size() * 2),
+                "hearing_ctx:" + aggregatedNorm + ":" + (now / 6000L)
+        );
+    }
+
+    private String buildCompanionHearingPromptText(String route,
+                                                   List<String> snippets,
+                                                   String localeMix,
+                                                   boolean mixedLocale,
+                                                   boolean strongCue,
+                                                   long contextAgeMs,
+                                                   long contextSpanMs) {
+        return buildCompanionHearingSceneSummary(route, snippets, localeMix, mixedLocale, strongCue, contextAgeMs, contextSpanMs);
+    }
+
+    private List<CompanionHearingCaption> snapshotRecentCompanionHearingCaptions(long now) {
+        synchronized (companionHearingCaptionLock) {
+            trimCompanionHearingCaptionHistory(now);
+            return new ArrayList<>(companionHearingCaptions);
+        }
+    }
+
+    private void trimCompanionHearingCaptionHistory(long now) {
+        while (!companionHearingCaptions.isEmpty()) {
+            CompanionHearingCaption first = companionHearingCaptions.peekFirst();
+            if (first == null || (now - first.createdAtMs) <= COMPANION_HEARING_CONTEXT_WINDOW_MS) {
+                break;
+            }
+            companionHearingCaptions.removeFirst();
+        }
+    }
+
+    private HearingContextSummary buildCompanionHearingContextSummary(long now) {
+        List<CompanionHearingCaption> recent = snapshotRecentCompanionHearingCaptions(now);
+        if (recent.isEmpty()) {
+            return new HearingContextSummary("", 0, "");
+        }
+        LinkedHashSet<String> localeSet = new LinkedHashSet<>();
+        List<String> snippets = new ArrayList<>();
+        for (CompanionHearingCaption item : recent) {
+            if (item == null || item.text.isBlank()) {
+                continue;
+            }
+            if (item.locale != null && !item.locale.isBlank()) {
+                localeSet.add(item.locale);
+            }
+            boolean duplicate = snippets.stream().anyMatch(prev -> similarityRatio(prev, item.text) >= 0.90d);
+            if (!duplicate) {
+                snippets.add(item.text.trim());
+            }
+        }
+        if (snippets.isEmpty()) {
+            return new HearingContextSummary("", 0, "");
+        }
+        List<String> tail = snippets.size() > 3
+                ? snippets.subList(Math.max(0, snippets.size() - 3), snippets.size())
+                : snippets;
+        String localeMix = localeSet.isEmpty() ? "" : String.join("+", localeSet);
+        long oldestAtMs = recent.stream()
+                .filter(item -> item != null)
+                .mapToLong(item -> item.createdAtMs)
+                .min()
+                .orElse(now);
+        long newestAtMs = recent.stream()
+                .filter(item -> item != null)
+                .mapToLong(item -> item.createdAtMs)
+                .max()
+                .orElse(now);
+        int strongestPriority = recent.stream()
+                .filter(item -> item != null)
+                .mapToInt(item -> item.priority)
+                .max()
+                .orElse(COMPANION_PRIORITY_HEARING_CAPTION);
+        boolean mixedLocale = localeSet.size() >= 2;
+        boolean strongCue = strongestPriority >= (COMPANION_PRIORITY_HEARING_CAPTION + 15);
+        String context = buildCompanionHearingSceneSummary(
+                "",
+                tail,
+                localeMix,
+                mixedLocale,
+                strongCue,
+                Math.max(0L, now - oldestAtMs),
+                Math.max(0L, newestAtMs - oldestAtMs)
+        );
+        return new HearingContextSummary(context, snippets.size(), localeMix);
+    }
+
+    private record HearingContextSummary(String context, int count, String localeMix) {}
+
+    private record CompanionSpeechSemanticSummary(List<String> snippets,
+                                                  long newestAtMs,
+                                                  String localeMix,
+                                                  int count,
+                                                  String route,
+                                                  String engine) {}
+
+    private String buildCompanionHearingSceneSummary(String route,
+                                                     List<String> snippets,
+                                                     String localeMix,
+                                                     boolean mixedLocale,
+                                                     boolean strongCue,
+                                                     long contextAgeMs,
+                                                     long contextSpanMs) {
+        String scene = classifyCompanionHearingScene(snippets, mixedLocale, strongCue);
+        String vibe = classifyCompanionHearingVibe(snippets, mixedLocale, strongCue);
+        String pace = classifyCompanionHearingPace(snippets, contextSpanMs);
+        String hint = pickCompanionHearingHint(snippets);
+        String mix = mixedLocale ? "mixed" : (localeMix == null || localeMix.isBlank() ? "single" : localeMix);
+
+        StringBuilder sb = new StringBuilder(160);
+        sb.append("[desktop_scene] ");
+        sb.append("scene=").append(scene);
+        sb.append(" vibe=").append(vibe);
+        sb.append(" pace=").append(pace);
+        sb.append(" mix=").append(mix);
+        if (contextAgeMs > 0L) {
+            sb.append(" age=").append(Math.max(0L, contextAgeMs / 1000L)).append("s");
+        }
+        if (route != null && !route.isBlank()) {
+            sb.append(" route=").append(route);
+        }
+        if (!hint.isBlank()) {
+            sb.append(" hint=").append(hint);
+        }
+        return sb.toString().trim();
+    }
+
+    private String classifyCompanionHearingScene(List<String> snippets, boolean mixedLocale, boolean strongCue) {
+        if (strongCue) {
+            return "hype_moment";
+        }
+        if (mixedLocale) {
+            return "mixed_chatter";
+        }
+        if (hasCompanionHearingQuestionCue(snippets)) {
+            return "questioning_talk";
+        }
+        if (hasCompanionHearingLongFormCue(snippets)) {
+            return "explaining_talk";
+        }
+        return "casual_talk";
+    }
+
+    private String classifyCompanionHearingVibe(List<String> snippets, boolean mixedLocale, boolean strongCue) {
+        if (strongCue) {
+            return "heated";
+        }
+        if (mixedLocale) {
+            return "busy";
+        }
+        if (hasCompanionHearingQuestionCue(snippets)) {
+            return "curious";
+        }
+        if (hasCompanionHearingLongFormCue(snippets)) {
+            return "focused";
+        }
+        return "steady";
+    }
+
+    private CompanionSpeechSemanticSummary buildCompanionSpeechSemanticSummary(long now) {
+        List<CompanionHearingCaption> recent = snapshotRecentCompanionHearingCaptions(now);
+        if (recent.isEmpty()) {
+            return new CompanionSpeechSemanticSummary(List.of(), 0L, "", 0, "", hearingSemanticEngineName());
+        }
+        ArrayList<String> uniqueSnippets = new ArrayList<>();
+        LinkedHashSet<String> localeSet = new LinkedHashSet<>();
+        long newestAtMs = 0L;
+        String latestRoute = "";
+        for (CompanionHearingCaption item : recent) {
+            if (item == null || item.text == null) {
+                continue;
+            }
+            String text = sanitizeSpeechSemanticSnippet(item.text);
+            if (text.isBlank()) {
+                continue;
+            }
+            newestAtMs = Math.max(newestAtMs, item.createdAtMs);
+            if (item.createdAtMs == newestAtMs && item.route != null && !item.route.isBlank()) {
+                latestRoute = item.route;
+            }
+            if (item.locale != null && !item.locale.isBlank()) {
+                localeSet.add(item.locale);
+            }
+            boolean duplicate = uniqueSnippets.stream().anyMatch(prev -> similarityRatio(prev, text) >= 0.90d);
+            if (!duplicate) {
+                uniqueSnippets.add(text);
+            }
+        }
+        if (uniqueSnippets.isEmpty()) {
+            return new CompanionSpeechSemanticSummary(List.of(), 0L, "", 0, latestRoute, hearingSemanticEngineName());
+        }
+        if (uniqueSnippets.size() < 2) {
+            return new CompanionSpeechSemanticSummary(List.of(), newestAtMs, "", uniqueSnippets.size(), latestRoute, hearingSemanticEngineName());
+        }
+        List<String> tail = uniqueSnippets.size() > COMPANION_SPEECH_SEMANTIC_MAX_SNIPPETS
+                ? new ArrayList<>(uniqueSnippets.subList(
+                Math.max(0, uniqueSnippets.size() - COMPANION_SPEECH_SEMANTIC_MAX_SNIPPETS),
+                uniqueSnippets.size()))
+                : new ArrayList<>(uniqueSnippets);
+        String localeMix = localeSet.isEmpty() ? "" : String.join("+", localeSet);
+        return new CompanionSpeechSemanticSummary(
+                tail,
+                newestAtMs,
+                localeMix,
+                uniqueSnippets.size(),
+                latestRoute,
+                hearingSemanticEngineName()
+        );
+    }
+
+    private String sanitizeSpeechSemanticSnippet(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String text = raw
+                .replace('\r', ' ')
+                .replace('\n', ' ')
+                .trim();
+        if (text.isBlank()) {
+            return "";
+        }
+        int letterOrDigitCount = 0;
+        int nonSpaceCount = 0;
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            i += Character.charCount(cp);
+            if (!Character.isWhitespace(cp)) {
+                nonSpaceCount++;
+            }
+            if (Character.isLetterOrDigit(cp)) {
+                letterOrDigitCount++;
+            }
+        }
+        if (nonSpaceCount < 2 || letterOrDigitCount < 2) {
+            return "";
+        }
+        return text;
+    }
+
+    private String hearingSemanticEngineName() {
+        return isHearingEngineMoonshine() ? "moonshine" : "whisper";
+    }
+
+    private String classifyCompanionHearingPace(List<String> snippets, long contextSpanMs) {
+        int count = snippets == null ? 0 : snippets.size();
+        if (count >= 3 && contextSpanMs <= 6_000L) {
+            return "fast";
+        }
+        if (count >= 2 && contextSpanMs <= 14_000L) {
+            return "steady";
+        }
+        return "slow";
+    }
+
+    private boolean hasCompanionHearingQuestionCue(List<String> snippets) {
+        if (snippets == null) {
+            return false;
+        }
+        int hits = 0;
+        for (String snippet : snippets) {
+            String text = snippet == null ? "" : snippet.trim().toLowerCase(Locale.ROOT);
+            if (text.isBlank()) {
+                continue;
+            }
+            if (text.contains("?") || text.contains("？")
+                    || text.contains(" why ") || text.startsWith("why ")
+                    || text.contains(" what ") || text.startsWith("what ")
+                    || text.contains(" how ") || text.startsWith("how ")
+                    || text.contains("なんで") || text.contains("なに") || text.contains("どう")
+                    || text.contains("吗") || text.contains("嗎") || text.contains("왜") || text.contains("뭐")) {
+                hits++;
+            }
+        }
+        return hits >= 1;
+    }
+
+    private boolean hasCompanionHearingLongFormCue(List<String> snippets) {
+        if (snippets == null || snippets.isEmpty()) {
+            return false;
+        }
+        int longCount = 0;
+        for (String snippet : snippets) {
+            if (snippet == null || snippet.isBlank()) {
+                continue;
+            }
+            if (snippet.codePointCount(0, snippet.length()) >= 10) {
+                longCount++;
+            }
+        }
+        return longCount >= 2;
+    }
+
+    private String pickCompanionHearingHint(List<String> snippets) {
+        if (snippets == null || snippets.isEmpty()) {
+            return "";
+        }
+        String best = "";
+        int bestScore = -1;
+        for (String snippet : snippets) {
+            if (snippet == null || snippet.isBlank()) {
+                continue;
+            }
+            String sanitized = snippet.replace('\r', ' ')
+                    .replace('\n', ' ')
+                    .trim();
+            int codePoints = sanitized.codePointCount(0, sanitized.length());
+            if (codePoints < 3) {
+                continue;
+            }
+            int score = Math.min(24, codePoints);
+            if (sanitized.contains("?") || sanitized.contains("？")) {
+                score += 4;
+            }
+            if (score > bestScore) {
+                best = shortenForLog(sanitized, 18).replace(' ', '_');
+                bestScore = score;
+            }
+        }
+        return best;
+    }
+
+    private void maybeQueueMicAutonomousStimulus(String sourceText, CompanionObservation observation) {
+        if (!isCompanionEnabled() || !isCompanionAutonomousEnabled() || observation == null) {
+            return;
+        }
+        String micStyle = getCompanionMicStyle();
+        String directReply = buildAutonomousMicComment(sourceText, observation);
+        if (directReply == null || directReply.isBlank()) {
+            Config.logDebug("[Companion][Stimulus] skip kind=mic reason=no_match style=" + micStyle
+                    + " obs=" + observation.summary());
+            return;
+        }
+        long now = System.currentTimeMillis();
+        String dedupeKey = "mic:" + normForNearDup(directReply);
+        Config.logDebug("[Companion][Stimulus] queued kind=mic style=" + micStyle + " text=" + directReply.trim()
+                + (sourceText == null || sourceText.isBlank() ? "" : " / source=" + sourceText.trim()));
+        offerCompanionStimulus(new CompanionStimulus(
+                "mic",
+                sourceText == null ? "" : sourceText.trim(),
+                directReply.trim(),
+                observation,
+                now,
+                now + COMPANION_AUTO_MIC_DELAY_MS,
+                COMPANION_PRIORITY_MIC_OBSERVATION,
+                dedupeKey
+        ));
+    }
+
+    private void offerCompanionStimulus(CompanionStimulus stimulus) {
+        if (stimulus == null || stimulus.dedupeKey == null || stimulus.dedupeKey.isBlank()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        synchronized (companionStimulusLock) {
+            companionStimulusSeenAtMs.entrySet().removeIf(e -> now - e.getValue() > COMPANION_AUTO_STIMULUS_MAX_AGE_MS);
+            Long prevSeen = companionStimulusSeenAtMs.get(stimulus.dedupeKey);
+            if (prevSeen != null && now - prevSeen < COMPANION_AUTO_STIMULUS_MAX_AGE_MS) {
+                return;
+            }
+            companionStimulusSeenAtMs.put(stimulus.dedupeKey, now);
+            companionStimuli.removeIf(existing ->
+                    existing != null
+                            && (("async_tick".equals(stimulus.kind) && "async_tick".equals(existing.kind))
+                            || (existing.dedupeKey != null
+                            && similarityRatio(existing.dedupeKey, stimulus.dedupeKey) >= 0.90d)));
+            companionStimuli.addLast(stimulus);
+        }
+    }
+
+    private void drainCompanionStimuli() {
+        if (!isCompanionEnabled() || !isCompanionAutonomousEnabled()) {
+            return;
+        }
+        if (companionTurnRunning.get()) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if ((now - lastCompanionAutonomousAtMs) < scaledCompanionAutonomousCooldownMs(COMPANION_AUTO_GLOBAL_COOLDOWN_MS)) {
+            return;
+        }
+        maybeOfferCompanionAsyncBrainStimulus(now);
+        CompanionStimulus next = null;
+        synchronized (companionStimulusLock) {
+            companionStimuli.removeIf(item -> item == null || (now - item.createdAtMs) > COMPANION_AUTO_STIMULUS_MAX_AGE_MS);
+            for (CompanionStimulus item : companionStimuli) {
+                if (item == null || now < item.readyAtMs || !isCompanionStimulusCooldownSatisfied(item, now)) {
+                    continue;
+                }
+                if (next == null
+                        || item.priority > next.priority
+                        || (item.priority == next.priority && item.createdAtMs > next.createdAtMs)) {
+                    next = item;
+                }
+            }
+            if (next != null) {
+                companionStimuli.remove(next);
+            }
+        }
+        if (next == null) {
+            return;
+        }
+        CompanionStimulus stimulus = next;
+        companionExecutor.submit(() -> runCompanionStimulus(stimulus));
+    }
+
+    private void maybeOfferCompanionAsyncBrainStimulus(long now) {
+        if (!isCompanionEnabled() || !isCompanionAutonomousEnabled()) {
+            return;
+        }
+        if (isTtsSpeaking || now < companionSuppressUntilMs || (ttsEndedMs > 0L && (now - ttsEndedMs) < 2000L)) {
+            return;
+        }
+        String sceneMemo = currentSceneMemoValue(now);
+        String sceneDetail = currentSceneDetailValue(now);
+        String audioMemo = currentAudioMemoValue(now);
+        String audioDetail = currentAudioDetailValue(now);
+        CompanionSpeechSemanticSummary speechSummary = buildCompanionSpeechSemanticSummary(now);
+        boolean hasVisual = !sceneMemo.isBlank() || !sceneDetail.isBlank();
+        boolean hasAudio = !audioMemo.isBlank() || !audioDetail.isBlank();
+        boolean hasSpeechThread = speechSummary.count() >= 2 && !speechSummary.snippets().isEmpty();
+        if (!hasVisual && !hasAudio && !hasSpeechThread) {
+            return;
+        }
+        long visualAnchor = Math.max(companionLatestSceneDetailAtMs, companionLatestSceneMemoAtMs);
+        long audioAnchor = Math.max(companionLastAudioObserveCompletedAtMs, companionLatestAudioMemoAtMs);
+        long speechAnchor = speechSummary.newestAtMs();
+        String dedupeKey = "async_tick:"
+                + (visualAnchor / 3000L) + ":"
+                + (audioAnchor / 3000L) + ":"
+                + (speechAnchor / 3000L) + ":"
+                + Math.min(10, speechSummary.count());
+        Config.logDebug("[Companion][AsyncTick] queued"
+                + " visual=" + (hasVisual ? "1" : "0")
+                + " audio=" + (hasAudio ? "1" : "0")
+                + " speech=" + Math.min(99, speechSummary.count())
+                + " scene=" + shortenForLog(defaultIfBlank(sceneDetail, sceneMemo), 72)
+                + (audioDetail.isBlank() && audioMemo.isBlank() ? "" : " audioMemo=" + shortenForLog(defaultIfBlank(audioDetail, audioMemo), 56)));
+        offerCompanionStimulus(new CompanionStimulus(
+                "async_tick",
+                "",
+                "async_tick",
+                null,
+                null,
+                now,
+                now + COMPANION_ASYNC_TICK_READY_DELAY_MS,
+                COMPANION_PRIORITY_ASYNC_TICK,
+                dedupeKey
+        ));
+    }
+
+    private void runCompanionStimulus(CompanionStimulus stimulus) {
+        if (stimulus == null || !isCompanionEnabled()) {
+            return;
+        }
+        if (!companionTurnRunning.compareAndSet(false, true)) {
+            offerCompanionStimulus(stimulus);
+            return;
+        }
+        try {
+            if (stimulus.directReplyText != null && !stimulus.directReplyText.isBlank()) {
+                emitAutonomousCompanionReply(stimulus.kind, stimulus.sourceText, stimulus.directReplyText.trim());
+                return;
+            }
+            boolean asyncTick = "async_tick".equals(stimulus.kind)
+                    || "async_tick".equalsIgnoreCase(defaultIfBlank(stimulus.sourceKindHint, ""));
+            if ((stimulus.sourceText == null || stimulus.sourceText.isBlank()) && !asyncTick) {
+                return;
+            }
+            Config.logDebug("[Companion][Auto] kind=" + stimulus.kind
+                    + " route=sidecar"
+                    + (defaultIfBlank(stimulus.sourceKindHint, "").isBlank() ? "" : " sourceKind=" + stimulus.sourceKindHint)
+                    + (stimulus.sourceText == null || stimulus.sourceText.isBlank() ? "" : " source=" + stimulus.sourceText));
+            String visibleSourceText = sanitizeCompanionUserFacingText(stimulus.sourceText);
+            if (!visibleSourceText.isBlank()) {
+                rememberCompanionContext("user", visibleSourceText);
+            }
+            long beforeReplyAtMs = lastCompanionReplyAtMs;
+            runCompanionTurn(stimulus.sourceText, stimulus.observation, asyncTick, stimulus.sourceKindHint);
+            if (lastCompanionReplyAtMs > beforeReplyAtMs) {
+                lastCompanionAutonomousAtMs = lastCompanionReplyAtMs;
+            }
+        } finally {
+            companionTurnRunning.set(false);
+        }
+    }
+
+    private void emitAutonomousCompanionReply(String kind, String sourceText, String replyText) {
+        String visibleReplyText = sanitizeCompanionReplyText(replyText);
+        if (visibleReplyText.isBlank()) {
+            return;
+        }
+        rememberCompanionContext("assistant", visibleReplyText);
+        lastCompanionReplyText = visibleReplyText;
+        lastCompanionReplyAtMs = System.currentTimeMillis();
+        lastCompanionAutonomousAtMs = lastCompanionReplyAtMs;
+        Config.logDebug("[Companion][Auto] kind=" + kind + " text=" + visibleReplyText
+                + (sourceText == null || sourceText.isBlank() ? "" : " / source=" + sourceText));
+        boolean speakCompanionAudio = shouldSpeakCompanionAudio();
+        SwingUtilities.invokeLater(() -> {
+            if (companionFrame != null) {
+                companionFrame.updateStatus("Companion auto [" + kind + "]");
+                companionFrame.updateExchange(sourceText == null ? "" : sourceText, visibleReplyText);
+                companionFrame.startReplyAnimation(visibleReplyText, speakCompanionAudio);
+            }
+        });
+        if (speakCompanionAudio) {
+            speakCompanionText(visibleReplyText);
+        }
+    }
+
+    private boolean isCompanionStimulusCooldownSatisfied(CompanionStimulus stimulus, long now) {
+        long directCooldown = ("mic".equals(stimulus.kind) && stimulus.directReplyText != null && !stimulus.directReplyText.isBlank())
+                ? COMPANION_AUTO_AFTER_DIRECT_REPLY_MIC_LOCAL_MS
+                : COMPANION_AUTO_AFTER_DIRECT_REPLY_MS;
+        if ((now - lastCompanionReplyAtMs) < directCooldown) {
+            return false;
+        }
+        if ((now - lastUserMicTurnAtMs) < COMPANION_AUTO_AFTER_MIC_MS) {
+            return false;
+        }
+        return true;
+    }
+
+    private int estimateHearingStimulusPriority(String caption) {
+        if (caption == null) {
+            return COMPANION_PRIORITY_HEARING_CAPTION;
+        }
+        String text = caption.trim();
+        if (text.isBlank()) {
+            return COMPANION_PRIORITY_HEARING_CAPTION;
+        }
+        if (containsAnyIgnoreCase(text, "boss", "win", "nice", "danger", "warning", "clear", "critical")
+                || text.contains("危ない")
+                || text.contains("やば")
+                || text.contains("勝")
+                || text.contains("死")
+                || text.contains("ナイス")
+                || text.contains("うお")
+                || text.contains("わあ")
+                || text.contains("！")
+                || text.contains("!")) {
+            return COMPANION_PRIORITY_HEARING_CAPTION + 15;
+        }
+        return COMPANION_PRIORITY_HEARING_CAPTION;
+    }
+
+    private String buildAutonomousMicComment(String sourceText, CompanionObservation observation) {
+        if (observation == null) {
+            return "";
+        }
+        String locale = resolveCompanionEventLocale();
+        String tone = prefs.get("companion.tone", "desu");
+        String micStyle = getCompanionMicStyle();
+        String text = sanitizeCompanionUserFacingText(sourceText).trim();
+
+        boolean sighLike = isAutonomousSighLike(observation);
+        boolean lowEnergy = isAutonomousLowEnergy(observation);
+        boolean shortReaction = isAutonomousShortReaction(text, observation);
+        boolean strongBurst = observation.maxPeak >= 11000
+                && observation.procRms >= 1800.0d
+                && observation.speechDurationMs <= 2200L;
+        boolean heatedRun = observation.speechDurationMs >= 2600L
+                && observation.procRms >= 1500.0d
+                && observation.maxPeak >= 7000;
+
+        if ("tsukkomi".equals(micStyle)) {
+            if (sighLike) {
+                return formatCompanionTone(locale, tone,
+                        "今のため息、だいぶ本音",
+                        "that sigh gave you away",
+                        "刚刚那声叹气太真实了",
+                        "방금 한숨에 진심이 다 새어 나왔");
+            }
+            if (strongBurst) {
+                return formatCompanionTone(locale, tone,
+                        "今の入り、勢いありすぎ",
+                        "that opening had way too much force",
+                        "刚刚那个开场也太猛了",
+                        "방금 들어가는 힘이 너무 셌");
+            }
+            if (shortReaction) {
+                return formatCompanionTone(locale, tone,
+                        "今の反応、わかりやすすぎ",
+                        "that reaction was way too obvious",
+                        "刚刚那个反应也太好懂了",
+                        "방금 반응이 너무 티 났");
+            }
+            if (heatedRun) {
+                return formatCompanionTone(locale, tone,
+                        "今の語り、熱入りすぎ",
+                        "you got really fired up there",
+                        "刚刚那段你说得也太投入了",
+                        "방금 말투에 열이 너무 올랐");
+            }
+            if (lowEnergy) {
+                return formatCompanionTone(locale, tone,
+                        "今ちょっとしおしおすぎ",
+                        "you sound a little too deflated right now",
+                        "你现在听起来有点太没劲了",
+                        "지금은 좀 너무 기운이 빠졌");
+            }
+            return "";
+        }
+
+        if (sighLike) {
+            return formatCompanionTone(locale, tone,
+                    "ちょっと疲れてそう",
+                    "you sound a little worn out",
+                    "听起来有点累了",
+                    "조금 지친 것 같");
+        }
+        if (lowEnergy) {
+            return formatCompanionTone(locale, tone,
+                    "ちょっと力抜けてそう",
+                    "you sound like you're running low on energy",
+                    "听起来像是有点没电了",
+                    "조금 힘이 빠진 것 같");
+        }
+        if (shortReaction) {
+            return formatCompanionTone(locale, tone,
+                    "今の反応かわいかった",
+                    "that reaction was kind of cute",
+                    "刚刚那个反应还挺可爱的",
+                    "방금 반응이 좀 귀여웠");
+        }
+        if (strongBurst) {
+            return formatCompanionTone(locale, tone,
+                    "今の入りかなり勢いあった",
+                    "that start had a lot of energy",
+                    "刚刚开口的劲头很足",
+                    "방금 시작할 때 힘이 꽤 있었");
+        }
+        if (heatedRun) {
+            return formatCompanionTone(locale, tone,
+                    "今の話し方、熱入ってた",
+                    "you were really into that just now",
+                    "你刚刚那段讲得很投入",
+                    "방금 말하는 데 꽤 열이 들어갔");
+        }
+        return "";
+    }
+
+    private String buildAutonomousHearingSeComment(String eventKind) {
+        String locale = resolveCompanionEventLocale();
+        String tone = prefs.get("companion.tone", "desu");
+        return switch (eventKind) {
+            case "impact_like" -> formatCompanionTone(locale, tone,
+                    "今の爆発音かなり大きい",
+                    "that blast sounded huge",
+                    "刚刚那声爆炸很猛",
+                    "방금 폭발음이 꽤 컸");
+            case "crowd_like" -> formatCompanionTone(locale, tone,
+                    "今かなり湧いてる",
+                    "the crowd sounds really fired up",
+                    "现在气氛一下子热起来了",
+                    "지금 분위기가 확 달아올랐");
+            case "alarm_like" -> formatCompanionTone(locale, tone,
+                    "今の警告音ちょっと物騒",
+                    "that warning sound felt serious",
+                    "刚刚那个警报声有点不妙",
+                    "방금 경고음이 꽤 심상치 않");
+            case "intense_nonvoice" -> formatCompanionTone(locale, tone,
+                    "今の音かなり荒れてる",
+                    "things sound pretty intense right now",
+                    "现在这阵声音相当激烈",
+                    "지금 소리가 꽤 거칠");
+            default -> "";
+        };
+    }
+
+    private String buildHearingSeSourceText(String eventKind,
+                                            double rms,
+                                            double zcr,
+                                            double voiceBandRatio,
+                                            int peak) {
+        return String.format(
+                Locale.ROOT,
+                "[loopback:%s rms=%.1f zcr=%.3f vbr=%.3f peak=%d]",
+                eventKind,
+                rms,
+                zcr,
+                voiceBandRatio,
+                peak
+        );
+    }
+
+    private boolean isAutonomousSighLike(CompanionObservation observation) {
+        if (observation == null) {
+            return false;
+        }
+        return observation.maxPeak <= 10000
+                && observation.maxAvg <= 2200
+                && observation.procRms <= 1900.0d
+                && observation.speechDurationMs >= 300L
+                && observation.speechDurationMs <= 1800L
+                && observation.trailingSilenceMs >= 900L;
+    }
+
+    private boolean isAutonomousLowEnergy(CompanionObservation observation) {
+        if (observation == null) {
+            return false;
+        }
+        return observation.procRms > 0.0d
+                && observation.procRms <= 900.0d
+                && observation.speechDurationMs >= 1500L;
+    }
+
+    private boolean isAutonomousShortReaction(String text, CompanionObservation observation) {
+        if (observation == null) {
+            return false;
+        }
+        String normalized = text == null ? "" : text.trim();
+        int codePoints = normalized.codePointCount(0, normalized.length());
+        return codePoints > 0
+                && codePoints <= 6
+                && observation.speechDurationMs <= 1800L
+                && observation.maxPeak >= 4500;
+    }
+
+    private String formatCompanionTone(String locale, String tone, String jaStem, String enStem, String zhStem, String koStem) {
+        String normalizedTone = (tone == null ? "desu" : tone.trim().toLowerCase(Locale.ROOT));
+        return switch (normalizeCompanionLocaleTag(locale)) {
+            case "en" -> switch (normalizedTone) {
+                case "yansu" -> enStem + ", cap'n.";
+                case "ssu" -> enStem + ", boss.";
+                case "noda" -> enStem + ", you know.";
+                case "dayomon" -> enStem + ", buddy.";
+                case "nanodesu" -> enStem + ", indeed.";
+                default -> enStem + ", sir.";
+            };
+            case "zh" -> switch (normalizedTone) {
+                case "yansu", "dayomon" -> zhStem + "呀。";
+                case "ssu" -> zhStem + "哦。";
+                case "noda" -> zhStem + "嘛。";
+                case "nanodesu" -> zhStem + "呢。";
+                default -> zhStem + "呢。";
+            };
+            case "ko" -> switch (normalizedTone) {
+                case "yansu" -> koStem + "네요, 얀수.";
+                case "ssu" -> koStem + "네요, 스.";
+                case "noda" -> koStem + "군요.";
+                case "dayomon", "nanodesu" -> koStem + "네요.";
+                default -> koStem + "네요.";
+            };
+            default -> switch (normalizedTone) {
+                case "yansu" -> jaStem + "でやんすね。";
+                case "ssu" -> jaStem + "ッスね。";
+                case "noda" -> jaStem + "なのだ。";
+                case "dayomon" -> jaStem + "だよもん。";
+                case "nanodesu" -> jaStem + "なのです。";
+                default -> jaStem + "デスね。";
+            };
+        };
+    }
+
+    private boolean containsAnyIgnoreCase(String text, String... needles) {
+        if (text == null || text.isBlank() || needles == null) {
+            return false;
+        }
+        String lower = text.toLowerCase(Locale.ROOT);
+        for (String needle : needles) {
+            if (needle != null && !needle.isBlank() && lower.contains(needle.toLowerCase(Locale.ROOT))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void rememberCompanionSituation(String sourceText, CompanionObservation observation) {
+        String visibleSourceText = sanitizeCompanionUserFacingText(sourceText);
+        if (visibleSourceText.isBlank() && observation == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        TtsProsodyProfile profile = snapshotRecentCompanionProsodyProfile();
+        CompanionSituationSample sample = new CompanionSituationSample(
+                now,
+                visibleSourceText,
+                observation,
+                profile == null ? "neutral" : profile.mood(),
+                profile == null ? 0.0f : profile.energyScore(),
+                profile == null ? 0.0f : profile.darkScore(),
+                profile == null ? 1.0f : profile.speedScale()
+        );
+        synchronized (companionSituationLock) {
+            trimCompanionSituationHistory(now);
+            companionSituationHistory.addLast(sample);
+            while (companionSituationHistory.size() > 180) {
+                companionSituationHistory.removeFirst();
+            }
+        }
+    }
+
+    private CompanionSituationSummary buildCompanionSituationSummary(String sourceText, CompanionObservation currentObservation) {
+        long now = System.currentTimeMillis();
+        List<CompanionSituationSample> samples = new ArrayList<>();
+        synchronized (companionSituationLock) {
+            trimCompanionSituationHistory(now);
+            samples.addAll(companionSituationHistory);
+        }
+
+        int sighCount = 0;
+        int utteranceCount5Min = 0;
+        boolean excitementBurst = false;
+        double recentEnergySum = 0.0d;
+        int recentEnergyCount = 0;
+        double earlierEnergySum = 0.0d;
+        int earlierEnergyCount = 0;
+        int recentTurns = 0;
+        int earlierTurns = 0;
+        double recentDarkSum = 0.0d;
+        int recentDarkCount = 0;
+        Map<String, Integer> moodCounts = new HashMap<>();
+        List<String> recentTexts = new ArrayList<>();
+
+        for (CompanionSituationSample sample : samples) {
+            long ageMs = now - sample.createdAtMs;
+            if (ageMs <= COMPANION_SUMMARY_WINDOW_MS) {
+                utteranceCount5Min++;
+                if (isSituationSighLike(sample.userText, sample.observation)) {
+                    sighCount++;
+                }
+                if (isSituationExcited(sample)) {
+                    excitementBurst = true;
+                }
+                if (!sample.userText.isBlank()) {
+                    recentTexts.add(sample.userText);
+                }
+                double activity = situationActivityScore(sample);
+                if (ageMs <= 90_000L) {
+                    recentTurns++;
+                    recentEnergySum += activity;
+                    recentEnergyCount++;
+                } else if (ageMs <= COMPANION_SUMMARY_WINDOW_MS) {
+                    earlierTurns++;
+                    earlierEnergySum += activity;
+                    earlierEnergyCount++;
+                }
+            }
+            if (ageMs <= COMPANION_SUMMARY_MOOD_WINDOW_MS && sample.mood != null && !sample.mood.isBlank()) {
+                moodCounts.merge(sample.mood, 1, Integer::sum);
+                recentDarkSum += Math.max(0.0d, sample.darkScore);
+                recentDarkCount++;
+            }
+        }
+
+        String energyTrend = "stable";
+        if (recentEnergyCount > 0 && earlierEnergyCount > 0) {
+            double recentAvg = recentEnergySum / recentEnergyCount;
+            double earlierAvg = earlierEnergySum / earlierEnergyCount;
+            if ((recentAvg - earlierAvg) >= 0.12d) {
+                energyTrend = "rising";
+            } else if ((earlierAvg - recentAvg) >= 0.12d) {
+                energyTrend = "falling";
+            }
+        } else if (recentEnergyCount > 0) {
+            double recentAvg = recentEnergySum / recentEnergyCount;
+            if (recentAvg >= 0.66d) {
+                energyTrend = "rising";
+            } else if (recentAvg <= 0.28d) {
+                energyTrend = "falling";
+            }
+        }
+
+        String moodDominant = "neutral";
+        int moodBest = -1;
+        for (Map.Entry<String, Integer> entry : moodCounts.entrySet()) {
+            if (entry.getValue() > moodBest) {
+                moodBest = entry.getValue();
+                moodDominant = entry.getKey();
+            }
+        }
+        if (moodBest < 0 && currentObservation != null) {
+            moodDominant = inferSituationMood(currentObservation);
+        }
+        String utteranceTrend = deriveSituationUtteranceTrend(utteranceCount5Min, recentTurns, earlierTurns);
+        double recentDarkAvg = recentDarkCount <= 0 ? 0.0d : (recentDarkSum / recentDarkCount);
+        String fatigueLevel = deriveSituationFatigueLevel(
+                energyTrend,
+                utteranceTrend,
+                sighCount,
+                recentDarkAvg,
+                currentObservation
+        );
+
+        boolean stuckDetected = isSituationStuck(recentTexts, sourceText, getLastPartial());
+        long sinceLastMicMs = lastUserMicTurnAtMs > 0L ? (now - lastUserMicTurnAtMs) : Long.MAX_VALUE;
+        long sinceLastHearingMs = lastHearingCaptionAtMs > 0L ? (now - lastHearingCaptionAtMs) : Long.MAX_VALUE;
+        long sinceLastReplyMs = lastCompanionReplyAtMs > 0L ? (now - lastCompanionReplyAtMs) : Long.MAX_VALUE;
+        boolean hasCompanionActivity = lastUserMicTurnAtMs > 0L || lastHearingCaptionAtMs > 0L || lastCompanionReplyAtMs > 0L;
+        boolean observationLongSilence = currentObservation != null
+                && currentObservation.trailingSilenceMs >= COMPANION_SUMMARY_LONG_SILENCE_MS;
+        boolean idleLongSilence = hasCompanionActivity
+                && sinceLastMicMs >= COMPANION_SUMMARY_LONG_SILENCE_MS
+                && sinceLastHearingMs >= COMPANION_SUMMARY_RECENT_ACTIVITY_GUARD_MS
+                && sinceLastReplyMs >= COMPANION_SUMMARY_RECENT_ACTIVITY_GUARD_MS;
+        boolean longSilence = observationLongSilence || idleLongSilence;
+        HearingContextSummary hearingContextSummary = buildCompanionHearingContextSummary(now);
+        String sourceKind = inferCompanionMultimodalSourceKind(sourceText);
+        boolean desktopAudioSource = isCompanionDesktopAudioSourceKind(sourceKind);
+        String visibleSourceText = sanitizeCompanionUserFacingText(sourceText);
+        String lastUserText = desktopAudioSource
+                ? ""
+                : (!visibleSourceText.isBlank() ? visibleSourceText : latestSituationUserText(samples));
+        String lastEchoText = desktopAudioSource ? "" : lastCompanionReplyText;
+        String lastTtsText = desktopAudioSource ? "" : lastSpeakStr;
+
+        String windowTitle = cachedCompanionSituationWindowTitle(now);
+        return new CompanionSituationSummary(
+                windowTitle,
+                Math.max(0L, (now - companionSessionStartedAtMs) / 60_000L),
+                currentCompanionWeekday(),
+                currentCompanionTimeBand(),
+                companionSinceLastLaunchHours(now),
+                companionLaunchCountToday,
+                classifyCompanionAppKind(windowTitle),
+                deriveCompanionWindowStability(now),
+                energyTrend,
+                utteranceTrend,
+                moodDominant,
+                fatigueLevel,
+                sighCount,
+                stuckDetected,
+                excitementBurst,
+                longSilence,
+                utteranceCount5Min,
+                currentSceneMemoSummary(now),
+                currentAudioMemoSummary(now),
+                hearingContextSummary.context(),
+                hearingContextSummary.count(),
+                hearingContextSummary.localeMix(),
+                lastUserText,
+                lastEchoText,
+                getLastPartial(),
+                getCompanionMicStyle(),
+                isTtsSpeaking,
+                lastTtsText
+        );
+    }
+
+    private void rememberCompanionSituationSummary(CompanionSituationSummary summary) {
+        if (summary == null) {
+            return;
+        }
+        companionUiWindowTitle = summary.windowTitle;
+        companionUiMoodDominant = summary.moodDominant;
+        companionUiEnergyTrend = summary.energyTrend;
+        companionUiUtteranceTrend = summary.utteranceTrend;
+        companionUiFatigueLevel = summary.fatigueLevel;
+        companionUiExcitementBurst = summary.excitementBurst;
+        companionUiLongSilence = summary.longSilence;
+        companionUiStuckDetected = summary.stuckDetected;
+        companionUiSighCount = summary.sighCount;
+        companionUiSummaryAtMs = System.currentTimeMillis();
+        SwingUtilities.invokeLater(() -> {
+            if (companionFrame != null) {
+                companionFrame.refreshSituationSummary(
+                        companionUiWindowTitle,
+                        companionUiMoodDominant,
+                        companionUiEnergyTrend,
+                        companionUiUtteranceTrend,
+                        companionUiFatigueLevel,
+                        companionUiExcitementBurst,
+                        companionUiLongSilence,
+                        companionUiStuckDetected,
+                        companionUiSighCount,
+                        companionUiSummaryAtMs
+                );
+            }
+        });
+    }
+
+    private void trimCompanionSituationHistory(long now) {
+        while (!companionSituationHistory.isEmpty()) {
+            CompanionSituationSample first = companionSituationHistory.peekFirst();
+            if (first == null || (now - first.createdAtMs) <= COMPANION_SUMMARY_WINDOW_MS) {
+                break;
+            }
+            companionSituationHistory.removeFirst();
+        }
+    }
+
+    private TtsProsodyProfile snapshotRecentCompanionProsodyProfile() {
+        TtsProsodyProfile recent = lastTalkTtsProsodyRecentProfile;
+        long ageMs = System.currentTimeMillis() - lastTalkTtsProsodyRecentAtMs;
+        if (recent == null || ageMs > TTS_PROSODY_RECENT_FALLBACK_MS) {
+            return TtsProsodyProfile.neutral();
+        }
+        return recent;
+    }
+
+    private boolean isSituationSighLike(String text, CompanionObservation observation) {
+        if (observation == null) {
+            return false;
+        }
+        String normalized = text == null ? "" : text.trim();
+        int codePoints = normalized.codePointCount(0, normalized.length());
+        boolean lowEnergy = observation.maxPeak <= 9200
+                && observation.maxAvg <= 2100
+                && observation.procRms <= 1900.0d;
+        boolean shortBreathy = observation.speechDurationMs >= 300L
+                && observation.speechDurationMs <= 1800L;
+        boolean relaxedTail = observation.trailingSilenceMs >= 1000L
+                && observation.trailingSilenceFrames >= Math.max(4, observation.silenceThresholdFrames);
+        boolean sttWeak = normalized.isBlank()
+                || codePoints <= 3
+                || observation.rescuedFromPartial;
+        boolean suppressionGap = (observation.rawRms - observation.procRms) >= 350.0d
+                || (observation.rawPeak - observation.procPeak) >= 800;
+        return lowEnergy && shortBreathy && relaxedTail && (sttWeak || suppressionGap);
+    }
+
+    private boolean isSituationExcited(CompanionSituationSample sample) {
+        if (sample == null) {
+            return false;
+        }
+        if (sample.energyScore >= 0.62f || sample.speedScale >= 1.10f) {
+            return true;
+        }
+        return sample.observation != null
+                && (sample.observation.maxPeak >= 14000 || sample.observation.maxAvg >= 3200);
+    }
+
+    private double situationActivityScore(CompanionSituationSample sample) {
+        if (sample == null) {
+            return 0.0d;
+        }
+        double score = Math.max(0.0d, sample.energyScore);
+        if (sample.observation != null) {
+            score = Math.max(score, Math.min(1.0d, sample.observation.maxAvg / 3600.0d));
+            score = Math.max(score, Math.min(1.0d, sample.observation.maxPeak / 18000.0d));
+        }
+        return score;
+    }
+
+    private String inferSituationMood(CompanionObservation observation) {
+        if (observation == null) {
+            return "neutral";
+        }
+        if (observation.maxPeak >= 14000 || observation.maxAvg >= 3200) {
+            return "excited";
+        }
+        if (observation.trailingSilenceMs >= 1800L || observation.procRms <= 1400.0d) {
+            return "calm";
+        }
+        return "neutral";
+    }
+
+    private boolean isSituationStuck(List<String> recentTexts, String currentText, String lastPartialText) {
+        List<String> normalized = new ArrayList<>();
+        if (recentTexts != null) {
+            for (String text : recentTexts) {
+                String norm = normForNearDup(text);
+                if (!norm.isBlank() && norm.codePointCount(0, norm.length()) >= 6) {
+                    normalized.add(norm);
+                }
+            }
+        }
+        String currentNorm = normForNearDup(currentText);
+        if (!currentNorm.isBlank() && currentNorm.codePointCount(0, currentNorm.length()) >= 6) {
+            normalized.add(currentNorm);
+        }
+        if (normalized.size() >= 4) {
+            String last = normalized.get(normalized.size() - 1);
+            int sameTail = 1;
+            for (int i = normalized.size() - 2; i >= 0; i--) {
+                if (similarityRatio(last, normalized.get(i)) >= 0.90d) {
+                    sameTail++;
+                } else {
+                    break;
+                }
+            }
+            if (sameTail >= 3) {
+                return true;
+            }
+        }
+        String partialNorm = normForNearDup(lastPartialText);
+        if (currentNorm.isBlank()
+                || partialNorm.isBlank()
+                || currentNorm.codePointCount(0, currentNorm.length()) < 8
+                || partialNorm.codePointCount(0, partialNorm.length()) < 8
+                || similarityRatio(currentNorm, partialNorm) < 0.96d) {
+            return false;
+        }
+        int similarRecent = 0;
+        for (int i = normalized.size() - 2; i >= 0; i--) {
+            if (similarityRatio(currentNorm, normalized.get(i)) >= 0.92d) {
+                similarRecent++;
+            }
+        }
+        return similarRecent >= 1;
+    }
+
+    private String latestSituationUserText(List<CompanionSituationSample> samples) {
+        if (samples == null || samples.isEmpty()) {
+            return "";
+        }
+        for (int i = samples.size() - 1; i >= 0; i--) {
+            CompanionSituationSample sample = samples.get(i);
+            if (sample != null && sample.userText != null && !sample.userText.isBlank()) {
+                return sample.userText.trim();
+            }
+        }
+        return "";
+    }
+
+    private String deriveSituationUtteranceTrend(int utteranceCount5Min, int recentTurns, int earlierTurns) {
+        if (utteranceCount5Min < 3) {
+            return "unknown";
+        }
+        if (recentTurns >= (earlierTurns + 2)) {
+            return "rising";
+        }
+        if (earlierTurns >= (recentTurns + 2)) {
+            return "falling";
+        }
+        return "stable";
+    }
+
+    private String deriveSituationFatigueLevel(String energyTrend,
+                                               String utteranceTrend,
+                                               int sighCount,
+                                               double recentDarkAvg,
+                                               CompanionObservation currentObservation) {
+        boolean currentLowEnergy = currentObservation != null
+                && currentObservation.procRms > 0.0d
+                && currentObservation.procRms <= 950.0d
+                && currentObservation.speechDurationMs >= 1200L;
+        if (sighCount >= 3
+                || ("falling".equals(energyTrend) && recentDarkAvg >= 0.28d)
+                || ("falling".equals(utteranceTrend) && recentDarkAvg >= 0.22d && currentLowEnergy)) {
+            return "high";
+        }
+        if (sighCount >= 1
+                || "falling".equals(energyTrend)
+                || "falling".equals(utteranceTrend)
+                || recentDarkAvg >= 0.18d
+                || currentLowEnergy) {
+            return "medium";
+        }
+        return "low";
+    }
+
+    private void initCompanionFriendContextPrefs() {
+        if (prefs == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        String today = LocalDate.now().toString();
+        long previousLaunchMs = prefs.getLong(PREF_COMPANION_LAST_LAUNCH_MS, -1L);
+        String previousLaunchDay = prefs.get(PREF_COMPANION_LAST_LAUNCH_DAY, "");
+        int launchCount = today.equals(previousLaunchDay)
+                ? Math.max(1, prefs.getInt(PREF_COMPANION_LAUNCH_COUNT_TODAY, 0) + 1)
+                : 1;
+        companionPreviousLaunchAtMs = previousLaunchMs;
+        companionLaunchCountToday = launchCount;
+        prefs.putLong(PREF_COMPANION_LAST_LAUNCH_MS, now);
+        prefs.put(PREF_COMPANION_LAST_LAUNCH_DAY, today);
+        prefs.putInt(PREF_COMPANION_LAUNCH_COUNT_TODAY, launchCount);
+        try {
+            prefs.flush();
+        } catch (Exception ignore) {
+        }
+    }
+
+    private String currentCompanionWeekday() {
+        return switch (LocalDate.now().getDayOfWeek()) {
+            case MONDAY -> "mon";
+            case TUESDAY -> "tue";
+            case WEDNESDAY -> "wed";
+            case THURSDAY -> "thu";
+            case FRIDAY -> "fri";
+            case SATURDAY -> "sat";
+            case SUNDAY -> "sun";
+        };
+    }
+
+    private String currentCompanionTimeBand() {
+        int hour = LocalDateTime.now().getHour();
+        if (hour < 5) {
+            return "late_night";
+        }
+        if (hour < 8) {
+            return "early_morning";
+        }
+        if (hour < 12) {
+            return "morning";
+        }
+        if (hour < 17) {
+            return "afternoon";
+        }
+        if (hour < 21) {
+            return "evening";
+        }
+        return "night";
+    }
+
+    private long companionSinceLastLaunchHours(long now) {
+        long previousLaunchMs = companionPreviousLaunchAtMs;
+        if (previousLaunchMs <= 0L || previousLaunchMs >= now) {
+            return -1L;
+        }
+        return Math.max(0L, (now - previousLaunchMs) / 3_600_000L);
+    }
+
+    private void rememberCompanionWindowSample(long now, String windowTitle) {
+        String normalized = windowTitle == null ? "" : windowTitle.trim();
+        if (normalized.isBlank()) {
+            return;
+        }
+        synchronized (companionWindowHistoryLock) {
+            while (!companionWindowHistory.isEmpty()
+                    && (now - companionWindowHistory.peekFirst().createdAtMs) > COMPANION_WINDOW_STABILITY_WINDOW_MS) {
+                companionWindowHistory.removeFirst();
+            }
+            companionWindowHistory.addLast(new CompanionWindowSample(now, normalized));
+            while (companionWindowHistory.size() > 32) {
+                companionWindowHistory.removeFirst();
+            }
+        }
+    }
+
+    private String deriveCompanionWindowStability(long now) {
+        List<String> titles = new ArrayList<>();
+        synchronized (companionWindowHistoryLock) {
+            while (!companionWindowHistory.isEmpty()
+                    && (now - companionWindowHistory.peekFirst().createdAtMs) > COMPANION_WINDOW_STABILITY_WINDOW_MS) {
+                companionWindowHistory.removeFirst();
+            }
+            for (CompanionWindowSample sample : companionWindowHistory) {
+                if (sample != null && sample.windowTitle != null && !sample.windowTitle.isBlank()) {
+                    titles.add(sample.windowTitle);
+                }
+            }
+        }
+        if (titles.size() < 2) {
+            return "unknown";
+        }
+        Map<String, Integer> counts = new HashMap<>();
+        int best = 0;
+        for (String title : titles) {
+            String normalized = normalizeWindowTitleForCompare(title);
+            if (normalized.isBlank()) {
+                continue;
+            }
+            int count = counts.merge(normalized, 1, Integer::sum);
+            if (count > best) {
+                best = count;
+            }
+        }
+        if (counts.isEmpty()) {
+            return "unknown";
+        }
+        double bestRatio = best / (double) Math.max(1, titles.size());
+        if (counts.size() <= 1 || bestRatio >= 0.78d) {
+            return "stable";
+        }
+        if (counts.size() <= 3 || bestRatio >= 0.45d) {
+            return "mixed";
+        }
+        return "switching";
+    }
+
+    private String normalizeWindowTitleForCompare(String title) {
+        if (title == null) {
+            return "";
+        }
+        return title.toLowerCase(Locale.ROOT)
+                .replaceAll("\\s+", " ")
+                .trim();
+    }
+
+    private String classifyCompanionAppKind(String windowTitle) {
+        String lower = windowTitle == null ? "" : windowTitle.toLowerCase(Locale.ROOT).trim();
+        if (lower.isBlank()) {
+            return "unknown";
+        }
+        if (containsAnyIgnoreCase(lower, "visual studio code", "vscode", "intellij", "pycharm", "android studio",
+                "notepad++", "sublime text", "eclipse", "xcode")) {
+            return "editor";
+        }
+        if (containsAnyIgnoreCase(lower, "powershell", "terminal", "command prompt", "cmd.exe", "windows terminal", "bash", "zsh")) {
+            return "terminal";
+        }
+        if (containsAnyIgnoreCase(lower, "chrome", "edge", "firefox", "brave", "opera", "vivaldi", "safari")) {
+            return "browser";
+        }
+        if (containsAnyIgnoreCase(lower, "discord", "slack", "teams", "zoom", "meet", "line")) {
+            return "chat";
+        }
+        if (containsAnyIgnoreCase(lower, "chatgpt", "claude", "codex", "cursor", "gemini", "copilot", "perplexity")) {
+            return "ai_tool";
+        }
+        if (containsAnyIgnoreCase(lower, "excel", "spreadsheet", "word", "powerpoint", "onenote", "acrobat", "pdf")) {
+            return "document";
+        }
+        if (containsAnyIgnoreCase(lower, "youtube", "netflix", "prime video", "spotify", "vlc", "mpv")) {
+            return "media";
+        }
+        if (containsAnyIgnoreCase(lower, "explorer", "finder", "sourcetree", "github desktop")) {
+            return "tool";
+        }
+        return "desktop";
+    }
+
+    private String cachedCompanionSituationWindowTitle(long now) {
+        if ((now - companionCachedWindowTitleAtMs) >= COMPANION_SUMMARY_WINDOW_TITLE_REFRESH_MS) {
+            companionCachedWindowTitle = bestEffortForegroundWindowTitle();
+            companionCachedWindowTitleAtMs = now;
+            rememberCompanionWindowSample(now, companionCachedWindowTitle);
+        }
+        return companionCachedWindowTitle == null ? "" : companionCachedWindowTitle;
+    }
+
+    private String currentSceneMemoValue(long now) {
+        String sanitized = sanitizeCompanionSceneMemo(companionLatestSceneMemo);
+        if (sanitized.isBlank()) {
+            return "";
+        }
+        if ((now - companionLatestSceneMemoAtMs) > COMPANION_SCENE_MEMO_TTL_MS) {
+            return "";
+        }
+        return sanitized;
+    }
+
+    private String currentSceneMemoSummary(long now) {
+        return shortenForLog(currentSceneMemoValue(now), 40);
+    }
+
+    private String currentSceneDetailValue(long now) {
+        String sanitized = sanitizeCompanionSceneMemo(companionLatestSceneDetail);
+        if (sanitized.isBlank()) {
+            return "";
+        }
+        if ((now - companionLatestSceneDetailAtMs) > COMPANION_SCENE_MEMO_TTL_MS) {
+            return "";
+        }
+        return sanitized;
+    }
+
+    private String currentSceneDetailSummary(long now) {
+        return shortenForLog(currentSceneDetailValue(now), 120);
+    }
+
+    private String currentAudioMemoValue(long now) {
+        String sanitized = sanitizeCompanionAudioMemo(companionLatestAudioMemo);
+        if (sanitized.isBlank()) {
+            return "";
+        }
+        if ((now - companionLatestAudioMemoAtMs) > COMPANION_AUDIO_MEMO_TTL_MS) {
+            return "";
+        }
+        return sanitized;
+    }
+
+    private String currentAudioMemoSummary(long now) {
+        return shortenForLog(currentAudioMemoValue(now), 40);
+    }
+
+    private String currentAudioDetailValue(long now) {
+        String sanitized = sanitizeCompanionAudioMemo(companionLatestAudioDetail);
+        if (sanitized.isBlank()) {
+            return "";
+        }
+        if ((now - companionLatestAudioMemoAtMs) > COMPANION_AUDIO_MEMO_TTL_MS) {
+            return "";
+        }
+        return sanitized;
+    }
+
+    private CompanionObserverSnapshot currentObservedAudioSnapshot(long now) {
+        String memo = sanitizeCompanionAudioMemo(companionLastObservedAudioMemo);
+        String detail = sanitizeCompanionAudioMemo(companionLastObservedAudioDetail);
+        if (memo.isBlank() && detail.isBlank()) {
+            return null;
+        }
+        long observedAtMs = companionLastObservedAudioMemoAtMs;
+        if (observedAtMs <= 0L) {
+            return null;
+        }
+        if ((now - observedAtMs) > COMPANION_AUDIO_MEMO_TTL_MS) {
+            return null;
+        }
+        return new CompanionObserverSnapshot(
+                defaultIfBlank(companionLastObservedAudioTraceId, ""),
+                memo,
+                detail,
+                observedAtMs,
+                companionLastAudioObserveCompletedAtMs
+        );
+    }
+
+    private boolean hasCompanionObservedAudioThisTurn(String traceId, long turnStartedAtMs) {
+        CompanionObserverSnapshot observed = currentObservedAudioSnapshot(System.currentTimeMillis());
+        if (observed == null) {
+            return false;
+        }
+        if (!defaultIfBlank(traceId, "").isBlank()
+                && defaultIfBlank(observed.traceId(), "").equals(traceId)) {
+            return true;
+        }
+        long observedAtMs = observed.observedAtMs();
+        if (observedAtMs >= turnStartedAtMs && observedAtMs > 0L) {
+            return true;
+        }
+        return observed.completedAtMs() >= turnStartedAtMs;
+    }
+
+    private CompanionObserverSnapshot audioSnapshotForTurn(CompanionCoherentSnapshot coherenceSnapshot, long now) {
+        CompanionObserverSnapshot observed = currentObservedAudioSnapshot(now);
+        if (observed != null && coherenceSnapshot != null) {
+            if (!defaultIfBlank(coherenceSnapshot.traceId(), "").isBlank()
+                    && defaultIfBlank(observed.traceId(), "").equals(coherenceSnapshot.traceId())) {
+                return observed;
+            }
+            if (observed.completedAtMs() >= coherenceSnapshot.turnStartedAtMs()) {
+                return observed;
+            }
+        }
+        String memo = currentAudioMemoValue(now);
+        String detail = currentAudioDetailValue(now);
+        if (memo.isBlank() && detail.isBlank()) {
+            return observed;
+        }
+        return new CompanionObserverSnapshot(
+                "",
+                memo,
+                detail,
+                companionLatestAudioMemoAtMs,
+                companionLastAudioObserveCompletedAtMs
+        );
+    }
+
+    private boolean shouldPrioritizeCompanionUserSpeech(String sourceText) {
+        if ("conversation".equalsIgnoreCase(inferCompanionMultimodalSourceKind(sourceText))) {
+            return true;
+        }
+        CompanionRecentMicAudioSnapshot recentMic = snapshotCompanionRecentMicAudio(
+                COMPANION_MM_AUDIO_WINDOW_MS,
+                COMPANION_MM_MIC_AUDIO_TTL_MS
+        );
+        return recentMic.pcm16le().length >= 3200;
+    }
+
+    private boolean hasReusableCompanionAudioTexture(long turnStartedAtMs) {
+        long now = System.currentTimeMillis();
+        CompanionObserverSnapshot observed = currentObservedAudioSnapshot(now);
+        if (observed != null && observed.completedAtMs() >= turnStartedAtMs) {
+            return true;
+        }
+        return !currentAudioMemoValue(now).isBlank() || !currentAudioDetailValue(now).isBlank();
+    }
+
+    private boolean hasCompanionConcreteVisionForTurn(long turnStartedAtMs) {
+        long now = System.currentTimeMillis();
+        String detail = currentSceneDetailValue(now);
+        if (companionLatestSceneDetailAtMs >= turnStartedAtMs && isCompanionRichSceneObservation(detail)) {
+            return true;
+        }
+        String memo = currentSceneMemoValue(now);
+        return companionLatestSceneMemoAtMs >= turnStartedAtMs && isCompanionRichSceneObservation(memo);
+    }
+
+    private boolean hasCompanionLowValueVisionForTurn(long turnStartedAtMs) {
+        long now = System.currentTimeMillis();
+        boolean memoFresh = companionLatestSceneMemoAtMs >= turnStartedAtMs;
+        boolean detailFresh = companionLatestSceneDetailAtMs >= turnStartedAtMs;
+        if (!memoFresh && !detailFresh && companionLastVisionObserveCompletedAtMs < turnStartedAtMs) {
+            return false;
+        }
+        String memo = currentSceneMemoValue(now);
+        String detail = currentSceneDetailValue(now);
+        if (memo.isBlank() && detail.isBlank()) {
+            return false;
+        }
+        return isCompanionLowValueSceneObservation(memo, detail);
+    }
+
+    private boolean shouldRequireAudioObserverForTurn(String sourceText, CompanionCoherentSnapshot coherenceSnapshot) {
+        if (shouldPrioritizeCompanionUserSpeech(sourceText)) {
+            return true;
+        }
+        if (coherenceSnapshot == null) {
+            return true;
+        }
+        if (hasCompanionLowValueVisionForTurn(coherenceSnapshot.turnStartedAtMs())) {
+            return false;
+        }
+        return !hasCompanionConcreteVisionForTurn(coherenceSnapshot.turnStartedAtMs());
+    }
+
+    private boolean hasCompanionFreshVisionForTurn(long turnStartedAtMs) {
+        return companionLatestSceneMemoAtMs >= turnStartedAtMs
+                || companionLatestSceneDetailAtMs >= turnStartedAtMs
+                || companionLastVisionObserveCompletedAtMs >= turnStartedAtMs;
+    }
+
+    private boolean hasCompanionFreshAudioForTurn(long turnStartedAtMs) {
+        return hasCompanionObservedAudioThisTurn("mmsync-" + turnStartedAtMs, turnStartedAtMs)
+                || companionLatestAudioMemoAtMs >= turnStartedAtMs;
+    }
+
+    private boolean shouldWaitForCompanionAudioSnapshot(String sourceText) {
+        String currentAudioRoute = companionDesktopAudioRoute == null ? "off" : companionDesktopAudioRoute;
+        if (!"off".equalsIgnoreCase(currentAudioRoute)) {
+            byte[] recentPcm = companionLoopbackMonitor.snapshotRecentAudioPcm(COMPANION_MM_AUDIO_WINDOW_MS);
+            if (recentPcm.length >= 3200) {
+                return true;
+            }
+        }
+        CompanionRecentMicAudioSnapshot recentMic = snapshotCompanionRecentMicAudio(
+                COMPANION_MM_AUDIO_WINDOW_MS,
+                COMPANION_MM_MIC_AUDIO_TTL_MS
+        );
+        if (recentMic.pcm16le().length >= 3200) {
+            return true;
+        }
+        String sourceKind = inferCompanionMultimodalSourceKind(sourceText);
+        return "conversation".equalsIgnoreCase(sourceKind);
+    }
+
+    private CompanionCoherentSnapshot awaitCompanionCoherentSnapshot(long turnStartedAtMs,
+                                                                    String sourceText,
+                                                                    String tone,
+                                                                    String locale,
+                                                                    CompanionSituationSummary summary) {
+        String traceId = "mmsync-" + turnStartedAtMs;
+        boolean userSpeechPriority = shouldPrioritizeCompanionUserSpeech(sourceText);
+        boolean visionConcreteReadyBeforeWait = hasCompanionConcreteVisionForTurn(turnStartedAtMs);
+        boolean audioTextureReadyBeforeWait = hasReusableCompanionAudioTexture(turnStartedAtMs);
+        boolean visionBootstrapForce = !hasAnyCompanionVisionObservation();
+        boolean audioBootstrapForce = !hasAnyCompanionAudioObservation();
+        boolean visionWaited = maybeScheduleCompanionVisionObservation(
+                sourceText, tone, locale, summary, traceId, turnStartedAtMs, visionBootstrapForce);
+        boolean audioWaited = maybeScheduleCompanionAudioObservation(
+                traceId,
+                turnStartedAtMs,
+                audioBootstrapForce && (userSpeechPriority || (!visionConcreteReadyBeforeWait && !audioTextureReadyBeforeWait))
+        );
+        boolean needVision = COMPANION_VISION_OBSERVER_ENABLED && (visionWaited || companionVisionObserverInFlight);
+        boolean needAudio = shouldWaitForCompanionAudioSnapshot(sourceText)
+                && (userSpeechPriority
+                || (!visionConcreteReadyBeforeWait && (
+                        audioWaited
+                                || companionAudioObserverInFlight
+                                || !audioTextureReadyBeforeWait
+                )));
+        long deadline = turnStartedAtMs + COMPANION_COHERENCE_WAIT_MAX_MS;
+        long lowValueVisionGraceDeadline = Long.MAX_VALUE;
+        while (System.currentTimeMillis() < deadline) {
+            long now = System.currentTimeMillis();
+            boolean visionReady = !needVision || hasCompanionFreshVisionForTurn(turnStartedAtMs);
+            boolean visionConcreteReady = hasCompanionConcreteVisionForTurn(turnStartedAtMs);
+            boolean lowValueVisionReady = !userSpeechPriority
+                    && visionReady
+                    && !visionConcreteReady
+                    && hasCompanionLowValueVisionForTurn(turnStartedAtMs);
+            boolean audioReady = !needAudio || hasCompanionFreshAudioForTurn(turnStartedAtMs);
+            if (!userSpeechPriority && visionConcreteReady) {
+                audioReady = true;
+            }
+            if (lowValueVisionReady) {
+                if (audioReady || audioTextureReadyBeforeWait) {
+                    break;
+                }
+                if (lowValueVisionGraceDeadline == Long.MAX_VALUE) {
+                    lowValueVisionGraceDeadline = Math.min(deadline, now + COMPANION_LOW_VALUE_VISION_AUDIO_GRACE_MS);
+                }
+                if (now >= lowValueVisionGraceDeadline) {
+                    break;
+                }
+            }
+            if (visionReady && audioReady) {
+                break;
+            }
+            try {
+                Thread.sleep(COMPANION_COHERENCE_POLL_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        long now = System.currentTimeMillis();
+        return new CompanionCoherentSnapshot(
+                traceId,
+                turnStartedAtMs,
+                Math.max(0L, now - turnStartedAtMs),
+                needVision,
+                !needVision || hasCompanionFreshVisionForTurn(turnStartedAtMs),
+                companionLatestSceneMemoAtMs >= turnStartedAtMs || companionLatestSceneDetailAtMs >= turnStartedAtMs,
+                needAudio,
+                !needAudio || hasCompanionFreshAudioForTurn(turnStartedAtMs),
+                hasCompanionObservedAudioThisTurn(traceId, turnStartedAtMs),
+                companionLastVisionObserveCompletedAtMs,
+                companionLastAudioObserveCompletedAtMs
+        );
+    }
+
+    private String sanitizeCompanionSceneMemo(String sceneMemo) {
+        if (sceneMemo == null) {
+            return "";
+        }
+        String normalized = sceneMemo.trim();
+        if (normalized.isBlank()) {
+            return "";
+        }
+        normalized = normalized.replace('\r', '\n');
+        int newline = normalized.indexOf('\n');
+        if (newline >= 0) {
+            normalized = normalized.substring(0, newline).trim();
+        }
+        String lower = normalized.toLowerCase(Locale.ROOT);
+        if (lower.contains("audio=")
+                || lower.contains("route=")
+                || lower.contains("style=")
+                || lower.contains("style:")
+                || lower.contains("friend context")
+                || lower.contains("friend_ctx:")
+                || lower.contains("friend_ctx=")
+                || lower.contains("mm_ctx=")
+                || lower.contains("mm_ctx:")
+                || lower.contains("image age:")
+                || lower.contains("scene=<skip>")
+                || lower.startsWith("<skip>")
+                || "skip".equals(lower)) {
+            return "";
+        }
+        return normalized;
+    }
+
+    private String defaultIfBlank(String value, String fallback) {
+        return value == null || value.isBlank() ? fallback : value;
+    }
+
+    private String sanitizeCompanionAudioMemo(String audioMemo) {
+        if (audioMemo == null) {
+            return "";
+        }
+        String normalized = audioMemo.trim();
+        if (normalized.isBlank()) {
+            return "";
+        }
+        normalized = normalized.replace('\r', '\n');
+        int newline = normalized.indexOf('\n');
+        if (newline >= 0) {
+            normalized = normalized.substring(0, newline).trim();
+        }
+        String lower = normalized.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("<skip>")
+                || "skip".equals(lower)
+                || lower.contains("route=")
+                || lower.contains("route:")
+                || lower.contains("summary=")
+                || lower.contains("summary:")
+                || lower.contains("friend context")) {
+            return "";
+        }
+        return normalized;
+    }
+
+    private boolean containsCompanionToken(String lower, String... needles) {
+        if (lower == null || lower.isBlank() || needles == null) {
+            return false;
+        }
+        for (String needle : needles) {
+            if (needle != null && !needle.isBlank() && lower.contains(needle)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isCompanionCoarseSceneMemo(String text) {
+        String normalized = sanitizeCompanionSceneMemo(text);
+        if (normalized.isBlank()) {
+            return true;
+        }
+        String lower = normalized.toLowerCase(Locale.ROOT);
+        if (normalized.length() < 24) {
+            return !looksLikeCompactConcreteSceneMemo(normalized, lower);
+        }
+        return containsCompanionToken(lower,
+                "browser_window", "ai_tool_window", "desktop_window", "image_viewer",
+                "text_editor", "code_editor", "terminal_window", "chat_panel",
+                "file_list_window", "settings_dialog", "text_box_active",
+                "search_field_active", "button_focus", "ui_hover",
+                "subtitle_menu", "scene_menu", "menu_open");
+    }
+
+    private boolean looksLikeCompactConcreteSceneMemo(String normalized, String lower) {
+        if (normalized.isBlank()) {
+            return false;
+        }
+        if (containsCompanionToken(lower,
+                "browser_window", "ai_tool_window", "desktop_window", "image_viewer",
+                "text_editor", "code_editor", "terminal_window", "chat_panel",
+                "file_list_window", "settings_dialog", "text_box_active",
+                "search_field_active", "button_focus", "ui_hover",
+                "subtitle_menu", "scene_menu", "menu_open")) {
+            return false;
+        }
+        String compactWords = normalized.replaceAll("[^\\p{L}\\p{N}\\s'-]", " ")
+                .replaceAll("\\s{2,}", " ")
+                .trim();
+        int wordCount = compactWords.isBlank() ? 0 : compactWords.split("\\s+").length;
+        if (wordCount < 2 || wordCount > 8) {
+            return false;
+        }
+        return containsCompanionToken(lower,
+                "rifle", "scope", "sight", "gun", "weapon", "sword", "blade",
+                "enemy", "monster", "character", "soldier", "tank", "vehicle",
+                "crosshair", "reticle", "bullet", "ammo", "helmet", "armor",
+                "sniper", "shotgun", "pistol", "red dot");
+    }
+
+    private boolean isCompanionRichSceneObservation(String text) {
+        String normalized = sanitizeCompanionSceneMemo(text);
+        if (normalized.isBlank()) {
+            return false;
+        }
+        if (!normalized.contains(" ") && !normalized.contains("\"")) {
+            return false;
+        }
+        return !isCompanionCoarseSceneMemo(normalized);
+    }
+
+    private boolean isCompanionLowValueSceneObservation(String memo, String detail) {
+        String normalizedMemo = sanitizeCompanionSceneMemo(memo);
+        String normalizedDetail = sanitizeCompanionSceneMemo(detail);
+        if (normalizedMemo.isBlank() && normalizedDetail.isBlank()) {
+            return true;
+        }
+        if (isCompanionRichSceneObservation(normalizedDetail) || isCompanionRichSceneObservation(normalizedMemo)) {
+            return false;
+        }
+        String lower = (normalizedDetail + " " + normalizedMemo).toLowerCase(Locale.ROOT);
+        if (containsCompanionToken(lower,
+                "cursor is hovering",
+                "cursor hovering",
+                "text input field",
+                "text box",
+                "search field",
+                "button focus",
+                "highlighted in blue")) {
+            return true;
+        }
+        return isCompanionCoarseSceneMemo(normalizedMemo);
+    }
+
+    private boolean isCompanionLowValueAudioMemo(String text) {
+        String normalized = sanitizeCompanionAudioMemo(text);
+        if (normalized.isBlank()) {
+            return true;
+        }
+        String lower = normalized.toLowerCase(Locale.ROOT);
+        return containsCompanionToken(lower,
+                "event=ambient",
+                "cue=desktop_audio",
+                "cue=ui_clicks",
+                "cue=menu_tick",
+                "vibe=calm");
+    }
+
+    private boolean isCompanionRichAudioObservation(String text) {
+        String normalized = sanitizeCompanionAudioMemo(text);
+        if (normalized.isBlank()) {
+            return false;
+        }
+        String lower = normalized.toLowerCase(Locale.ROOT);
+        if (containsCompanionToken(lower,
+                "typing", "speech", "conversation", "voice", "laughter",
+                "music", "alert", "impact", "explosion", "click noise")) {
+            return true;
+        }
+        return normalized.length() >= 18 && !isCompanionLowValueAudioMemo(normalized);
+    }
+
+    private boolean shouldKeepExistingSceneObservation(String newMemo, String newDetail, long now) {
+        String currentMemo = currentSceneMemoValue(now);
+        String currentDetail = currentSceneDetailValue(now);
+        if (currentMemo.isBlank() && currentDetail.isBlank()) {
+            return false;
+        }
+        String candidateScene = sanitizeCompanionSceneMemo(
+                (newDetail != null && !newDetail.isBlank()) ? newDetail : newMemo
+        );
+        boolean newCompactConcrete = looksLikeCompactConcreteSceneMemo(
+                candidateScene,
+                candidateScene.toLowerCase(Locale.ROOT)
+        );
+        if (newCompactConcrete) {
+            return false;
+        }
+        boolean currentRich = isCompanionRichSceneObservation(currentDetail) || isCompanionRichSceneObservation(currentMemo);
+        if (!currentRich) {
+            return false;
+        }
+        boolean newRich = isCompanionRichSceneObservation(newDetail) || isCompanionRichSceneObservation(newMemo);
+        return !newRich;
+    }
+
+    private boolean shouldKeepExistingAudioObservation(String newMemo, String newDetail, long now) {
+        String currentMemo = currentAudioMemoValue(now);
+        String currentDetail = currentAudioDetailValue(now);
+        if (currentMemo.isBlank() && currentDetail.isBlank()) {
+            return false;
+        }
+        boolean currentRich = isCompanionRichAudioObservation(currentDetail) || isCompanionRichAudioObservation(currentMemo);
+        if (!currentRich) {
+            return false;
+        }
+        boolean newRich = isCompanionRichAudioObservation(newDetail) || isCompanionRichAudioObservation(newMemo);
+        return !newRich && (newMemo == null || newMemo.isBlank() || isCompanionLowValueAudioMemo(newMemo));
+    }
+
+    private void copyCompanionJsonField(JSONObject src, JSONObject dst, String key) {
+        if (src == null || dst == null || key == null || key.isBlank() || !src.has(key)) {
+            return;
+        }
+        Object value = src.get(key);
+        if (value == null) {
+            return;
+        }
+        dst.put(key, value);
+    }
+
+    private JSONObject buildCompanionObserverSituationJson(CompanionSituationSummary summary) {
+        if (summary == null) {
+            return null;
+        }
+        JSONObject json = summary.toJson();
+        json.put("scene_memo", "");
+        json.put("screen_caption", "");
+        json.put("audio_memo", "");
+        json.put("hearing_context", "");
+        json.put("hearing_caption_count", 0);
+        json.put("hearing_locale_mix", "");
+        json.put("last_user_text", "");
+        json.put("last_echo_text", "");
+        json.put("last_partial_text", "");
+        return json;
+    }
+
+    private JSONObject buildCompanionVisionObserverContext(CompanionMultimodalPayload payload) {
+        JSONObject src = payload == null ? null : payload.json();
+        if (src == null || src.length() == 0) {
+            return null;
+        }
+        JSONObject json = new JSONObject();
+        copyCompanionJsonField(src, json, "captured_at_ms");
+        copyCompanionJsonField(src, json, "source_kind");
+        copyCompanionJsonField(src, json, "image_jpeg_b64");
+        copyCompanionJsonField(src, json, "image_width");
+        copyCompanionJsonField(src, json, "image_height");
+        copyCompanionJsonField(src, json, "image_age_ms");
+        copyCompanionJsonField(src, json, "turn_trace_id");
+        copyCompanionJsonField(src, json, "turn_started_at_ms");
+        copyCompanionJsonField(src, json, "coherence_wait_ms");
+        return json.length() == 0 ? null : json;
+    }
+
+    private JSONObject buildCompanionAudioObserverContext(CompanionMultimodalPayload payload) {
+        JSONObject src = payload == null ? null : payload.json();
+        if (src == null || src.length() == 0) {
+            return null;
+        }
+        JSONObject json = new JSONObject();
+        copyCompanionJsonField(src, json, "captured_at_ms");
+        copyCompanionJsonField(src, json, "source_kind");
+        copyCompanionJsonField(src, json, "audio_wav_b64");
+        copyCompanionJsonField(src, json, "audio_duration_ms");
+        copyCompanionJsonField(src, json, "audio_route");
+        copyCompanionJsonField(src, json, "mic_audio_wav_b64");
+        copyCompanionJsonField(src, json, "mic_audio_duration_ms");
+        copyCompanionJsonField(src, json, "mic_audio_sample_rate");
+        copyCompanionJsonField(src, json, "mic_audio_route");
+        copyCompanionJsonField(src, json, "mic_audio_age_ms");
+        copyCompanionJsonField(src, json, "turn_trace_id");
+        copyCompanionJsonField(src, json, "turn_started_at_ms");
+        copyCompanionJsonField(src, json, "coherence_wait_ms");
+        return json.length() == 0 ? null : json;
+    }
+
+    private CompanionMultimodalPayload buildCompanionMultimodalPayload(String sourceText, CompanionSituationSummary summary) {
+        return buildCompanionMultimodalPayload(sourceText, summary, null, null, false);
+    }
+
+    private CompanionMultimodalPayload buildCompanionMultimodalPayload(String sourceText,
+                                                                       CompanionSituationSummary summary,
+                                                                       CompanionCoherentSnapshot coherenceSnapshot) {
+        return buildCompanionMultimodalPayload(sourceText, summary, coherenceSnapshot, null, false);
+    }
+
+    private CompanionMultimodalPayload buildCompanionMultimodalPayload(String sourceText,
+                                                                       CompanionSituationSummary summary,
+                                                                       CompanionCoherentSnapshot coherenceSnapshot,
+                                                                       String sourceKindHint,
+                                                                       boolean asyncTick) {
+        long now = System.currentTimeMillis();
+        JSONObject json = new JSONObject();
+        json.put("captured_at_ms", now);
+        if (coherenceSnapshot != null && coherenceSnapshot.traceId() != null && !coherenceSnapshot.traceId().isBlank()) {
+            json.put("turn_trace_id", coherenceSnapshot.traceId());
+            json.put("turn_started_at_ms", coherenceSnapshot.turnStartedAtMs());
+            json.put("coherence_wait_ms", Math.max(0L, coherenceSnapshot.waitedMs()));
+            json.put("vision_observer_completed_at_ms", Math.max(0L, coherenceSnapshot.visionCompletedAtMs()));
+            json.put("audio_observer_completed_at_ms", Math.max(0L, coherenceSnapshot.audioCompletedAtMs()));
+        }
+        String sourceKind = inferCompanionMultimodalSourceKind(sourceText, sourceKindHint);
+        json.put("source_kind", sourceKind);
+        json.put("brain_mode", asyncTick ? "async_accumulated" : "sync_coherent");
+        json.put("async_tick", asyncTick);
+        json.put("autonomous_cooldown_ms", scaledCompanionAutonomousCooldownMs(COMPANION_AUTO_GLOBAL_COOLDOWN_MS));
+        json.put("observer_audio_interval_ms", COMPANION_AUDIO_OBSERVER_INTERVAL_MS);
+        json.put("observer_vision_interval_ms", COMPANION_VISION_OBSERVER_INTERVAL_MS);
+        json.put("audio_window_ms", COMPANION_MM_AUDIO_WINDOW_MS);
+        json.put("hearing_window_ms", COMPANION_HEARING_CONTEXT_WINDOW_MS);
+        json.put("session_memory_target", COMPANION_MM_MEMORY_MAX_ITEMS);
+        json.put("visual_history_target", COMPANION_MM_VISUAL_HISTORY_TARGET);
+        json.put("speech_history_target", COMPANION_MM_SPEECH_HISTORY_TARGET);
+        if (summary != null && !summary.windowTitle.isBlank()) {
+            json.put("window_title", summary.windowTitle);
+        }
+
+        String currentAudioRoute = companionDesktopAudioRoute == null ? "off" : companionDesktopAudioRoute;
+        byte[] recentPcm = "off".equalsIgnoreCase(currentAudioRoute)
+                ? new byte[0]
+                : companionLoopbackMonitor.snapshotRecentAudioPcm(COMPANION_MM_AUDIO_WINDOW_MS);
+        CompanionRecentMicAudioSnapshot recentMic = snapshotCompanionRecentMicAudio(
+                COMPANION_MM_AUDIO_WINDOW_MS,
+                COMPANION_MM_MIC_AUDIO_TTL_MS
+        );
+        int audioDurationMs = 0;
+        int micAudioDurationMs = 0;
+        String mmAudioPrefilterMode = getCompanionMmAudioPrefilterMode();
+        if (recentPcm.length >= 3200) {
+            try {
+                AudioPrefilter.VoiceMetrics rawMetrics =
+                        AudioPrefilter.analyzeVoiceLike(recentPcm, recentPcm.length, 16000);
+                byte[] filteredPcm = AudioPrefilter.processForMultimodal(
+                        recentPcm,
+                        recentPcm.length,
+                        16000,
+                        mmAudioPrefilterMode
+                );
+                AudioPrefilter.VoiceMetrics filteredMetrics =
+                        AudioPrefilter.analyzeVoiceLike(filteredPcm, filteredPcm.length, 16000);
+                Config.logDebug(String.format(
+                        Locale.ROOT,
+                        "[Companion][MM][Audio] mode=%s raw_rms=%.1f raw_vbr=%.3f raw_peak=%d filt_rms=%.1f filt_vbr=%.3f filt_peak=%d",
+                        mmAudioPrefilterMode,
+                        rawMetrics.rms,
+                        rawMetrics.voiceBandRatio,
+                        rawMetrics.peak,
+                        filteredMetrics.rms,
+                        filteredMetrics.voiceBandRatio,
+                        filteredMetrics.peak
+                ));
+                byte[] wav = wrapPcm16MonoAsWav(filteredPcm, 16000);
+                audioDurationMs = (int) Math.max(0L, (recentPcm.length * 1000L) / (16000L * 2L));
+                json.put("audio_wav_b64", Base64.getEncoder().encodeToString(wav));
+                json.put("audio_duration_ms", audioDurationMs);
+                json.put("audio_route", currentAudioRoute);
+            } catch (IOException ex) {
+                Config.logDebug("[Companion][MM] wav wrap skipped: " + ex.getClass().getSimpleName());
+            }
+        }
+        if (recentMic.pcm16le().length >= 3200) {
+            try {
+                AudioPrefilter.VoiceMetrics rawMicMetrics =
+                        AudioPrefilter.analyzeVoiceLike(
+                                recentMic.pcm16le(),
+                                recentMic.pcm16le().length,
+                                recentMic.sampleRateHz());
+                byte[] filteredMicPcm = AudioPrefilter.processForMultimodal(
+                        recentMic.pcm16le(),
+                        recentMic.pcm16le().length,
+                        recentMic.sampleRateHz(),
+                        mmAudioPrefilterMode
+                );
+                AudioPrefilter.VoiceMetrics filteredMicMetrics =
+                        AudioPrefilter.analyzeVoiceLike(filteredMicPcm, filteredMicPcm.length, recentMic.sampleRateHz());
+                Config.logDebug(String.format(
+                        Locale.ROOT,
+                        "[Companion][MM][MicAudio] mode=%s raw_rms=%.1f raw_vbr=%.3f raw_peak=%d filt_rms=%.1f filt_vbr=%.3f filt_peak=%d age=%dms",
+                        mmAudioPrefilterMode,
+                        rawMicMetrics.rms,
+                        rawMicMetrics.voiceBandRatio,
+                        rawMicMetrics.peak,
+                        filteredMicMetrics.rms,
+                        filteredMicMetrics.voiceBandRatio,
+                        filteredMicMetrics.peak,
+                        recentMic.ageMs()
+                ));
+                byte[] micWav = wrapPcm16MonoAsWav(filteredMicPcm, recentMic.sampleRateHz());
+                micAudioDurationMs = (int) Math.max(0L,
+                        (recentMic.pcm16le().length * 1000L) / (Math.max(8000, recentMic.sampleRateHz()) * 2L));
+                json.put("mic_audio_wav_b64", Base64.getEncoder().encodeToString(micWav));
+                json.put("mic_audio_duration_ms", micAudioDurationMs);
+                json.put("mic_audio_sample_rate", recentMic.sampleRateHz());
+                json.put("mic_audio_route", "mic_live");
+                json.put("mic_audio_age_ms", recentMic.ageMs());
+            } catch (IOException ex) {
+                Config.logDebug("[Companion][MM] mic wav wrap skipped: " + ex.getClass().getSimpleName());
+            }
+        }
+        String sceneMemo = summary == null ? "" : sanitizeCompanionSceneMemo(summary.sceneMemo);
+        String hiddenSummary = buildCompanionMultimodalContextSummary(sourceKind, currentAudioRoute, sceneMemo, summary);
+        if (!hiddenSummary.isBlank()) {
+            json.put("summary", hiddenSummary);
+        }
+
+        JSONArray memory = buildCompanionMultimodalMemory(summary, sourceKind);
+        if (memory.size() > 0) {
+            json.put("session_memory", memory);
+        }
+        CompanionSpeechSemanticSummary speechSemanticSummary = buildCompanionSpeechSemanticSummary(now);
+        if (!speechSemanticSummary.snippets().isEmpty()) {
+            JSONArray semanticSnippets = new JSONArray();
+            for (String snippet : speechSemanticSummary.snippets()) {
+                if (snippet != null && !snippet.isBlank()) {
+                    semanticSnippets.add(snippet);
+                }
+            }
+            if (semanticSnippets.size() > 0) {
+                json.put("speech_semantic_snippets", semanticSnippets);
+                json.put("speech_semantic_age_ms", Math.max(0L, now - speechSemanticSummary.newestAtMs()));
+                json.put("speech_semantic_locale_mix", defaultIfBlank(speechSemanticSummary.localeMix(), ""));
+                json.put("speech_semantic_count", Math.max(0, speechSemanticSummary.count()));
+                json.put("speech_semantic_route", defaultIfBlank(speechSemanticSummary.route(), ""));
+                json.put("speech_semantic_engine", defaultIfBlank(speechSemanticSummary.engine(), ""));
+            }
+        }
+        CompanionObserverSnapshot audioObserverSnapshot = audioSnapshotForTurn(coherenceSnapshot, now);
+        String audioObserverMemo = audioObserverSnapshot == null ? "" : defaultIfBlank(audioObserverSnapshot.memo(), "");
+        boolean audioObserverRequired = shouldRequireAudioObserverForTurn(sourceText, coherenceSnapshot);
+        json.put("audio_observer_required", audioObserverRequired);
+        if (!audioObserverMemo.isBlank()) {
+            json.put("audio_observer_memo", audioObserverMemo);
+            json.put("audio_observer_age_ms", Math.max(0L, now - audioObserverSnapshot.observedAtMs()));
+            if (!defaultIfBlank(audioObserverSnapshot.traceId(), "").isBlank()) {
+                json.put("audio_observer_trace_id", audioObserverSnapshot.traceId());
+            }
+            String audioObserverDetail = defaultIfBlank(audioObserverSnapshot.detail(), "");
+            if (!audioObserverDetail.isBlank()) {
+                json.put("audio_observer_detail", audioObserverDetail);
+            }
+        }
+        String visionObserverMemo = currentSceneMemoValue(now);
+        if (!visionObserverMemo.isBlank()) {
+            json.put("vision_observer_memo", visionObserverMemo);
+            json.put("vision_observer_age_ms", Math.max(0L, now - companionLatestSceneMemoAtMs));
+            String visionObserverDetail = currentSceneDetailValue(now);
+            if (!visionObserverDetail.isBlank()) {
+                json.put("vision_observer_detail", visionObserverDetail);
+                json.put("vision_observer_detail_age_ms", Math.max(0L, now - companionLatestSceneDetailAtMs));
+            }
+        }
+
+        String summaryLine = "mode=" + (asyncTick ? "async_accumulated" : "sync_coherent")
+                + " src=" + sourceKind
+                + " audio=" + audioDurationMs + "ms"
+                + " req=" + COMPANION_MM_AUDIO_WINDOW_MS + "ms"
+                + " route=" + currentAudioRoute
+                + " mic=" + micAudioDurationMs + "ms"
+                + " filter=" + mmAudioPrefilterMode
+                + " sem=" + speechSemanticSummary.snippets().size()
+                + (speechSemanticSummary.snippets().isEmpty() ? "" : ":" + hearingSemanticEngineName())
+                + " image=" + (COMPANION_VISION_OBSERVER_ENABLED ? "observer" : "off")
+                + " scene=" + ((sceneMemo != null && !sceneMemo.isBlank()) ? "1" : "0")
+                + " aObs=" + (audioObserverMemo.isBlank() ? "0" : "1")
+                + " vi=" + COMPANION_VISION_OBSERVER_INTERVAL_MS + "ms"
+                + " ai=" + COMPANION_AUDIO_OBSERVER_INTERVAL_MS + "ms"
+                + " hw=" + COMPANION_HEARING_CONTEXT_WINDOW_MS + "ms"
+                + " vh=" + COMPANION_MM_VISUAL_HISTORY_TARGET
+                + " sh=" + COMPANION_MM_SPEECH_HISTORY_TARGET
+                + (coherenceSnapshot == null ? "" : " sync=" + coherenceSnapshot.waitedMs() + "ms"
+                + " vr=" + (coherenceSnapshot.visionReady() ? "1" : "0")
+                + " ar=" + (coherenceSnapshot.audioReady() ? "1" : "0"))
+                + " memory=" + memory.size();
+        return new CompanionMultimodalPayload(json, summaryLine);
+    }
+
+    private String buildCompanionMultimodalContextSummary(String sourceKind,
+                                                          String currentAudioRoute,
+                                                          String sceneMemo,
+                                                          CompanionSituationSummary summary) {
+        StringBuilder sb = new StringBuilder(180);
+        sb.append("src=").append(sourceKind == null || sourceKind.isBlank() ? "conversation" : sourceKind);
+        if (currentAudioRoute != null && !currentAudioRoute.isBlank()) {
+            sb.append(" route=").append(currentAudioRoute);
+        }
+        sb.append(" win=").append(summary != null && summary.windowTitle != null && !summary.windowTitle.isBlank() ? "1" : "0");
+        if (sceneMemo != null && !sceneMemo.isBlank()) {
+            sb.append(" scene=1");
+        }
+        return sb.toString().trim();
+    }
+
+    private boolean shouldObserveCompanionVision(String sourceKind, String currentAudioRoute, long now) {
+        if (!COMPANION_VISION_OBSERVER_ENABLED) {
+            return false;
+        }
+        if (companionVisionObserverInFlight) {
+            return false;
+        }
+        return (now - companionLatestSceneMemoAtMs) >= COMPANION_VISION_OBSERVER_INTERVAL_MS;
+    }
+
+    private String inferCompanionMultimodalSourceKind(String sourceText) {
+        return inferCompanionMultimodalSourceKind(sourceText, null);
+    }
+
+    private String inferCompanionMultimodalSourceKind(String sourceText, String sourceKindHint) {
+        String hinted = sourceKindHint == null ? "" : sourceKindHint.trim();
+        if (!hinted.isBlank()) {
+            return hinted;
+        }
+        String normalized = sourceText == null ? "" : sourceText.trim();
+        if (normalized.startsWith("[async_brain_tick]")) {
+            return "async_tick";
+        }
+        if (normalized.startsWith("[desktop_scene]")) {
+            return "desktop_scene";
+        }
+        if (normalized.startsWith("[desktop_audio_presence]")) {
+            return "desktop_audio";
+        }
+        if (normalized.startsWith("[loopback:")) {
+            return "desktop_audio_event";
+        }
+        return "conversation";
+    }
+
+    private JSONArray buildCompanionMultimodalMemory(CompanionSituationSummary summary, String sourceKind) {
+        JSONArray memory = new JSONArray();
+        boolean desktopAudioSource = isCompanionDesktopAudioSourceKind(sourceKind);
+        synchronized (companionContextLock) {
+            int skip = Math.max(0, companionContext.size() - COMPANION_MM_MEMORY_MAX_ITEMS);
+            int index = 0;
+            for (CompanionContextMessage msg : companionContext) {
+                if (msg == null) {
+                    continue;
+                }
+                if (index++ < skip) {
+                    continue;
+                }
+                String role = msg.role == null ? "" : msg.role.trim();
+                String text = msg.text == null ? "" : msg.text.trim();
+                if (role.isBlank() || text.isBlank()) {
+                    continue;
+                }
+                if (desktopAudioSource) {
+                    continue;
+                }
+                memory.add(new JSONObject()
+                        .put("role", role)
+                        .put("text", shortenForLog(text, 80)));
+            }
+        }
+        if (summary != null) {
+            if (!summary.hearingContext.isBlank()) {
+                memory.add(new JSONObject()
+                        .put("role", "scene")
+                        .put("text", shortenForLog(summary.hearingContext, 120)));
+            }
+            if (!summary.sceneMemo.isBlank()) {
+                memory.add(new JSONObject()
+                        .put("role", "scene")
+                        .put("text", shortenForLog(summary.sceneMemo, 120)));
+            }
+        }
+        return memory;
+    }
+
+    private boolean isCompanionDesktopAudioSourceKind(String sourceKind) {
+        if (sourceKind == null) {
+            return false;
+        }
+        String normalized = sourceKind.trim().toLowerCase(Locale.ROOT);
+        return "desktop_audio".equals(normalized) || "desktop_audio_event".equals(normalized);
+    }
+
+    private CompanionScreenshotFrame captureCompanionScreenshotFrame(long now) {
+        CompanionScreenshotFrame cached = companionCachedScreenshotFrame;
+        if (cached != null
+                && cached.jpegBytes().length > 0
+                && (now - cached.capturedAtMs()) < COMPANION_MM_SCREENSHOT_CACHE_MS) {
+            return cached;
+        }
+        try {
+            Rectangle captureArea = bestEffortForegroundWindowBounds();
+            if (captureArea == null) {
+                captureArea = fullVirtualScreenBounds();
+            }
+            if (captureArea.width <= 0 || captureArea.height <= 0) {
+                return cached;
+            }
+            BufferedImage captured = new Robot().createScreenCapture(captureArea);
+            int captureMaxWidth = resolveCompanionVisionCaptureMaxWidth();
+            BufferedImage scaled = scaleCompanionScreenshot(captured, captureMaxWidth);
+            ByteArrayOutputStream out = new ByteArrayOutputStream(32 * 1024);
+            if (!ImageIO.write(scaled, "jpg", out)) {
+                return cached;
+            }
+            CompanionScreenshotFrame frame = new CompanionScreenshotFrame(
+                    out.toByteArray(),
+                    scaled.getWidth(),
+                    scaled.getHeight(),
+                    now,
+                    computeCompanionScreenshotContentHash(scaled)
+            );
+            Config.logDebug("[Companion][VisionConfig] capture_max_width="
+                    + captureMaxWidth
+                    + " actual=" + scaled.getWidth() + "x" + scaled.getHeight());
+            companionCachedScreenshotFrame = frame;
+            return frame;
+        } catch (Throwable t) {
+            Config.logDebug("[Companion][MM] screenshot capture skipped: " + t.getClass().getSimpleName());
+            return cached;
+        }
+    }
+
+    private Rectangle bestEffortForegroundWindowBounds() {
+        try {
+            com.sun.jna.platform.win32.WinDef.HWND hwnd =
+                    com.sun.jna.platform.win32.User32.INSTANCE.GetForegroundWindow();
+            if (hwnd == null) {
+                return null;
+            }
+            com.sun.jna.platform.win32.WinDef.RECT rect = new com.sun.jna.platform.win32.WinDef.RECT();
+            if (!com.sun.jna.platform.win32.User32.INSTANCE.GetWindowRect(hwnd, rect)) {
+                return null;
+            }
+            int left = rect.left;
+            int top = rect.top;
+            int width = rect.right - rect.left;
+            int height = rect.bottom - rect.top;
+            if (width <= 32 || height <= 32) {
+                return null;
+            }
+            if (left <= -30000 || top <= -30000) {
+                return null;
+            }
+            Rectangle windowRect = new Rectangle(left, top, width, height);
+            Rectangle screens = fullVirtualScreenBounds();
+            Rectangle clipped = windowRect.intersection(screens);
+            if (clipped.width <= 32 || clipped.height <= 32) {
+                return null;
+            }
+            return clipped;
+        } catch (Throwable ignore) {
+            return null;
+        }
+    }
+
+    private Rectangle fullVirtualScreenBounds() {
+        GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
+        Rectangle union = null;
+        for (GraphicsDevice gd : ge.getScreenDevices()) {
+            Rectangle bounds = gd.getDefaultConfiguration().getBounds();
+            union = (union == null) ? new Rectangle(bounds) : union.union(bounds);
+        }
+        if (union == null || union.width <= 0 || union.height <= 0) {
+            return GraphicsEnvironment.getLocalGraphicsEnvironment()
+                    .getDefaultScreenDevice()
+                    .getDefaultConfiguration()
+                    .getBounds();
+        }
+        return union;
+    }
+
+    private boolean maybeScheduleCompanionVisionObservation(String sourceText,
+                                                            String tone,
+                                                            String locale,
+                                                            CompanionSituationSummary summary) {
+        return maybeScheduleCompanionVisionObservation(sourceText, tone, locale, summary, "", 0L, false);
+    }
+
+    private boolean maybeScheduleCompanionVisionObservation(String sourceText,
+                                                            String tone,
+                                                            String locale,
+                                                            CompanionSituationSummary summary,
+                                                            String turnTraceId,
+                                                            long turnStartedAtMs,
+                                                            boolean force) {
+        long now = System.currentTimeMillis();
+        String sourceKind = inferCompanionMultimodalSourceKind(sourceText);
+        String currentAudioRoute = companionDesktopAudioRoute == null ? "off" : companionDesktopAudioRoute;
+        if (!force && !shouldObserveCompanionVision(sourceKind, currentAudioRoute, now)) {
+            return false;
+        }
+        if (companionVisionObserverInFlight) {
+            return false;
+        }
+        CompanionScreenshotFrame screenshot = captureCompanionScreenshotFrame(now);
+        if (screenshot == null || screenshot.jpegBytes().length <= 0) {
+            return false;
+        }
+        if (reuseCompanionVisionObservationForFrame(screenshot)) {
+            long reusedAtMs = System.currentTimeMillis();
+            if (!currentSceneMemoValue(reusedAtMs).isBlank()) {
+                companionLatestSceneMemoAtMs = reusedAtMs;
+            }
+            if (!currentSceneDetailValue(reusedAtMs).isBlank()) {
+                companionLatestSceneDetailAtMs = reusedAtMs;
+            }
+            companionLastVisionObserveCompletedAtMs = reusedAtMs;
+            Config.logDebug("[Companion][Vision] reused same screenshot frame"
+                    + " capturedAt=" + screenshot.capturedAtMs()
+                    + " scene=" + shortenForLog(currentSceneMemoValue(reusedAtMs), 56)
+                    + (currentSceneDetailValue(reusedAtMs).isBlank()
+                    ? ""
+                    : " detail=" + shortenForLog(currentSceneDetailValue(reusedAtMs), 80)));
+            return true;
+        }
+        if (skipCompanionVisionObservationForKnownLowValueFrame(screenshot)) {
+            long skippedAtMs = System.currentTimeMillis();
+            if (!currentSceneMemoValue(skippedAtMs).isBlank()) {
+                companionLatestSceneMemoAtMs = skippedAtMs;
+            }
+            if (!currentSceneDetailValue(skippedAtMs).isBlank()) {
+                companionLatestSceneDetailAtMs = skippedAtMs;
+            }
+            companionLastVisionObserveCompletedAtMs = skippedAtMs;
+            Config.logDebug("[Companion][Vision] skipped known low-value frame"
+                    + " hash=" + screenshot.contentHash()
+                    + " scene=" + shortenForLog(currentSceneMemoValue(skippedAtMs), 56)
+                    + (currentSceneDetailValue(skippedAtMs).isBlank()
+                    ? ""
+                    : " detail=" + shortenForLog(currentSceneDetailValue(skippedAtMs), 80)));
+            return true;
+        }
+        companionVisionObserverInFlight = true;
+        companionVisionObserverExecutor.submit(() -> {
+            try {
+                JSONObject multimodalContext = new JSONObject();
+                multimodalContext.put("captured_at_ms", System.currentTimeMillis());
+                multimodalContext.put("source_kind", sourceKind);
+                multimodalContext.put("audio_route", currentAudioRoute);
+                if (turnTraceId != null && !turnTraceId.isBlank()) {
+                    multimodalContext.put("turn_trace_id", turnTraceId);
+                    multimodalContext.put("turn_started_at_ms", Math.max(0L, turnStartedAtMs));
+                }
+                if (summary != null && !summary.windowTitle.isBlank()) {
+                    multimodalContext.put("window_title", summary.windowTitle);
+                }
+                multimodalContext.put("image_jpeg_b64", Base64.getEncoder().encodeToString(screenshot.jpegBytes()));
+                multimodalContext.put("image_width", screenshot.width());
+                multimodalContext.put("image_height", screenshot.height());
+                multimodalContext.put("image_age_ms", Math.max(0L, System.currentTimeMillis() - screenshot.capturedAtMs()));
+                String hiddenSummary = buildCompanionMultimodalContextSummary(
+                        sourceKind,
+                        currentAudioRoute,
+                        summary == null ? "" : summary.sceneMemo,
+                        summary
+                );
+                if (!hiddenSummary.isBlank()) {
+                    multimodalContext.put("summary", hiddenSummary);
+                }
+                CompanionSidecarClient.SceneObservation observed = companionSidecarClient.observeScene(
+                        tone,
+                        locale,
+                        buildCompanionObserverSituationJson(summary),
+                        buildCompanionVisionObserverContext(new CompanionMultimodalPayload(multimodalContext, ""))
+                );
+                if (observed != null && observed.sceneMemo() != null && !observed.sceneMemo().isBlank()) {
+                    String sanitizedSceneMemo = sanitizeCompanionSceneMemo(observed.sceneMemo());
+                    String sanitizedSceneDetail = sanitizeCompanionSceneMemo(observed.detail());
+                    if (!sanitizedSceneMemo.isBlank()) {
+                        long observedAtMs = System.currentTimeMillis();
+                        if (shouldKeepExistingSceneObservation(sanitizedSceneMemo, sanitizedSceneDetail, observedAtMs)) {
+                            Config.logDebug("[Companion][Vision] retained existing richer memo"
+                                    + " newScene=" + shortenForLog(sanitizedSceneMemo, 56));
+                        } else {
+                            companionLatestSceneMemo = sanitizedSceneMemo;
+                            companionLatestSceneMemoAtMs = observedAtMs;
+                            companionLatestSceneDetail = sanitizedSceneDetail;
+                            companionLatestSceneDetailAtMs = sanitizedSceneDetail.isBlank() ? 0L : observedAtMs;
+                            companionLastVisionObservedFrameAtMs = screenshot.capturedAtMs();
+                            companionLastVisionObservedFrameHash = screenshot.contentHash();
+                            companionLastVisionObservedLowValue =
+                                    isCompanionLowValueSceneObservation(sanitizedSceneMemo, sanitizedSceneDetail);
+                            Config.logDebug("[Companion][Vision] engine=" + observed.activeEngine()
+                                    + " fallback=" + observed.fallback()
+                                    + " scene=" + shortenForLog(companionLatestSceneMemo, 56)
+                                    + (sanitizedSceneDetail.isBlank() ? "" : " detail=" + shortenForLog(sanitizedSceneDetail, 80)));
+                        }
+                    } else {
+                        Config.logDebug("[Companion][Vision] skipped detail=sanitized_blank retained="
+                                + !currentSceneMemoValue(System.currentTimeMillis()).isBlank());
+                    }
+                } else {
+                    Config.logDebug("[Companion][Vision] skipped retained="
+                            + !currentSceneMemoValue(System.currentTimeMillis()).isBlank());
+                }
+            } catch (Exception ex) {
+                Config.logDebug("[Companion][Vision] observe failed: " + ex.getClass().getSimpleName()
+                        + ":" + ex.getMessage());
+            } finally {
+                companionLastVisionObserveCompletedAtMs = System.currentTimeMillis();
+                companionVisionObserverInFlight = false;
+            }
+        });
+        return true;
+    }
+
+    private boolean reuseCompanionVisionObservationForFrame(CompanionScreenshotFrame screenshot) {
+        if (screenshot == null || screenshot.capturedAtMs() <= 0L) {
+            return false;
+        }
+        if (screenshot.capturedAtMs() != companionLastVisionObservedFrameAtMs) {
+            return false;
+        }
+        long now = System.currentTimeMillis();
+        return !currentSceneMemoValue(now).isBlank() || !currentSceneDetailValue(now).isBlank();
+    }
+
+    private boolean skipCompanionVisionObservationForKnownLowValueFrame(CompanionScreenshotFrame screenshot) {
+        if (screenshot == null) {
+            return false;
+        }
+        if (!companionLastVisionObservedLowValue) {
+            return false;
+        }
+        if (!isSimilarCompanionVisionFrameHash(screenshot.contentHash(), companionLastVisionObservedFrameHash)) {
+            return false;
+        }
+        long now = System.currentTimeMillis();
+        return !currentSceneMemoValue(now).isBlank() || !currentSceneDetailValue(now).isBlank();
+    }
+
+    private long computeCompanionScreenshotContentHash(BufferedImage image) {
+        if (image == null) {
+            return 0L;
+        }
+        final int size = 8;
+        BufferedImage reduced = new BufferedImage(size, size, BufferedImage.TYPE_BYTE_GRAY);
+        Graphics2D g = reduced.createGraphics();
+        try {
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+            g.drawImage(image, 0, 0, size, size, null);
+        } finally {
+            g.dispose();
+        }
+        long sum = 0L;
+        int[] luminance = new int[size * size];
+        int idx = 0;
+        for (int y = 0; y < size; y++) {
+            for (int x = 0; x < size; x++) {
+                int rgb = reduced.getRGB(x, y);
+                int value = rgb & 0xff;
+                luminance[idx++] = value;
+                sum += value;
+            }
+        }
+        int avg = (int) Math.round(sum / (double) luminance.length);
+        long hash = 0L;
+        for (int i = 0; i < luminance.length; i++) {
+            if (luminance[i] >= avg) {
+                hash |= (1L << i);
+            }
+        }
+        return hash;
+    }
+
+    private boolean isSimilarCompanionVisionFrameHash(long currentHash, long previousHash) {
+        if (currentHash == previousHash) {
+            return true;
+        }
+        return Long.bitCount(currentHash ^ previousHash) <= COMPANION_VISION_LOW_VALUE_HASH_MAX_DISTANCE;
+    }
+
+    private boolean shouldObserveCompanionAudio(long now) {
+        if (!isCompanionEnabled() || !isCompanionAutonomousEnabled()) {
+            return false;
+        }
+        if (companionAudioObserverInFlight) {
+            return false;
+        }
+        long anchor = companionLastAudioObserveRequestedAtMs > 0L
+                ? companionLastAudioObserveRequestedAtMs
+                : companionLatestAudioMemoAtMs;
+        return anchor <= 0L || (now - anchor) >= COMPANION_AUDIO_OBSERVER_INTERVAL_MS;
+    }
+
+    private void maybeScheduleCompanionAudioObservation() {
+        maybeScheduleCompanionAudioObservation("", 0L, false);
+    }
+
+    private boolean maybeScheduleCompanionAudioObservation(String turnTraceId,
+                                                           long turnStartedAtMs,
+                                                           boolean force) {
+        long now = System.currentTimeMillis();
+        if (!force && !shouldObserveCompanionAudio(now)) {
+            return false;
+        }
+        if (companionAudioObserverInFlight) {
+            return false;
+        }
+
+        String currentAudioRoute = companionDesktopAudioRoute == null ? "off" : companionDesktopAudioRoute;
+        byte[] recentPcm = "off".equalsIgnoreCase(currentAudioRoute)
+                ? new byte[0]
+                : companionLoopbackMonitor.snapshotRecentAudioPcm(COMPANION_MM_AUDIO_WINDOW_MS);
+        CompanionRecentMicAudioSnapshot recentMic = snapshotCompanionRecentMicAudio(
+                COMPANION_MM_AUDIO_WINDOW_MS,
+                COMPANION_MM_MIC_AUDIO_TTL_MS
+        );
+        boolean hasLoopback = recentPcm.length >= 3200;
+        boolean hasMic = recentMic.pcm16le().length >= 3200;
+        if (!hasLoopback && !hasMic) {
+            return false;
+        }
+
+        String sourceText = (hasMic && !hasLoopback) ? "" : "[desktop_audio_presence]";
+        String tone = prefs.get("companion.tone", "desu");
+        String locale = resolveCompanionLocale(sourceText);
+        CompanionSituationSummary summary = buildCompanionSituationSummary(sourceText, null);
+        CompanionMultimodalPayload payload = buildCompanionMultimodalPayload(sourceText, summary);
+        if (payload == null || payload.json() == null) {
+            return false;
+        }
+        boolean hasAudioPayload = payload.json().optString("audio_wav_b64", "").length() > 0
+                || payload.json().optString("mic_audio_wav_b64", "").length() > 0;
+        if (!hasAudioPayload) {
+            return false;
+        }
+
+        companionAudioObserverInFlight = true;
+        companionLastAudioObserveRequestedAtMs = now;
+        companionAudioObserverExecutor.submit(() -> {
+            try {
+                JSONObject audioObserverContext = buildCompanionAudioObserverContext(payload);
+                if (audioObserverContext != null && turnTraceId != null && !turnTraceId.isBlank()) {
+                    audioObserverContext.put("turn_trace_id", turnTraceId);
+                    audioObserverContext.put("turn_started_at_ms", Math.max(0L, turnStartedAtMs));
+                }
+                CompanionSidecarClient.AudioObservation observed = companionSidecarClient.observeAudio(
+                        tone,
+                        locale,
+                        buildCompanionObserverSituationJson(summary),
+                        audioObserverContext
+                );
+                String sanitizedMemo = observed == null ? "" : sanitizeCompanionAudioMemo(observed.audioMemo());
+                String sanitizedDetail = observed == null ? "" : sanitizeCompanionAudioMemo(observed.detail());
+                if (!sanitizedMemo.isBlank() || !sanitizedDetail.isBlank()) {
+                    long observedAtMs = System.currentTimeMillis();
+                    companionLastObservedAudioTraceId = defaultIfBlank(turnTraceId, "");
+                    companionLastObservedAudioMemo = sanitizedMemo;
+                    companionLastObservedAudioDetail = sanitizedDetail;
+                    companionLastObservedAudioMemoAtMs = observedAtMs;
+                    if (shouldKeepExistingAudioObservation(sanitizedMemo, sanitizedDetail, observedAtMs)) {
+                        Config.logDebug("[Companion][Audio] retained existing richer memo"
+                                + " newMemo=" + shortenForLog(sanitizedMemo, 56));
+                    } else {
+                        companionLatestAudioMemo = sanitizedMemo;
+                        companionLatestAudioDetail = sanitizedDetail;
+                        companionLatestAudioMemoAtMs = observedAtMs;
+                        Config.logDebug("[Companion][Audio] engine="
+                                + observed.activeEngine()
+                                + " fallback=" + observed.fallback()
+                                + " memo=" + shortenForLog(companionLatestAudioMemo, 56)
+                                + (sanitizedDetail.isBlank() ? "" : " detail=" + shortenForLog(sanitizedDetail, 80)));
+                    }
+                } else {
+                    Config.logDebug("[Companion][Audio] skipped retained="
+                            + !currentAudioMemoValue(System.currentTimeMillis()).isBlank());
+                }
+            } catch (Exception ex) {
+                Config.logDebug("[Companion][Audio] observe failed: " + ex.getClass().getSimpleName()
+                        + ":" + ex.getMessage());
+            } finally {
+                companionLastAudioObserveCompletedAtMs = System.currentTimeMillis();
+                companionAudioObserverInFlight = false;
+            }
+        });
+        return true;
+    }
+
+    private BufferedImage scaleCompanionScreenshot(BufferedImage source, int maxEdge) {
+        if (source == null) {
+            return new BufferedImage(1, 1, BufferedImage.TYPE_3BYTE_BGR);
+        }
+        if (maxEdge <= 0) {
+            maxEdge = Math.max(source.getWidth(), source.getHeight());
+        }
+        if (source.getWidth() <= maxEdge && source.getHeight() <= maxEdge) {
+            if (source.getType() == BufferedImage.TYPE_3BYTE_BGR) {
+                return source;
+            }
+            BufferedImage copy = new BufferedImage(source.getWidth(), source.getHeight(), BufferedImage.TYPE_3BYTE_BGR);
+            Graphics2D g = copy.createGraphics();
+            try {
+                g.drawImage(source, 0, 0, null);
+            } finally {
+                g.dispose();
+            }
+            return copy;
+        }
+        double scale = Math.min(
+                maxEdge / (double) Math.max(1, source.getWidth()),
+                maxEdge / (double) Math.max(1, source.getHeight())
+        );
+        if (scale >= 1.0d) {
+            scale = 1.0d;
+        }
+        int width = Math.max(1, (int) Math.round(source.getWidth() * scale));
+        int height = Math.max(1, (int) Math.round(source.getHeight() * scale));
+        BufferedImage scaled = new BufferedImage(width, height, BufferedImage.TYPE_3BYTE_BGR);
+        Graphics2D g = scaled.createGraphics();
+        try {
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+            g.drawImage(source, 0, 0, width, height, null);
+        } finally {
+            g.dispose();
+        }
+        return scaled;
+    }
+
+    private int resolveCompanionVisionCaptureMaxWidth() {
+        Path configDir = companionVisionConfigDir();
+        if (Files.exists(configDir.resolve("ENABLE_CAPTURE_960.txt"))) {
+            return COMPANION_MM_SCREEN_MAX_WIDTH_960;
+        }
+        if (Files.exists(configDir.resolve("ENABLE_CAPTURE_768.txt"))) {
+            return COMPANION_MM_SCREEN_MAX_WIDTH_768;
+        }
+        return COMPANION_MM_SCREEN_MAX_WIDTH_DEFAULT;
+    }
+
+    private Path companionVisionConfigDir() {
+        return Paths.get("mobecho", "vision");
+    }
+
+    private String bestEffortForegroundWindowTitle() {
+        try {
+            com.sun.jna.platform.win32.WinDef.HWND hwnd =
+                    com.sun.jna.platform.win32.User32.INSTANCE.GetForegroundWindow();
+            if (hwnd == null) {
+                return "";
+            }
+            char[] buffer = new char[512];
+            int len = com.sun.jna.platform.win32.User32.INSTANCE.GetWindowText(hwnd, buffer, buffer.length);
+            if (len <= 0) {
+                return "";
+            }
+            String title = com.sun.jna.Native.toString(buffer);
+            if (title == null) {
+                return "";
+            }
+            title = title.trim();
+            if (shouldIgnoreCompanionWindowTitle(title)) {
+                return "";
+            }
+            return title.length() > 72 ? title.substring(0, 72).trim() : title;
+        } catch (Throwable ignore) {
+            return "";
+        }
+    }
+
+    private boolean shouldIgnoreCompanionWindowTitle(String title) {
+        if (title == null) {
+            return true;
+        }
+        String normalized = title.trim();
+        if (normalized.isBlank()) {
+            return true;
+        }
+        String lower = normalized.toLowerCase(Locale.ROOT);
+        if (lower.startsWith("mobmate") || lower.contains("mobecho") || "companion".equals(lower)) {
+            return true;
+        }
+        return false;
+    }
+
+    private static String shortenForLog(String text, int maxChars) {
+        if (text == null) {
+            return "";
+        }
+        String normalized = text.replace('\r', ' ').replace('\n', ' ').trim();
+        if (normalized.length() <= maxChars) {
+            return normalized;
+        }
+        return normalized.substring(0, Math.max(0, maxChars)) + "...";
+    }
+
+    private boolean isCompanionHiddenDesktopAudioMarker(String text) {
+        if (text == null) {
+            return false;
+        }
+        String normalized = text.trim();
+        return normalized.startsWith("[desktop_audio_presence]")
+                || normalized.startsWith("[async_brain_tick]");
+    }
+
+    private String sanitizeCompanionUserFacingText(String text) {
+        if (text == null) {
+            return "";
+        }
+        String normalized = text.trim();
+        if (normalized.isBlank() || isCompanionHiddenDesktopAudioMarker(normalized)) {
+            return "";
+        }
+        return normalized;
+    }
+
+    private String sanitizeCompanionReplyText(String text) {
+        String normalized = sanitizeCompanionUserFacingText(text);
+        if (normalized.isBlank()) {
+            return "";
+        }
+        normalized = normalized
+                .replaceAll("(?is)<\\s*/?\\s*skip\\s*>", " ")
+                .replaceAll("(?is)<\\s*skip\\s*/\\s*>", " ")
+                .replaceAll("\\s{2,}", " ")
+                .trim();
+        return normalized;
+    }
+
+    private CompanionCoherentSnapshot snapshotCompanionLatestState(long turnStartedAtMs,
+                                                                   String sourceText,
+                                                                   String tone,
+                                                                   String locale,
+                                                                   CompanionSituationSummary situationSummary) {
+        String traceId = "mmasync-" + turnStartedAtMs;
+        maybeScheduleCompanionVisionObservation(sourceText, tone, locale, situationSummary, traceId, turnStartedAtMs, false);
+        maybeScheduleCompanionAudioObservation(traceId, turnStartedAtMs, false);
+        long now = System.currentTimeMillis();
+        CompanionObserverSnapshot audioSnapshot = audioSnapshotForTurn(null, now);
+        boolean visionReady = !currentSceneMemoValue(now).isBlank() || !currentSceneDetailValue(now).isBlank();
+        boolean audioReady = audioSnapshot != null
+                && (!defaultIfBlank(audioSnapshot.memo(), "").isBlank()
+                || !defaultIfBlank(audioSnapshot.detail(), "").isBlank());
+        boolean visionThisTurn = companionLastVisionObserveCompletedAtMs >= turnStartedAtMs;
+        boolean audioThisTurn = companionLastAudioObserveCompletedAtMs >= turnStartedAtMs;
+        return new CompanionCoherentSnapshot(
+                traceId,
+                turnStartedAtMs,
+                0L,
+                false,
+                visionReady,
+                visionThisTurn,
+                false,
+                audioReady,
+                audioThisTurn,
+                Math.max(0L, companionLastVisionObserveCompletedAtMs),
+                Math.max(0L, companionLastAudioObserveCompletedAtMs)
+        );
+    }
+
+    private boolean hasAnyCompanionVisionObservation() {
+        return companionLastVisionObserveCompletedAtMs > 0L
+                || companionLatestSceneMemoAtMs > 0L
+                || companionLatestSceneDetailAtMs > 0L;
+    }
+
+    private boolean hasAnyCompanionAudioObservation() {
+        return companionLastAudioObserveCompletedAtMs > 0L
+                || companionLastAudioObserveRequestedAtMs > 0L
+                || companionLatestAudioMemoAtMs > 0L;
+    }
+
+    private void runCompanionTurn(String sourceText, CompanionObservation observation) {
+        runCompanionTurn(sourceText, observation, false, null);
+    }
+
+    private void runCompanionTurn(String sourceText, CompanionObservation observation, boolean asyncTick) {
+        runCompanionTurn(sourceText, observation, asyncTick, null);
+    }
+
+    private void runCompanionTurn(String sourceText,
+                                  CompanionObservation observation,
+                                  boolean asyncTick,
+                                  String sourceKindHint) {
+        companionTurnRunning.set(true);
+        long turnStartedAtMs = System.currentTimeMillis();
+        try {
+            CompanionSidecarClient.Status status = companionSidecarClient.probe();
+            if (!status.installed()) {
+                SwingUtilities.invokeLater(() -> {
+                    if (companionFrame != null) {
+                        companionFrame.refreshStatusSummary(isCompanionEnabled(), status, prefs.get("companion.output.device", "").trim());
+                        companionFrame.updateStatus("Companion DLC missing");
+                        companionFrame.updateExchange(sourceText, "");
+                    }
+                });
+                return;
+            }
+
+            JSONArray messages = buildCompanionMessagePayload();
+            String tone = prefs.get("companion.tone", "desu");
+            String locale = resolveCompanionLocale(sourceText);
+            CompanionSituationSummary situationSummary = buildCompanionSituationSummary(sourceText, observation);
+            CompanionCoherentSnapshot coherenceSnapshot = asyncTick
+                    ? snapshotCompanionLatestState(turnStartedAtMs, sourceText, tone, locale, situationSummary)
+                    : awaitCompanionCoherentSnapshot(turnStartedAtMs, sourceText, tone, locale, situationSummary);
+            CompanionMultimodalPayload multimodalPayload = buildCompanionMultimodalPayload(
+                    sourceText,
+                    situationSummary,
+                    coherenceSnapshot,
+                    sourceKindHint,
+                    asyncTick
+            );
+            rememberCompanionSituationSummary(situationSummary);
+            Config.logDebug((asyncTick ? "[Companion][Async]" : "[Companion][Sync]") + " id=" + coherenceSnapshot.traceId()
+                    + " waited=" + coherenceSnapshot.waitedMs() + "ms"
+                    + " visionWait=" + (coherenceSnapshot.visionWaited() ? "1" : "0")
+                    + " visionReady=" + (coherenceSnapshot.visionReady() ? "1" : "0")
+                    + " visionThis=" + (coherenceSnapshot.visionObservedThisTurn() ? "1" : "0")
+                    + " audioWait=" + (coherenceSnapshot.audioWaited() ? "1" : "0")
+                    + " audioReady=" + (coherenceSnapshot.audioReady() ? "1" : "0")
+                    + " audioThis=" + (coherenceSnapshot.audioObservedThisTurn() ? "1" : "0"));
+            Config.logDebug("[Companion][Summary] " + situationSummary.summaryLine());
+            Config.logDebug("[Companion][MM] " + multimodalPayload.summaryLine());
+            CompanionSidecarClient.Reply reply = companionSidecarClient.generateReply(
+                    messages,
+                    tone,
+                    locale,
+                    observation == null ? null : observation.toJson(),
+                    situationSummary.toJson(),
+                    multimodalPayload.json()
+            );
+            String replyText = sanitizeCompanionReplyText(reply.text());
+            if (replyText.isBlank()) {
+                Config.logDebug("[Companion][Trace] id=" + coherenceSnapshot.traceId()
+                        + " reply_blank_ms=" + Math.max(0L, System.currentTimeMillis() - turnStartedAtMs));
+                return;
+            }
+
+            rememberCompanionContext("assistant", replyText);
+            lastCompanionReplyText = replyText;
+            lastCompanionReplyAtMs = System.currentTimeMillis();
+            Config.logDebug("[Companion] reply: engine=" + reply.activeEngine()
+                    + " fallback=" + reply.fallback()
+                    + " tag=" + (reply.observationTag() == null ? "" : reply.observationTag())
+                    + " text=" + replyText);
+            Config.logDebug("[Companion][Trace] id=" + coherenceSnapshot.traceId()
+                    + " reply_ms=" + Math.max(0L, System.currentTimeMillis() - turnStartedAtMs));
+            boolean speakCompanionAudio = shouldSpeakCompanionAudio();
+            String displaySourceText = sanitizeCompanionUserFacingText(sourceText);
+            SwingUtilities.invokeLater(() -> {
+                if (companionFrame != null) {
+                    companionFrame.updateStatus("Companion ready [" + reply.activeEngine() + "]");
+                    companionFrame.updateExchange(displaySourceText, replyText);
+                    companionFrame.startReplyAnimation(replyText, speakCompanionAudio);
+                }
+            });
+            refreshCompanionStatusAsync();
+
+            if (speakCompanionAudio) {
+                long beforeTtsAtMs = System.currentTimeMillis();
+                speakCompanionText(replyText);
+                Config.logDebug("[Companion][Trace] id=" + coherenceSnapshot.traceId()
+                        + " tts_queue_ms=" + Math.max(0L, beforeTtsAtMs - turnStartedAtMs));
+            }
+        } catch (Exception ex) {
+            Config.logError("[Companion] generate failed", ex);
+            SwingUtilities.invokeLater(() -> {
+                if (companionFrame != null) {
+                    companionFrame.updateStatus("Companion error: " + ex.getMessage());
+                }
+            });
+            refreshCompanionStatusAsync();
+        } finally {
+            companionTurnRunning.set(false);
+        }
+    }
+
+    private JSONArray buildCompanionMessagePayload() {
+        JSONArray arr = new JSONArray();
+        synchronized (companionContextLock) {
+            for (CompanionContextMessage msg : companionContext) {
+                if ("user".equalsIgnoreCase(msg.role) && isCompanionHiddenDesktopAudioMarker(msg.text)) {
+                    continue;
+                }
+                JSONObject json = new JSONObject();
+                json.put("role", msg.role);
+                json.put("text", msg.text);
+                arr.add(json);
+            }
+        }
+        return arr;
+    }
+
+    private void rememberCompanionContext(String role, String text) {
+        if (text == null || text.isBlank()) return;
+        synchronized (companionContextLock) {
+            if ("assistant".equalsIgnoreCase(role)) {
+                String currentNorm = normForNearDup(text);
+                if (currentNorm.isBlank()) {
+                    return;
+                }
+                java.util.Iterator<CompanionContextMessage> it = companionContext.descendingIterator();
+                while (it.hasNext()) {
+                    CompanionContextMessage prev = it.next();
+                    if (!"assistant".equalsIgnoreCase(prev.role)) {
+                        continue;
+                    }
+                    String prevNorm = normForNearDup(prev.text);
+                    if (!prevNorm.isBlank() && similarityRatio(prevNorm, currentNorm) >= 0.84d) {
+                        return;
+                    }
+                    break;
+                }
+            }
+            companionContext.addLast(new CompanionContextMessage(role, text));
+            while (companionContext.size() > 6) {
+                companionContext.removeFirst();
+            }
+        }
+    }
+
+    private boolean shouldAcceptCompanionHeardText(String text, long now) {
+        String normalized = normForNearDup(text);
+        if (normalized.isBlank()) return false;
+        if (!lastCompanionHeardText.isBlank()
+                && (now - lastCompanionHeardAtMs) < 1500L
+                && normalized.equals(normForNearDup(lastCompanionHeardText))) {
+            return false;
+        }
+        lastCompanionHeardText = text;
+        lastCompanionHeardAtMs = now;
+        return true;
+    }
+
+    private boolean isLikelyCompanionEcho(String text, long now) {
+        if (text == null || text.isBlank()) return false;
+        if (now < companionSuppressUntilMs) {
+            String prev = normForNearDup(lastCompanionReplyText);
+            String cur = normForNearDup(text);
+            if (!prev.isBlank() && !cur.isBlank() && similarityRatio(prev, cur) >= 0.72) {
+                return true;
+            }
+        }
+        if (!lastCompanionReplyText.isBlank() && (now - lastCompanionReplyAtMs) < 3500L) {
+            String prev = normForNearDup(lastCompanionReplyText);
+            String cur = normForNearDup(text);
+            return !prev.isBlank() && !cur.isBlank() && similarityRatio(prev, cur) >= 0.82;
+        }
+        return false;
+    }
+
+    private String resolveCompanionLocale(String text) {
+        String configured = normalizeCompanionLocaleTag(prefs.get("talk.lang", "auto"));
+        if (!configured.isBlank() && !"auto".equalsIgnoreCase(configured)) {
+            return configured;
+        }
+        if (text == null || text.isBlank()) return "ja";
+        if (text.trim().startsWith("[async_brain_tick]")) {
+            return resolveCompanionEventLocale();
+        }
+        boolean hasHangul = text.codePoints().anyMatch(cp -> cp >= 0xac00 && cp <= 0xd7af);
+        if (hasHangul) return "ko";
+        boolean hasKana = text.codePoints().anyMatch(cp -> (cp >= 0x3040 && cp <= 0x30ff));
+        if (hasKana) return "ja";
+        if (containsChineseHint(text)) return "zh";
+        boolean hasCjk = text.codePoints().anyMatch(cp -> cp >= 0x4e00 && cp <= 0x9fff);
+        if (hasCjk) return "ja";
+        return "en";
+    }
+
+    private String resolveCompanionEventLocale() {
+        String talkConfigured = normalizeCompanionLocaleTag(prefs.get("talk.lang", "auto"));
+        if (!talkConfigured.isBlank() && !"auto".equalsIgnoreCase(talkConfigured)) {
+            return talkConfigured;
+        }
+        String hearingConfigured = normalizeCompanionLocaleTag(prefs.get("hearing.lang", "auto"));
+        if (!hearingConfigured.isBlank() && !"auto".equalsIgnoreCase(hearingConfigured)) {
+            return hearingConfigured;
+        }
+        return "ja";
+    }
+
+    private String resolveCompanionSpeakLocale(String text) {
+        String eventLocale = normalizeCompanionLocaleTag(resolveCompanionEventLocale());
+        if (!eventLocale.isBlank() && !"auto".equalsIgnoreCase(eventLocale)) {
+            return eventLocale;
+        }
+        return resolveCompanionLocale(text);
+    }
+
+    private String normalizeCompanionLocaleTag(String locale) {
+        if (locale == null) return "";
+        String normalized = locale.trim().toLowerCase(Locale.ROOT).replace('_', '-');
+        if (normalized.isBlank()) return "";
+        if ("auto".equals(normalized)) return "auto";
+        if (normalized.startsWith("zh")) return "zh";
+        if (normalized.startsWith("ja")) return "ja";
+        if (normalized.startsWith("ko")) return "ko";
+        if (normalized.startsWith("en")) return "en";
+        return normalized;
+    }
+
+    private boolean containsChineseHint(String text) {
+        if (text == null || text.isBlank()) return false;
+        return text.contains("吗")
+                || text.contains("呢")
+                || text.contains("啊")
+                || text.contains("了")
+                || text.contains("这")
+                || text.contains("那")
+                || text.contains("个")
+                || text.contains("们")
+                || text.contains("说")
+                || text.contains("听")
+                || text.contains("让")
+                || text.contains("听起来")
+                || text.contains("這")
+                || text.contains("嗎")
+                || text.contains("個")
+                || text.contains("們")
+                || text.contains("說")
+                || text.contains("聽")
+                || text.contains("聽起來");
+    }
+
+    private void rememberCompanionObservation(CompanionObservation observation) {
+        if (observation == null) return;
+        lastCompanionObservationSeq = observation.utteranceSeq;
+        lastCompanionObservation = observation;
+        Config.logDebug("[Companion][Obs] " + observation.summary());
+        maybeTuneRecognitionAssist(observation);
+    }
+
+    private CompanionObservation consumeCompanionObservation(long utteranceSeq) {
+        if (utteranceSeq <= 0L) return null;
+        if (lastCompanionObservationSeq != utteranceSeq) return null;
+        CompanionObservation observation = lastCompanionObservation;
+        lastCompanionObservation = null;
+        lastCompanionObservationSeq = -1L;
+        return observation;
+    }
+
+    private long pcmBytesToMs(int byteCount) {
+        if (byteCount <= 0) return 0L;
+        double bytesPerSecond = audioFormat.getFrameSize() * audioFormat.getSampleRate();
+        if (bytesPerSecond <= 0.0d) return 0L;
+        return Math.max(0L, Math.round((byteCount * 1000.0d) / bytesPerSecond));
+    }
+
+    private CompanionObservation buildCompanionObservation(long utteranceSeq,
+                                                           long speechDurationMs,
+                                                           int trailingSilenceFrames,
+                                                           int silenceThresholdFrames,
+                                                           int maxPeak,
+                                                           int maxAvg,
+                                                           byte[] rawChunk,
+                                                           byte[] procChunk,
+                                                           boolean rescuedFromPartial) {
+        AudioPrefilter.VoiceMetrics rawMetrics = AudioPrefilter.analyzeVoiceLike(
+                rawChunk,
+                rawChunk == null ? 0 : rawChunk.length,
+                (int) audioFormat.getSampleRate()
+        );
+        AudioPrefilter.VoiceMetrics procMetrics = AudioPrefilter.analyzeVoiceLike(
+                procChunk,
+                procChunk == null ? 0 : procChunk.length,
+                (int) audioFormat.getSampleRate()
+        );
+        long trailingSilenceMs = pcmBytesToMs(4096) * Math.max(0, trailingSilenceFrames);
+        return new CompanionObservation(
+                utteranceSeq,
+                Math.max(0L, speechDurationMs),
+                trailingSilenceMs,
+                Math.max(0, trailingSilenceFrames),
+                Math.max(0, silenceThresholdFrames),
+                Math.max(0, maxPeak),
+                Math.max(0, maxAvg),
+                rawMetrics.peak,
+                rawMetrics.rms,
+                procMetrics.peak,
+                procMetrics.rms,
+                rescuedFromPartial
+        );
+    }
+
+    private boolean shouldSpeakCompanionAudio() {
+        String mode = prefs.get("companion.output.mode", "voice").trim().toLowerCase(Locale.ROOT);
+        if ("subtitle".equals(mode)) {
+            return false;
+        }
+        return prefs.getBoolean("companion.tts.enabled", true);
+    }
+
     private volatile long lastSpeakMs = 0;
     private final Object talkFinalDedupeLock = new Object();
     private void handleFinalText(String finalStr, Action action, boolean flgRescue) {
@@ -6114,7 +10454,13 @@ public class MobMateWhisp implements NativeKeyListener {
         markFinalAcceptedNow(now, willSpeak, out);
 
         long uttSeq = TL_FINAL_UTTERANCE_SEQ.get();
+        if (willSpeak && uttSeq > 0) {
+            lastSpokenUtteranceSeq = uttSeq;
+            lastSpokenUtteranceAtMs = now;
+            lastSpokenUtteranceText = dedupeText;
+        }
         TtsProsodyProfile ttsProsodyProfile = consumeTalkTtsProsodyProfile(uttSeq, s);
+        maybeSubmitCompanionTurn(s, action, uttSeq);
 
         if (ttsConfirmMode && action != Action.NOTHING_NO_SPEAK) {
             enqueuePendingConfirm(s, out, historyText, action, now, "final", ttsProsodyProfile);
@@ -6214,6 +10560,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private static final long PARTIAL_RESCUE_STALE_MS = 90;      // partial更新が止まった判
     private static final long PARTIAL_RESCUE_MIN_SILENCE_MS = 40; // 無音が続いてる判定
     private static final long PARTIAL_RESCUE_COOLDOWN_MS = 400;    // 連発防止
+    private static final long SAME_UTTERANCE_TTS_DUP_SUPPRESS_MS = 2200;
     void maybeRescueSpeakFromPartial(Action action, long nowMs, long utteranceSeq) {
         // ★ADD: Final処理中はrescueしない（セーフティネット）
         if (isProcessingFinal.get()) return;
@@ -6231,6 +10578,12 @@ public class MobMateWhisp implements NativeKeyListener {
         if (utteranceSeq != currentUtteranceSeq) {
             Config.logDebug("★Partial rescue blocked (utterance changed): old=" + currentUtteranceSeq + " new=" + utteranceSeq);
             MobMateWhisp.setLastPartial(""); // 古いpartialをクリア
+            clearMoonshineCompleteCandidate(utteranceSeq);
+            return;
+        }
+        if (isNearDuplicateOfRecentlySpokenUtterance(s, utteranceSeq, nowMs)) {
+            Config.logDebug("★Partial rescue blocked (same utterance near-dup after speak): " + s);
+            MobMateWhisp.setLastPartial("");
             clearMoonshineCompleteCandidate(utteranceSeq);
             return;
         }
@@ -6295,7 +10648,12 @@ public class MobMateWhisp implements NativeKeyListener {
         MobMateWhisp.setLastPartial(s);
 
         Config.logDebug("★Instant FINAL(Hearing) -> handleFinalText(no-history/no-speak): " + s);
-        handleFinalText(s, Action.NOTHING_NO_SPEAK, true);
+        companionSuppressedForCurrentFinal.set(true);
+        try {
+            handleFinalText(s, Action.NOTHING_NO_SPEAK, true);
+        } finally {
+            companionSuppressedForCurrentFinal.remove();
+        }
     }
     // LocalWhisperCPP の「短文=即FINAL」から呼ばれるやつ
     public void instantFinalFromWhisper(String text, Action action) {
@@ -6336,6 +10694,10 @@ public class MobMateWhisp implements NativeKeyListener {
     private boolean shouldSuppressMoonshineComplete(String finalStr, long uttSeq) {
         if (isDuplicateFinalOfRescue(finalStr, uttSeq)) {
             Config.logDebug("★Moon COMPLETE suppressed (dup of partial rescue): " + finalStr);
+            return true;
+        }
+        if (isNearDuplicateOfRecentlySpokenUtterance(finalStr, uttSeq, System.currentTimeMillis())) {
+            Config.logDebug("★Moon COMPLETE suppressed (same utterance already spoke): " + finalStr);
             return true;
         }
         String norm = normForNearDup(finalStr);
@@ -6691,7 +11053,9 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
     private boolean isKnownUnstableBuiltInPiperPlusEntry(PiperPlusCatalog.Entry entry) {
-        return entry != null && "css10-ja-6lang-zh".equalsIgnoreCase(entry.id());
+        if (entry == null) return false;
+        String id = entry.id().toLowerCase(Locale.ROOT);
+        return "css10-ja-6lang-zh".equals(id) || "xiao_ya".equals(id);
     }
 
     private void notifyKnownPiperPlusCompatibilityIssue(Component parent, PiperPlusCatalog.Entry entry) {
@@ -6699,10 +11063,19 @@ public class MobMateWhisp implements NativeKeyListener {
         String key = "compat:" + entry.id().toLowerCase(Locale.ROOT);
         if (!piperPlusCompatibilityNotified.add(key)) return;
 
-        String message = "The bundled Piper+ Chinese route is currently unstable with this CSS10 6lang voice.\n\n"
-                + "MobMate will fall back to Windows TTS for Chinese output.\n"
-                + "If you want Piper+ Chinese later, you can add a separate local Chinese model.\n\n"
-                + "Open the manual guide or the models folder now?";
+        String id = entry.id().toLowerCase(Locale.ROOT);
+        String message;
+        if ("xiao_ya".equals(id)) {
+            message = "This local Chinese piper-plus model is currently known to be incompatible with MobMate's bundled piper-plus runtime.\n\n"
+                    + "In our CLI test, xiao_ya generated noise-only WAV output, and the upstream model card says it only works on the Python version of Piper 1.4+ because of g2pW.\n\n"
+                    + "MobMate will fall back to Windows TTS for Chinese output.\n"
+                    + "Please open the Chinese guide and try another manual model first.";
+        } else {
+            message = "The bundled piper-plus Chinese route is currently unstable with this CSS10 6lang voice.\n\n"
+                    + "MobMate will fall back to Windows TTS for Chinese output.\n"
+                    + "If you want piper-plus Chinese later, you can add a separate local Chinese model.\n\n"
+                    + "Open the manual guide or the models folder now?";
+        }
         Runnable show = () -> {
             Object[] options = {"Open Chinese model guide", "Open models folder", "Close"};
             int choice = JOptionPane.showOptionDialog(
@@ -6726,7 +11099,7 @@ public class MobMateWhisp implements NativeKeyListener {
         } else {
             SwingUtilities.invokeLater(show);
         }
-        Config.log("[Piper+][Compat] builtin Chinese route marked unstable for entry=" + entry.id());
+        Config.log("[Piper+][Compat] Chinese route marked unstable for entry=" + entry.id());
     }
 
     private void openPiperPlusGuide(Component parent) {
@@ -6788,6 +11161,35 @@ public class MobMateWhisp implements NativeKeyListener {
                 parent != null ? parent : window,
                 "Open this folder manually:\n" + dir.toAbsolutePath(),
                 "MobMate",
+                JOptionPane.INFORMATION_MESSAGE
+        );
+    }
+
+    public void openCompanionDebugReport(String url) {
+        String normalized = url == null ? "" : url.trim();
+        if (normalized.isBlank()) {
+            return;
+        }
+        try {
+            Path reportPath = Path.of(normalized);
+            if (Desktop.isDesktopSupported()) {
+                Desktop desktop = Desktop.getDesktop();
+                if (Files.isRegularFile(reportPath) && desktop.isSupported(Desktop.Action.OPEN)) {
+                    desktop.open(reportPath.toFile());
+                    return;
+                }
+                if (desktop.isSupported(Desktop.Action.BROWSE)) {
+                    desktop.browse(reportPath.toUri());
+                    return;
+                }
+            }
+        } catch (Exception ex) {
+            Config.log("[MobEcho][debug-report] failed to open debug report: " + ex.getMessage());
+        }
+        JOptionPane.showMessageDialog(
+                companionFrame != null ? companionFrame : window,
+                "Open this debug report manually:\n" + normalized,
+                "MobMate Echo",
                 JOptionPane.INFORMATION_MESSAGE
         );
     }
@@ -6862,6 +11264,13 @@ public class MobMateWhisp implements NativeKeyListener {
         String n = normForRescueDup(finalStr);
         return !n.isEmpty() && n.equals(lastRescueNorm);
     }
+    private boolean isNearDuplicateOfRecentlySpokenUtterance(String text, long uttSeq, long nowMs) {
+        if (uttSeq <= 0) return false;
+        if (uttSeq != lastSpokenUtteranceSeq) return false;
+        long dt = nowMs - lastSpokenUtteranceAtMs;
+        if (dt < 0 || dt > SAME_UTTERANCE_TTS_DUP_SUPPRESS_MS) return false;
+        return areSameUtteranceRescueVariants(lastSpokenUtteranceText, text);
+    }
     private static String normForRescueDup(String s) {
         if (s == null) return "";
         String t = s.replace('\n',' ')
@@ -6872,6 +11281,38 @@ public class MobMateWhisp implements NativeKeyListener {
         t = t.replaceAll("\\s+", " ");
         t = t.replaceAll("[。．\\.！!？?]+$", ""); // 末尾の句読点ゆれを潰す
         return t;
+    }
+    private boolean areSameUtteranceRescueVariants(String previous, String current) {
+        String prev = normForNearDup(previous);
+        String cur = normForNearDup(current);
+        if (prev.isEmpty() || cur.isEmpty()) return false;
+        if (prev.equals(cur)) return true;
+        if (prev.startsWith(cur) || cur.startsWith(prev)) return true;
+
+        int prevCp = prev.codePointCount(0, prev.length());
+        int curCp = cur.codePointCount(0, cur.length());
+        int shorterCp = Math.min(prevCp, curCp);
+        int commonPrefixCp = commonPrefixCodePoints(prev, cur);
+        if (shorterCp >= 6 && commonPrefixCp >= Math.max(5, shorterCp - 2)) {
+            return true;
+        }
+
+        return similarityRatio(prev, cur) >= 0.78;
+    }
+    private static int commonPrefixCodePoints(String a, String b) {
+        if (a == null || b == null) return 0;
+        int ai = 0;
+        int bi = 0;
+        int matched = 0;
+        while (ai < a.length() && bi < b.length()) {
+            int acp = a.codePointAt(ai);
+            int bcp = b.codePointAt(bi);
+            if (acp != bcp) break;
+            ai += Character.charCount(acp);
+            bi += Character.charCount(bcp);
+            matched++;
+        }
+        return matched;
     }
 
 
@@ -6933,6 +11374,9 @@ public class MobMateWhisp implements NativeKeyListener {
         // ★softRestart中は w=null → 安全にスキップ
         if (w == null) {
             Config.logDebug("★TRANSCRIBE SKIP: whisper not available (restarting?)");
+            if (isEndOfCapture) {
+                clearTranscribingStateAfterAbortedFinal();
+            }
             return "";
         }
         if (MobMateWhisp.this.remoteUrl == null) {
@@ -6952,6 +11396,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 }
                 if (!transcribeBusy.compareAndSet(false, true)) {
                     Config.logDebug("★TRANSCRIBE BUSY -> DROP(final timeout) end=" + isEndOfCapture + " bytes=" + bytes);
+                    clearTranscribingStateAfterAbortedFinal();
                     return "";
                 }
             }
@@ -7122,6 +11567,17 @@ public class MobMateWhisp implements NativeKeyListener {
         return finalStr;
     }
 
+    private void clearTranscribingStateAfterAbortedFinal() {
+        MobMateWhisp.setLastPartial("");
+        updateTalkPartialPreview("");
+        setTranscribing(false);
+        SwingUtilities.invokeLater(() -> {
+            if (window != null && isRecording()) {
+                window.setTitle(UiText.t("ui.title.rec"));
+            }
+        });
+    }
+
     private void setStartupStatus(boolean busy, String text) {
         this.startupBusy = busy;
         if (text != null && !text.isBlank()) {
@@ -7147,6 +11603,7 @@ public class MobMateWhisp implements NativeKeyListener {
             recordingStartTime2 = System.currentTimeMillis();
         } else {
             recordingStartTime2 = 0;
+            endRecognitionAssistSession();
         }
         updateIcon();
     }
@@ -7457,6 +11914,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 Runtime.getRuntime().addShutdownHook(new Thread(() -> {
                     if (!shutdownHookOnce.compareAndSet(false, true)) return;
                     try { piperPlusSessionManager.close(); } catch (Throwable ignore) {}
+                    try { r.companionSidecarClient.close(); } catch (Throwable ignore) {}
                     try { shutdownMoonshine(); } catch (Throwable ignore) {}
                     try { SteamHelper.shutdown(); } catch (Throwable ignore) {}
                     try {
@@ -7472,6 +11930,38 @@ public class MobMateWhisp implements NativeKeyListener {
                     } catch (Throwable ignore) {
                     } finally {
                         try { audioService.shutdownNow(); } catch (Throwable ignore) {}
+                    }
+                    try {
+                        r.companionLoopbackMonitor.stop("core-shutdown");
+                    } catch (Throwable ignore) {
+                    }
+                    try {
+                        r.companionExecutor.shutdown();
+                        r.companionExecutor.awaitTermination(1200, TimeUnit.MILLISECONDS);
+                    } catch (Throwable ignore) {
+                    } finally {
+                        try { r.companionExecutor.shutdownNow(); } catch (Throwable ignore) {}
+                    }
+                    try {
+                        r.companionAutoScheduler.shutdown();
+                        r.companionAutoScheduler.awaitTermination(1200, TimeUnit.MILLISECONDS);
+                    } catch (Throwable ignore) {
+                    } finally {
+                        try { r.companionAutoScheduler.shutdownNow(); } catch (Throwable ignore) {}
+                    }
+                    try {
+                        r.companionVisionObserverExecutor.shutdown();
+                        r.companionVisionObserverExecutor.awaitTermination(1200, TimeUnit.MILLISECONDS);
+                    } catch (Throwable ignore) {
+                    } finally {
+                        try { r.companionVisionObserverExecutor.shutdownNow(); } catch (Throwable ignore) {}
+                    }
+                    try {
+                        r.companionAudioObserverExecutor.shutdown();
+                        r.companionAudioObserverExecutor.awaitTermination(1200, TimeUnit.MILLISECONDS);
+                    } catch (Throwable ignore) {
+                    } finally {
+                        try { r.companionAudioObserverExecutor.shutdownNow(); } catch (Throwable ignore) {}
                     }
                     try {
                         piperPlusPrewarmExecutor.shutdown();
@@ -7615,6 +12105,14 @@ public class MobMateWhisp implements NativeKeyListener {
         titleBar.add(Box.createHorizontalStrut(4));
         titleBar.add(confirmModeToggle);
 
+        companionButton = null;
+        if (isCompanionUiAvailable()) {
+            companionButton = new JButton("(^^)");
+            companionButton.setToolTipText("Companion");
+            titleBar.add(Box.createHorizontalStrut(4));
+            titleBar.add(companionButton);
+        }
+
         final JButton prefButton = new JButton(UiText.t("ui.main.prefs"));
         titleBar.add(Box.createHorizontalStrut(4));
         titleBar.add(prefButton);
@@ -7630,6 +12128,9 @@ public class MobMateWhisp implements NativeKeyListener {
         compactTitleButton(confirmModeToggle,
                 uiOr("ui.main.confirm.instant.short", "I"),
                 uiOr("ui.main.confirm.pending.short", "P"));
+        if (companionButton != null) {
+            compactTitleButton(companionButton, "(^^)");
+        }
         compactTitleButton(prefButton, UiText.t("ui.main.prefs"));
 
         // 右側：×ボタン
@@ -7729,11 +12230,25 @@ public class MobMateWhisp implements NativeKeyListener {
                     Config.logError("[Hearing] startup restore failed", t);
                 }
             }
+            boolean restoreCompanion = (pendingCompanionRestore != null)
+                    ? pendingCompanionRestore.booleanValue()
+                    : prefs.getBoolean("ui.companion.visible", false);
+            if (restoreCompanion && isCompanionUiAvailable()) {
+                try {
+                    showCompanionWindow();
+                } catch (Throwable t) {
+                    Config.logError("[Companion] startup restore failed", t);
+                }
+            }
+            pendingCompanionRestore = null;
 
             // 主役はメイン画面のまま
             if (window != null) {
                 window.toFront();
                 window.requestFocus();
+            }
+            if (restoreCompanion && companionFrame != null && companionFrame.isVisible()) {
+                companionFrame.ensureVisibleAboveMainWindow();
             }
         });
 
@@ -7782,6 +12297,14 @@ public class MobMateWhisp implements NativeKeyListener {
                 showHearingWindow();
             }
         });
+        if (companionButton != null) {
+            companionButton.addActionListener(new ActionListener() {
+                @Override
+                public void actionPerformed(ActionEvent e) {
+                    toggleCompanionWindow();
+                }
+            });
+        }
 
         settingsCenterButton.addActionListener(new ActionListener() {
             @Override
@@ -7808,6 +12331,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 if (settingsCenterFrame != null && settingsCenterFrame.isShowing()) return;
                 if (historyFrame != null && historyFrame.isShowing()) return;
                 if (hearingFrame != null && hearingFrame.isShowing()) return;
+                if (companionFrame != null && companionFrame.isShowing()) return;
 
                 // 通常時だけ明示前面化したいなら残す
                 // bringToFront(window);
@@ -7831,6 +12355,12 @@ public class MobMateWhisp implements NativeKeyListener {
                 Config.mirrorAllToCloud();
                 try {
                     if (hearingFrame != null) hearingFrame.shutdownForExit();
+                } catch (Throwable ignore) {}
+                try {
+                    if (companionFrame != null) companionFrame.shutdownForExit();
+                } catch (Throwable ignore) {}
+                try {
+                    companionSidecarClient.close();
                 } catch (Throwable ignore) {}
                 System.exit(0);
             }
@@ -8164,6 +12694,32 @@ public class MobMateWhisp implements NativeKeyListener {
             }
         });
     }
+
+    private void prepareForExit() {
+        if (isRecording()) {
+            stopRecording();
+        }
+        if (meterUpdateTimer != null) {
+            meterUpdateTimer.stop();
+        }
+        if (statusUpdateTimer != null) {
+            statusUpdateTimer.stop();
+        }
+        Config.mirrorAllToCloud();
+        try {
+            if (hearingFrame != null) hearingFrame.shutdownForExit();
+        } catch (Throwable ignore) {}
+        try {
+            if (companionFrame != null) {
+                companionFrame.shutdownForExit();
+                companionFrame = null;
+            }
+        } catch (Throwable ignore) {}
+        try {
+            companionSidecarClient.close();
+        } catch (Throwable ignore) {}
+    }
+
     // ===== ×ボタン作成 =====
     private JButton createCloseButton() {
         JButton closeBtn = new JButton("×");
@@ -8188,20 +12744,7 @@ public class MobMateWhisp implements NativeKeyListener {
         });
 
         closeBtn.addActionListener(e -> {
-            if (isRecording()) {
-                stopRecording();
-            }
-            if (meterUpdateTimer != null) {
-                meterUpdateTimer.stop();
-            }
-            // ★ステータス更新タイマーも停止
-            if (statusUpdateTimer != null) {
-                statusUpdateTimer.stop();
-            }
-            Config.mirrorAllToCloud();
-            try {
-                if (hearingFrame != null) hearingFrame.shutdownForExit();
-            } catch (Throwable ignore) {}
+            prepareForExit();
             System.exit(0);
         });
 
@@ -8236,6 +12779,11 @@ public class MobMateWhisp implements NativeKeyListener {
         speakerStatusLabel.setFont(speakerStatusLabel.getFont().deriveFont(11f));
         speakerStatusLabel.setToolTipText("Speaker Verification Status");
 
+        aiAssistStatusLabel = new JLabel(recognitionAssistUiText);
+        aiAssistStatusLabel.setFont(aiAssistStatusLabel.getFont().deriveFont(11f));
+        aiAssistStatusLabel.setForeground(recognitionAssistUiColor);
+        aiAssistStatusLabel.setToolTipText(recognitionAssistUiTooltip);
+
         // VV/VG
         vvStatusLabel = new JLabel("○VV");
         vvStatusLabel.setFont(vvStatusLabel.getFont().deriveFont(11f));
@@ -8244,6 +12792,32 @@ public class MobMateWhisp implements NativeKeyListener {
         vgStatusLabel = new JLabel("○VG");
         vgStatusLabel.setFont(vgStatusLabel.getFont().deriveFont(11f));
         vgStatusLabel.setToolTipText("Voiceger Status");
+
+        ttsMonitorLabel = new JLabel(uiOr("ui.status.monitor", "Mon"));
+        ttsMonitorLabel.setFont(ttsMonitorLabel.getFont().deriveFont(11f));
+        ttsMonitorLabel.setToolTipText(uiOr("ui.status.monitorTooltip", "Mirror TTS to your main speakers for monitoring"));
+
+        String[] monitorChoices = {"0%", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%"};
+        ttsMonitorVolumeCombo = new JComboBox<>(monitorChoices);
+        ttsMonitorVolumeCombo.setFont(ttsMonitorVolumeCombo.getFont().deriveFont(11f));
+        ttsMonitorVolumeCombo.setFocusable(false);
+        ttsMonitorVolumeCombo.setPreferredSize(new Dimension(68, 22));
+        ttsMonitorVolumeCombo.setMaximumSize(new Dimension(68, 22));
+        ttsMonitorVolumeCombo.addActionListener(e -> {
+            if (updatingTtsMonitorVolumeCombo || ttsMonitorVolumeCombo == null) return;
+            Object selected = ttsMonitorVolumeCombo.getSelectedItem();
+            if (selected == null) return;
+            String text = selected.toString().replace("%", "").trim();
+            try {
+                int volumePercent = Math.max(0, Math.min(100, Integer.parseInt(text)));
+                prefs.putInt("tts.monitor.volume_percent", volumePercent);
+                try {
+                    prefs.sync();
+                } catch (Exception ignore) {}
+                updateTtsMonitorStatusBarUi();
+            } catch (NumberFormatException ignore) {
+            }
+        });
 
         // 録音時間
         durationLabel = new JLabel("0:00");
@@ -8289,11 +12863,22 @@ public class MobMateWhisp implements NativeKeyListener {
         JSeparator sepSpk = new JSeparator(SwingConstants.VERTICAL);
         sepSpk.setPreferredSize(new Dimension(1, 12));
         statusBar.add(sepSpk);
+        statusBar.add(aiAssistStatusLabel);
+
+        JSeparator sepAia = new JSeparator(SwingConstants.VERTICAL);
+        sepAia.setPreferredSize(new Dimension(1, 12));
+        statusBar.add(sepAia);
 
         statusBar.add(vvStatusLabel);
         statusBar.add(sep5);
         statusBar.add(vgStatusLabel);
         statusBar.add(sep6);
+        statusBar.add(ttsMonitorLabel);
+        statusBar.add(ttsMonitorVolumeCombo);
+
+        JSeparator sepMonitor = new JSeparator(SwingConstants.VERTICAL);
+        sepMonitor.setPreferredSize(new Dimension(1, 12));
+        statusBar.add(sepMonitor);
 
         statusBar.add(hotkeyLabel);
         statusBar.add(sep3);
@@ -8303,7 +12888,42 @@ public class MobMateWhisp implements NativeKeyListener {
         statusBar.add(sep8);
         statusBar.add(versionLabel);
 
+        applyRecognitionAssistStatus(recognitionAssistUiText, recognitionAssistUiColor, recognitionAssistUiTooltip);
+        updateTtsMonitorStatusBarUi();
+
         return statusBar;
+    }
+
+    private int getTtsMonitorVolumePercent() {
+        if (prefs == null) return 0;
+        int legacyDefault = prefs.getBoolean("tts.monitor.enabled", false) ? 30 : 0;
+        return Math.max(0, Math.min(100, prefs.getInt("tts.monitor.volume_percent", legacyDefault)));
+    }
+
+    private void updateTtsMonitorStatusBarUi() {
+        int volumePercent = getTtsMonitorVolumePercent();
+        boolean enabled = volumePercent > 0;
+
+        if (ttsMonitorLabel != null) {
+            ttsMonitorLabel.setForeground(enabled
+                    ? UIManager.getColor("Label.foreground")
+                    : Color.GRAY);
+        }
+        if (ttsMonitorVolumeCombo != null) {
+            updatingTtsMonitorVolumeCombo = true;
+            try {
+                String selected = volumePercent + "%";
+                if (!Objects.equals(selected, ttsMonitorVolumeCombo.getSelectedItem())) {
+                    ttsMonitorVolumeCombo.setSelectedItem(selected);
+                }
+                ttsMonitorVolumeCombo.setEnabled(true);
+                ttsMonitorVolumeCombo.setToolTipText(enabled
+                        ? uiOr("ui.status.monitorTooltip", "Mirror TTS to your main speakers for monitoring")
+                        : uiOr("ui.status.monitorTooltipOff", "0% turns monitor playback off"));
+            } finally {
+                updatingTtsMonitorVolumeCombo = false;
+            }
+        }
     }
 
     private String buildCurrentModelStatusText() {
@@ -8525,6 +13145,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 latencyLabel.setText(buildLatencyText());
                 latencyLabel.setToolTipText(buildLatencyTooltip());
             }
+            updateTtsMonitorStatusBarUi();
             if (statusLabel != null) {
                 boolean rec = isRecording();
                 boolean tr = isTranscribing();
@@ -8663,6 +13284,259 @@ public class MobMateWhisp implements NativeKeyListener {
             }
             throw t;
         }
+    }
+    private void toggleCompanionWindow() {
+        if (companionFrame != null && companionFrame.isVisible()) {
+            companionFrame.hideWindow();
+            return;
+        }
+        showCompanionWindow();
+    }
+    private void showCompanionWindow() {
+        Config.log("[Companion] showCompanionWindow begin frameExists=" + (companionFrame != null));
+        if (!isCompanionUiAvailable()) {
+            closeCompanionUiForMissingDlc();
+            return;
+        }
+        try {
+            if (companionFrame == null) {
+                companionFrame = new CompanionFrame(prefs, this.imageInactive, this);
+            }
+            companionFrame.showWindow();
+            refreshCompanionStatusAsync();
+        } catch (Throwable t) {
+            logDetailedThrowable("[Companion] showCompanionWindow failed", t);
+            if (companionFrame != null && !companionFrame.isDisplayable()) {
+                companionFrame = null;
+            }
+            throw t;
+        }
+    }
+    public boolean isCompanionEnabled() {
+        return prefs != null && prefs.getBoolean("companion.enabled", false);
+    }
+    public boolean isCompanionAutonomousEnabled() {
+        return prefs != null && prefs.getBoolean("companion.autonomous.enabled", true);
+    }
+
+    private long scaledCompanionAutonomousCooldownMs(long baseMs) {
+        double factor = switch (getCompanionAutonomousFrequency()) {
+            case "very_low" -> 2.2d;
+            case "low" -> 1.5d;
+            case "high" -> 0.7d;
+            case "very_high" -> 0.45d;
+            default -> 1.0d;
+        };
+        return Math.max(400L, Math.round(baseMs * factor));
+    }
+
+    private String getCompanionAutonomousFrequency() {
+        if (prefs == null) {
+            return "normal";
+        }
+        String value = prefs.get("companion.autonomous.frequency", "normal");
+        if (value == null) {
+            return "normal";
+        }
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        return switch (normalized) {
+            case "very_low", "low", "normal", "high", "very_high" -> normalized;
+            default -> "normal";
+        };
+    }
+
+    private String getCompanionMicStyle() {
+        if (prefs == null) {
+            return "partner";
+        }
+        String value = prefs.get("companion.mic.style", "partner");
+        if (value == null) {
+            return "partner";
+        }
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        return switch (normalized) {
+            case "partner", "tsukkomi" -> normalized;
+            default -> "partner";
+        };
+    }
+
+    private String getCompanionMmAudioPrefilterMode() {
+        if (prefs == null) {
+            return "normal";
+        }
+        return normalizeAudioPrefilterMode(prefs.get("companion.mm.audio.prefilter", "normal"));
+    }
+
+    public boolean isCompanionDebugModeEnabled() {
+        return prefs != null && prefs.getBoolean("companion.debug.mode", false);
+    }
+
+    public boolean isInternalCompanionDebugUiEnabled() {
+        try {
+            return Files.isRegularFile(getExeDir().toPath().resolve(COMPANION_DEBUG_UI_MARKER));
+        } catch (Exception ignore) {
+            return false;
+        }
+    }
+
+    public boolean isCompanionDebugCaptureImagesEnabled() {
+        return isCompanionDebugModeEnabled() && prefs != null
+                && prefs.getBoolean("companion.debug.capture_images", false);
+    }
+
+    private void enforceCompanionDebugPrivacyDefaults() {
+        if (prefs == null) {
+            return;
+        }
+        boolean changed = false;
+        if (prefs.getBoolean("companion.debug.mode", false)) {
+            prefs.putBoolean("companion.debug.mode", false);
+            changed = true;
+        }
+        if (prefs.getBoolean("companion.debug.capture_images", false)) {
+            prefs.putBoolean("companion.debug.capture_images", false);
+            changed = true;
+        }
+        if (changed) {
+            try { prefs.sync(); } catch (Exception ignore) {}
+            Config.log("[Companion][Debug] forced privacy-safe debug defaults");
+        }
+        purgeCompanionDebugArtifacts();
+    }
+
+    private void purgeCompanionDebugArtifacts() {
+        try {
+            Path runtimeDir = getExeDir().toPath().resolve("mobecho");
+            deletePathRecursively(runtimeDir.resolve("debug_artifacts"));
+            Files.deleteIfExists(runtimeDir.resolve("moecho-debug-report.md"));
+            Files.deleteIfExists(runtimeDir.resolve("moecho-debug-raw.md"));
+        } catch (Exception ex) {
+            Config.log("[Companion][Debug] artifact cleanup skipped: " + ex.getMessage());
+        }
+    }
+
+    private static void deletePathRecursively(Path root) throws IOException {
+        if (root == null || !Files.exists(root)) {
+            return;
+        }
+        try (var walk = Files.walk(root)) {
+            walk.sorted(Comparator.reverseOrder()).forEach(path -> {
+                try {
+                    Files.deleteIfExists(path);
+                } catch (IOException ex) {
+                    throw new UncheckedIOException(ex);
+                }
+            });
+        } catch (UncheckedIOException ex) {
+            throw ex.getCause();
+        }
+    }
+
+    public void setCompanionEnabled(boolean enabled) {
+        prefs.putBoolean("companion.enabled", enabled);
+        try { prefs.sync(); } catch (Exception ignore) {}
+        if (companionFrame != null) {
+            String output = prefs.get("companion.output.device", "").trim();
+            companionFrame.refreshStatusSummary(enabled, null, output);
+            companionFrame.updateStatus(enabled ? "Companion standby..." : "Companion off");
+        }
+        syncCompanionDesktopAudioRouteAsync();
+        refreshCompanionStatusAsync();
+    }
+    public void refreshCompanionStatusAsync() {
+        companionExecutor.submit(() -> {
+            CompanionSidecarClient.Status status = companionSidecarClient.probe();
+            String output = prefs.get("companion.output.device", "").trim();
+            if (output.isBlank()) {
+                output = getPreferredCompanionOutputDevice();
+            }
+            final String statusOutput = output;
+            boolean enabled = isCompanionEnabled();
+            SwingUtilities.invokeLater(() -> {
+                if (!status.installed()) {
+                    closeCompanionUiForMissingDlc();
+                }
+                if (companionFrame != null) {
+                    companionFrame.refreshStatusSummary(enabled, status, statusOutput);
+                    companionFrame.refreshSituationSummary(
+                            companionUiWindowTitle,
+                            companionUiMoodDominant,
+                            companionUiEnergyTrend,
+                            companionUiUtteranceTrend,
+                            companionUiFatigueLevel,
+                            companionUiExcitementBurst,
+                            companionUiLongSilence,
+                            companionUiStuckDetected,
+                            companionUiSighCount,
+                            companionUiSummaryAtMs
+                    );
+                }
+                if (companionButton != null) {
+                    companionButton.setVisible(status.installed());
+                }
+            });
+            ensureCompanionDesktopAudioMonitorState();
+        });
+    }
+
+    private boolean isCompanionUiAvailable() {
+        return companionSidecarClient.isInstalled();
+    }
+
+    private void closeCompanionUiForMissingDlc() {
+        prefs.putBoolean("ui.companion.visible", false);
+        try { prefs.flush(); } catch (Exception ignore) {}
+        pendingCompanionRestore = false;
+        if (companionFrame != null) {
+            try {
+                companionFrame.shutdownForExit();
+            } catch (Throwable ignore) {}
+            companionFrame = null;
+        }
+        if (companionButton != null) {
+            companionButton.setVisible(false);
+        }
+        syncCompanionDesktopAudioRouteAsync();
+        if (window != null) {
+            window.revalidate();
+            window.repaint();
+        }
+    }
+
+    void syncCompanionDesktopAudioRouteAsync() {
+        companionExecutor.submit(() -> {
+            try {
+                ensureCompanionDesktopAudioMonitorState();
+            } catch (Throwable t) {
+                Config.logError("[Companion][Loopback] route sync failed", t);
+            }
+        });
+    }
+
+    void noteCompanionDesktopAudioRouteChanged(String route, String reason) {
+        String normalizedRoute = (route == null || route.isBlank()) ? "off" : route.trim().toLowerCase(Locale.ROOT);
+        if (Objects.equals(companionDesktopAudioRoute, normalizedRoute)) {
+            return;
+        }
+        companionDesktopAudioRoute = normalizedRoute;
+        Config.log("[Companion][Loopback] route=" + normalizedRoute
+                + (reason == null || reason.isBlank() ? "" : " reason=" + reason));
+    }
+
+    private void ensureCompanionDesktopAudioMonitorState() {
+        if (!isCompanionEnabled()) {
+            companionLoopbackMonitor.stop("companion-disabled");
+            noteCompanionDesktopAudioRouteChanged("off", "companion-disabled");
+            return;
+        }
+        boolean hearingSharedActive = hearingFrame != null && hearingFrame.isMonitoringActive();
+        if (hearingSharedActive) {
+            companionLoopbackMonitor.stop("hearing-shared-active");
+            noteCompanionDesktopAudioRouteChanged("hearing_shared", "hearing-shared-active");
+            return;
+        }
+        companionLoopbackMonitor.startIfNeeded();
+        noteCompanionDesktopAudioRouteChanged("companion_owned", "hearing-off-direct-audio");
     }
     private void logDetailedThrowable(String prefix, Throwable t) {
         Config.log("[ERROR] " + prefix + ": " + t);
@@ -8840,6 +13714,34 @@ public class MobMateWhisp implements NativeKeyListener {
             hearingSem.release();
         }
     }
+
+    public String transcribeCompanionSpeechSemanticRaw(byte[] pcm16k16mono) {
+        if (!hearingSem.tryAcquire()) return "";
+        try {
+            LocalMoonshineSTT hm = getOrCreateHearingMoonshine();
+            if (hm != null) {
+                float[] pcmFloat = pcm16leToFloat(pcm16k16mono, pcm16k16mono.length);
+                String moonText = removeCjkSpaces(hm.transcribeOneShot(pcmFloat)).trim();
+                if (!moonText.isBlank()) {
+                    return moonText;
+                }
+                long fallbackCount = hearingMoonshineBlankFallbackCount.incrementAndGet();
+                Config.log("[Moonshine][CompanionSemantic] blank result -> fallback to Whisper (count=" + fallbackCount + ")");
+            } else {
+                Config.logDebug("[Moonshine][CompanionSemantic] unavailable -> fallback to Whisper");
+            }
+            if (hw == null) {
+                hw = getOrCreateHearingWhisper();
+            }
+            if (hw == null) return "";
+            return removeCjkSpaces(hw.transcribeRawHearing(pcm16k16mono, Action.NOTHING_NO_SPEAK, this)).trim();
+        } catch (Exception ex) {
+            Config.logError("[Companion][Semantic] transcribe failed", ex);
+            return "";
+        } finally {
+            hearingSem.release();
+        }
+    }
     private LocalMoonshineSTT getOrCreateHearingMoonshine() {
         LocalMoonshineSTT cur = hearingMoonshine;
         if (cur != null && cur.isLoaded()) return cur;
@@ -8926,7 +13828,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
         // prefsから都度読む（UI表示用）
         boolean autoGainEnabledNow = prefs.getBoolean("audio.autoGain", false);
-        float userGain = prefs.getFloat("audio.inputGainMultiplier", 1.0f);
+        float userGain = getEffectiveInputGainMultiplier();
 
         if (ignorePreloadPending || LocalWhisperCPP.isIgnoreExpansionBusy()) {
             gainMeter.setValue(0, -60.0, autoGainEnabledNow, autoGainMultiplier, userGain, false);
@@ -8942,7 +13844,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private void updateInputLevelWithGain(byte[] pcm, int len, boolean speech) {
         if (pcm == null || len <= 0) return;
 
-        float userGain = prefs.getFloat("audio.inputGainMultiplier", 1.0f);
+        float userGain = getEffectiveInputGainMultiplier();
         boolean autoGainEnabledNow = prefs.getBoolean("audio.autoGain", true);
 
         float gain = userGain * autoGainMultiplier;
@@ -9430,8 +14332,9 @@ public class MobMateWhisp implements NativeKeyListener {
             return;
         }
 
-        // --- auto (existing behavior) ---
-        if (isVoiceVoxAvailable()) {
+        // --- auto (language-aware behavior) ---
+        String autoEngine = resolveAutoTtsEngineForTalkOutput();
+        if ("voicevox".equals(autoEngine) && isVoiceVoxAvailable()) {
             String api = Config.getString("voicevox.api", "");
             int base = Integer.parseInt(prefs.get("tts.voice", "3"));
             String uiLang = prefs.get("ui.language", "en");
@@ -9442,7 +14345,11 @@ public class MobMateWhisp implements NativeKeyListener {
                     : base;
 
             speakVoiceVox(text, String.valueOf(styleId), api, effectiveProsodyProfile);
-        } else if (isXttsAvailable()) {
+        } else if ("piper_plus".equals(autoEngine)) {
+            speakPiperPlus(text, effectiveProsodyProfile);
+        } else if ("voiceger_tts".equals(autoEngine)) {
+            speakVoiceger(text);
+        } else if ("xtts".equals(autoEngine) && isXttsAvailable()) {
             try { speakXtts(text); } catch (Exception ignore) {}
         } else {
             speakWindows(text, effectiveProsodyProfile);
@@ -9465,10 +14372,19 @@ public class MobMateWhisp implements NativeKeyListener {
                 + " installed=" + installed
                 + " cliLang=" + entry.cliTextLanguage());
         if (isKnownUnstableBuiltInPiperPlusEntry(entry)) {
+            PiperPlusCatalog.Entry rerouted = "zh".equalsIgnoreCase(PiperPlusCatalog.normalizeOutputLanguage(getTalkOutputLanguage()))
+                    ? PiperPlusCatalog.preferredInstalledChineseEntry()
+                    : null;
+            if (rerouted != null && !rerouted.id().equalsIgnoreCase(entry.id())) {
+                Config.log("[Piper+][Compat] reroute unstable zh entry=" + entry.id() + " -> " + rerouted.id());
+                entry = rerouted;
+                installed = PiperPlusModelManager.isInstalled(entry);
+            } else {
             notifyKnownPiperPlusCompatibilityIssue(window, entry);
             Config.log("[Piper+][Compat] fallback to Windows TTS for unstable entry=" + entry.id());
             speakWindows(text, ttsProsodyProfile);
             return;
+            }
         }
         if (!installed) {
             if (ensurePiperPlusModelReady(entry, window)) {
@@ -9491,7 +14407,8 @@ public class MobMateWhisp implements NativeKeyListener {
             return;
         }
         try {
-            PiperSynthesisOptions options = buildPiperSynthesisOptions(entry, text, ttsProsodyProfile);
+            String cliText = preparePiperPlusCliText(entry, text);
+            PiperSynthesisOptions options = buildPiperSynthesisOptions(entry, cliText, ttsProsodyProfile);
             schedulePiperPlusEmotionFamilyWarmup(
                     exePath,
                     entry,
@@ -9499,7 +14416,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     options,
                     ttsProsodyProfile,
                     "runtime-family");
-            PiperPlusPersistentSessionManager.SynthesisResult session = synthPiperPlusViaPersistentSession(exePath, entry, text, options);
+            PiperPlusPersistentSessionManager.SynthesisResult session = synthPiperPlusViaPersistentSession(exePath, entry, cliText, options);
             if (session != null && session.wavPath() != null && session.wavBytes() >= 256) {
                 Config.logDebug("[Piper+][SESSION] key=" + session.sessionKey()
                         + " reused=" + session.reused()
@@ -9509,7 +14426,11 @@ public class MobMateWhisp implements NativeKeyListener {
                 playViaPowerShellPathAsync(maybePostProcessPiperWavPath(session.wavPath(), ttsProsodyProfile), true);
                 return;
             }
-            Path tempWav = synthPiperPlusToTempWavFile(exePath, entry, text, options);
+            Path tempWav = synthPiperPlusToTempWavFile(exePath, entry, cliText, options);
+            Path retriedZhWav = retryShortChinesePiperTempWavIfNeeded(exePath, entry, cliText, tempWav, options);
+            if (retriedZhWav != null) {
+                tempWav = retriedZhWav;
+            }
             if (tempWav != null && Files.isRegularFile(tempWav)) {
                 try {
                     long wavBytes = Files.size(tempWav);
@@ -9523,7 +14444,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 playViaPowerShellPathAsync(maybePostProcessPiperWavPath(tempWav, ttsProsodyProfile), true);
                 return;
             }
-            PiperRawSynthesis raw = synthPiperPlusRaw(exePath, entry, text, options);
+            PiperRawSynthesis raw = synthPiperPlusRaw(exePath, entry, cliText, options);
             if (raw != null && raw.pcmBytes() != null && raw.pcmBytes().length >= 128) {
                 Config.logDebug("[Piper+] route=stdout_raw sr=" + raw.sampleRate()
                         + " bytes=" + raw.pcmBytes().length
@@ -9538,7 +14459,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 playViaPowerShellPcm16MonoAsync(postPcm, raw.sampleRate(), raw.spawnMs(), raw.rawReadMs());
                 return;
             }
-            byte[] wavBytes = synthPiperPlusToWavBytes(exePath, entry, text, ttsProsodyProfile);
+            byte[] wavBytes = synthPiperPlusToWavBytes(exePath, entry, cliText, ttsProsodyProfile);
             if (wavBytes != null && wavBytes.length >= 256) {
                 playViaPowerShellBytesAsync(maybePostProcessPiperWavBytes(wavBytes, ttsProsodyProfile));
                 return;
@@ -9563,7 +14484,7 @@ public class MobMateWhisp implements NativeKeyListener {
         AtomicReference<Integer> answerRef = new AtomicReference<>(JOptionPane.NO_OPTION);
         Runnable ask = () -> {
             String target = LanguageOptions.displayTranslationTarget(entry.language());
-            String message = "Piper+ model is not downloaded yet.\n\n"
+            String message = "piper-plus model is not downloaded yet.\n\n"
                     + entry.displayName() + "\n"
                     + "Target language: " + target + "\n\n"
                     + "Download it now?";
@@ -9600,7 +14521,7 @@ public class MobMateWhisp implements NativeKeyListener {
             Config.log("[Piper+] on-demand download failed: " + ex.getMessage());
             SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(
                     parent != null ? parent : window,
-                    "Failed to download Piper+ model:\n" + ex.getMessage(),
+                    "Failed to download piper-plus model:\n" + ex.getMessage(),
                     "MobMate",
                     JOptionPane.WARNING_MESSAGE
             ));
@@ -9613,6 +14534,11 @@ public class MobMateWhisp implements NativeKeyListener {
                                                                                                  String text,
                                                                                                  PiperSynthesisOptions options) {
         if (!prefs.getBoolean("piper.plus.persistent", true)) return null;
+        String cliLang = PiperPlusCatalog.canonicalizeCliTextLanguageTag(entry != null ? entry.cliTextLanguage() : "");
+        if ("zh".equals(cliLang)) {
+            Config.logDebug("[Piper+][SESSION] bypass persistent for zh: " + (entry != null ? entry.id() : "(null)"));
+            return null;
+        }
         PiperSynthesisOptions persistent = toPersistentSessionOptions(options);
         try {
             return piperPlusSessionManager.synth(
@@ -9635,11 +14561,12 @@ public class MobMateWhisp implements NativeKeyListener {
                                             PiperPlusCatalog.Entry entry,
                                             String text,
                                             TtsProsodyProfile profile) throws Exception {
+        String cliText = preparePiperPlusCliText(entry, text);
         try {
-            return synthPiperPlusToWavBytesRaw(exePath, entry, text, profile);
+            return synthPiperPlusToWavBytesRaw(exePath, entry, cliText, profile);
         } catch (Exception rawEx) {
             Config.logDebug("[Piper+] raw stdout path failed -> temp wav fallback: " + rawEx.getMessage());
-            Path tempWav = synthPiperPlusToTempWavFile(exePath, entry, text, buildPiperSynthesisOptions(entry, text, profile));
+            Path tempWav = synthPiperPlusToTempWavFile(exePath, entry, cliText, buildPiperSynthesisOptions(entry, cliText, profile));
             if (tempWav == null || !Files.isRegularFile(tempWav)) {
                 throw new IOException("PiperPlus did not create temp wav");
             }
@@ -9676,6 +14603,12 @@ public class MobMateWhisp implements NativeKeyListener {
         int sampleRate = PiperPlusModelManager.getSampleRate(entry);
         float lengthScale = piperLengthScale(text, profile);
         float sentenceSilence = piperSentenceSilence(text, profile);
+        if (isHuayanChinesePiperEntry(entry) && isShortChinesePiperPhrase(text)) {
+            lengthScale = Math.max(lengthScale, 2.10f);
+            sentenceSilence = Math.max(sentenceSilence, 0.28f);
+        } else if (isChinesePiperEntry(entry)) {
+            lengthScale = Math.max(lengthScale, 1.45f);
+        }
         float noiseScale = piperNoiseScale(profile);
         float noiseW = piperNoiseW(profile);
         PiperSynthesisOptions options = new PiperSynthesisOptions(
@@ -9693,6 +14626,114 @@ public class MobMateWhisp implements NativeKeyListener {
         return options;
     }
 
+    private String preparePiperPlusCliText(PiperPlusCatalog.Entry entry, String text) {
+        if (text == null) return "";
+        String normalized = text.trim();
+        if (!isHuayanChinesePiperEntry(entry) || !isShortChinesePiperPhrase(normalized)) {
+            return normalized;
+        }
+        String adjusted = normalized.replaceAll("[\\s\\u3000]+", " ");
+        adjusted = adjusted.replaceAll("[，。！？；：、,.!?;:]+$", "").trim();
+        if (adjusted.isBlank()) return normalized;
+        if (!adjusted.equals(normalized)) {
+            Config.logDebug("[Piper+][ZH] short-phrase text assist entry=" + entry.id()
+                    + " from=" + shortenForProsodyLog(normalized, 32)
+                    + " to=" + shortenForProsodyLog(adjusted, 32));
+        }
+        return adjusted;
+    }
+
+    private boolean isChinesePiperEntry(PiperPlusCatalog.Entry entry) {
+        String cliLang = PiperPlusCatalog.canonicalizeCliTextLanguageTag(entry != null ? entry.cliTextLanguage() : "");
+        return "zh".equalsIgnoreCase(cliLang);
+    }
+
+    private boolean isHuayanChinesePiperEntry(PiperPlusCatalog.Entry entry) {
+        return isChinesePiperEntry(entry)
+                && entry != null
+                && "huayan".equalsIgnoreCase(entry.id());
+    }
+
+    private boolean isShortChinesePiperPhrase(String text) {
+        if (text == null || text.isBlank()) return false;
+        int hanCount = countHanCodePoints(text);
+        return hanCount > 0 && hanCount <= 8;
+    }
+
+    private int countHanCodePoints(String text) {
+        if (text == null || text.isBlank()) return 0;
+        int hanCount = 0;
+        for (int i = 0; i < text.length(); ) {
+            int cp = text.codePointAt(i);
+            if (Character.UnicodeScript.of(cp) == Character.UnicodeScript.HAN) {
+                hanCount++;
+            }
+            i += Character.charCount(cp);
+        }
+        return hanCount;
+    }
+
+    private Path retryShortChinesePiperTempWavIfNeeded(Path exePath,
+                                                       PiperPlusCatalog.Entry entry,
+                                                       String cliText,
+                                                       Path tempWav,
+                                                       PiperSynthesisOptions options) {
+        if (!isHuayanChinesePiperEntry(entry) || !isShortChinesePiperPhrase(cliText) || tempWav == null || !Files.isRegularFile(tempWav)) return null;
+        try {
+            float observedSec = estimatePiperTempWavDurationSec(tempWav, options.sampleRate());
+            PiperSynthesisOptions retry = buildShortChineseRetryOptions(options);
+            String retryText = preparePiperPlusCliText(entry, cliText);
+            Path retryWav = synthPiperPlusToTempWavFile(exePath, entry, retryText, retry);
+            if (retryWav == null || !Files.isRegularFile(retryWav)) return null;
+            float retrySec = estimatePiperTempWavDurationSec(retryWav, retry.sampleRate());
+            float minExpectedSec = estimateShortChineseMinDurationSec(cliText);
+            Config.logDebug("[Piper+][ZH] retry short wav entry=" + entry.id()
+                    + " observedSec=" + String.format(Locale.ROOT, "%.3f", observedSec)
+                    + " retrySec=" + String.format(Locale.ROOT, "%.3f", retrySec)
+                    + " minExpectedSec=" + String.format(Locale.ROOT, "%.3f", minExpectedSec)
+                    + " lenScale=" + retry.lengthScaleArg()
+                    + " sentSil=" + retry.sentenceSilenceArg());
+            if (retrySec > observedSec + 0.02f) {
+                try { Files.deleteIfExists(tempWav); } catch (Exception ignore) {}
+                return retryWav;
+            }
+            try { Files.deleteIfExists(retryWav); } catch (Exception ignore) {}
+        } catch (Exception ex) {
+            Config.logDebug("[Piper+][ZH] retry short wav skipped: " + ex.getMessage());
+        }
+        return null;
+    }
+
+    private PiperSynthesisOptions buildShortChineseRetryOptions(PiperSynthesisOptions base) {
+        float lengthScale = Math.max(base.lengthScale(), 2.10f);
+        float sentenceSilence = Math.max(base.sentenceSilence(), 0.28f);
+        return new PiperSynthesisOptions(
+                base.sampleRate(),
+                lengthScale,
+                sentenceSilence,
+                base.noiseScale(),
+                base.noiseW(),
+                String.format(Locale.ROOT, "%.3f", lengthScale),
+                String.format(Locale.ROOT, "%.3f", sentenceSilence),
+                base.noiseScaleArg(),
+                base.noiseWArg()
+        );
+    }
+
+    private float estimatePiperTempWavDurationSec(Path wavPath, int sampleRate) throws IOException {
+        long bytes = Files.size(wavPath);
+        long pcmBytes = Math.max(0L, bytes - 44L);
+        if (sampleRate <= 0) return 0.0f;
+        return (float) (pcmBytes / 2.0d / sampleRate);
+    }
+
+    private float estimateShortChineseMinDurationSec(String text) {
+        int hanCount = countHanCodePoints(text);
+        if (hanCount <= 0) return 0.0f;
+        float expected = 0.10f + (hanCount * 0.14f);
+        return Math.min(1.45f, expected);
+    }
+
     private void logPiperProsodyOptions(String text,
                                         TtsProsodyProfile profile,
                                         PiperSynthesisOptions options) {
@@ -9701,7 +14742,7 @@ public class MobMateWhisp implements NativeKeyListener {
         String contourMode = prefs.get("tts.reflect.contour_strength", "normal");
         String toneMode = prefs.get("tts.reflect.tone_emphasis", "normal");
         if (profile == null || !profile.isUsable()) {
-            Config.logDebug("[TTS_PROSODY][PIPER+] no-conf text=" + shortenForProsodyLog(text, 48)
+            Config.logDebug("[TTS_PROSODY][PIPER+] no-conf text=" + shortenForProsodyLog(text, 160)
                     + " contourMode=" + contourMode
                     + " toneMode=" + toneMode
                     + " contourPref=" + String.format(Locale.ROOT, "%.2f", contourPref)
@@ -9737,7 +14778,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 + " contourPref=" + String.format(Locale.ROOT, "%.2f", contourPref)
                 + " tonePref=" + String.format(Locale.ROOT, "%.2f", tonePref)
                 + " pitchDirect=false"
-                + " text=" + shortenForProsodyLog(text, 48));
+                + " text=" + shortenForProsodyLog(text, 160));
     }
 
     private PiperSynthesisOptions toPersistentSessionOptions(PiperSynthesisOptions options) {
@@ -9849,7 +14890,8 @@ public class MobMateWhisp implements NativeKeyListener {
                                                PiperPlusCatalog.Entry entry,
                                                String text,
                                                TtsProsodyProfile profile) throws Exception {
-        PiperRawSynthesis raw = synthPiperPlusRaw(exePath, entry, text, buildPiperSynthesisOptions(entry, text, profile));
+        String cliText = preparePiperPlusCliText(entry, text);
+        PiperRawSynthesis raw = synthPiperPlusRaw(exePath, entry, cliText, buildPiperSynthesisOptions(entry, cliText, profile));
         return wrapPcm16MonoAsWav(raw.pcmBytes(), raw.sampleRate());
     }
 
@@ -9986,12 +15028,14 @@ public class MobMateWhisp implements NativeKeyListener {
         if (pcmBytes == null || pcmBytes.length < 8 || sampleRate < 8000 || profile == null || !profile.isUsable()) {
             return pcmBytes;
         }
+        byte[] contourWarped = maybeApplyPiperContourPitchWarp(pcmBytes, sampleRate, profile);
+        byte[] working = contourWarped;
         float contourPref = getPiperContourReflectionStrength();
         float tonePref = getPiperToneEmphasisStrength();
         float tone = derivePiperToneColor(profile);
-        if (Math.abs(tone) < 0.08f) return pcmBytes;
+        if (Math.abs(tone) < 0.08f) return working;
 
-        byte[] out = Arrays.copyOf(pcmBytes, pcmBytes.length);
+        byte[] out = Arrays.copyOf(working, working.length);
         float cutoffHz = 1500.0f + (Math.abs(tone) * 1100.0f);
         float dt = 1.0f / Math.max(8000, sampleRate);
         float rc = 1.0f / (2.0f * (float) Math.PI * cutoffHz);
@@ -10032,6 +15076,114 @@ public class MobMateWhisp implements NativeKeyListener {
                 + " melody=" + String.format(Locale.ROOT, "%.2f", profile.melodyDepth())
                 + " sr=" + sampleRate);
         return out;
+    }
+
+    private byte[] maybeApplyPiperContourPitchWarp(byte[] pcmBytes, int sampleRate, TtsProsodyProfile profile) {
+        if (pcmBytes == null || pcmBytes.length < 8 || sampleRate < 8000 || profile == null || !profile.isUsable()) {
+            return pcmBytes;
+        }
+        if (!profile.hasPitchContour()) {
+            return pcmBytes;
+        }
+        float[] contour = normalizeContourForVoiceVox(profile.pitchContour());
+        if (contour.length < 3) {
+            return pcmBytes;
+        }
+        float contourPref = getPiperContourReflectionStrength();
+        float contourWeight = clamp01(((profile.confidence() - 0.22f) / 0.78f) * 0.45f
+                + (Math.abs(profile.contourRise()) * 0.30f)
+                + (profile.melodyDepth() * 0.35f));
+        if (contourWeight < 0.14f) {
+            return pcmBytes;
+        }
+
+        int sampleCount = pcmBytes.length / 2;
+        if (sampleCount < 320) {
+            return pcmBytes;
+        }
+        int frameMs = profile.contourStepMs() > 0 ? Math.max(10, Math.min(40, profile.contourStepMs())) : 20;
+        int hop = Math.max(80, sampleRate * frameMs / 1000);
+        int window = Math.max(hop * 2, 160);
+        if (window >= sampleCount) {
+            return pcmBytes;
+        }
+
+        float[] source = new float[sampleCount];
+        for (int i = 0; i < sampleCount; i++) {
+            source[i] = readLePcm16Sample(pcmBytes, i * 2) / 32768.0f;
+        }
+
+        float[] accum = new float[sampleCount];
+        float[] weight = new float[sampleCount];
+        float maxSemitone = (1.10f + (1.35f * contourWeight)) * contourPref;
+        float globalMix = clamp01(0.24f + (0.34f * contourWeight * contourPref));
+        int half = window / 2;
+
+        for (int center = half; center < sampleCount - half; center += hop) {
+            double pos = center / (double) Math.max(1, sampleCount - 1);
+            float localContour = samplePitchContourAt(contour, pos);
+            float localVoicing = sampleGenericContourAt(profile.voicingContour(), pos, 1.0f);
+            float localActivity = sampleGenericContourAt(profile.activityContour(), pos, 1.0f);
+            float voicedGate = clamp01((localVoicing - 0.16f) / 0.52f);
+            float activityGate = 0.45f + (0.55f * clamp01(localActivity));
+            float localGate = voicedGate * activityGate;
+            if (localGate < 0.08f) {
+                continue;
+            }
+            float semitone = localContour * maxSemitone * localGate;
+            if (Math.abs(semitone) < 0.05f) {
+                continue;
+            }
+            float ratio = (float) Math.pow(2.0d, semitone / 12.0d);
+            for (int n = 0; n < window; n++) {
+                int outIndex = center - half + n;
+                if (outIndex < 0 || outIndex >= sampleCount) continue;
+                float phase = (float) n / Math.max(1, window - 1);
+                float hann = 0.5f - (0.5f * (float) Math.cos(2.0d * Math.PI * phase));
+                float srcPos = center + ((n - half) * ratio);
+                float warped = sampleFloatLinear(source, srcPos);
+                accum[outIndex] += warped * hann;
+                weight[outIndex] += hann;
+            }
+        }
+
+        byte[] out = Arrays.copyOf(pcmBytes, pcmBytes.length);
+        int touched = 0;
+        for (int i = 0; i < sampleCount; i++) {
+            float original = source[i];
+            float w = weight[i];
+            if (w <= 0.0001f) {
+                continue;
+            }
+            float warped = accum[i] / w;
+            float mixed = (original * (1.0f - globalMix)) + (warped * globalMix);
+            short shaped = (short) Math.round(clampVoiceVoxProsody(mixed, -1.0f, 1.0f) * 32767.0f);
+            writeLePcm16Sample(out, i * 2, shaped);
+            touched++;
+        }
+        if (touched == 0) {
+            return pcmBytes;
+        }
+        Config.logDebug("[Piper+][POST][Contour] pts=" + contour.length
+                + " stepMs=" + frameMs
+                + " maxSemi=" + String.format(Locale.ROOT, "%.2f", maxSemitone)
+                + " mix=" + String.format(Locale.ROOT, "%.2f", globalMix)
+                + " touched=" + touched
+                + " conf=" + String.format(Locale.ROOT, "%.2f", profile.confidence())
+                + " rise=" + String.format(Locale.ROOT, "%.2f", profile.contourRise())
+                + " melody=" + String.format(Locale.ROOT, "%.2f", profile.melodyDepth()));
+        return out;
+    }
+
+    private float sampleFloatLinear(float[] source, float index) {
+        if (source == null || source.length == 0) return 0.0f;
+        if (index <= 0.0f) return source[0];
+        int last = source.length - 1;
+        if (index >= last) return source[last];
+        int lo = (int) Math.floor(index);
+        int hi = Math.min(last, lo + 1);
+        float t = index - lo;
+        return source[lo] + ((source[hi] - source[lo]) * t);
     }
 
     private float derivePiperToneColor(TtsProsodyProfile profile) {
@@ -10123,6 +15275,8 @@ public class MobMateWhisp implements NativeKeyListener {
 
     private record WavPcmView(int sampleRate, int dataOffset, int dataLength, byte[] pcmBytes) {}
 
+    private record CompanionRecentMicAudioSnapshot(byte[] pcm16le, int sampleRateHz, long ageMs) {}
+
     private byte[] wrapPcm16MonoAsWav(byte[] pcm16le, int sampleRate) throws IOException {
         if (pcm16le == null || pcm16le.length == 0) return new byte[0];
         int safeSampleRate = Math.max(8000, sampleRate);
@@ -10150,6 +15304,67 @@ public class MobMateWhisp implements NativeKeyListener {
             dos.write(pcm16le);
         }
         return out.toByteArray();
+    }
+
+    private void rememberCompanionRecentMicAudio(byte[] pcm16le, int bytes, int sampleRateHz) {
+        if (pcm16le == null || bytes <= 0) {
+            return;
+        }
+        int safeSampleRate = Math.max(8000, sampleRateHz);
+        int maxBytes = (int) ((((long) safeSampleRate) * 2L * COMPANION_MM_AUDIO_WINDOW_MS) / 1000L);
+        synchronized (companionRecentMicAudioLock) {
+            int keepBytes = Math.min(maxBytes, companionRecentMicAudioPcm.length + bytes);
+            byte[] merged = new byte[keepBytes];
+            int oldBytes = Math.min(companionRecentMicAudioPcm.length, Math.max(0, keepBytes - bytes));
+            if (oldBytes > 0) {
+                System.arraycopy(
+                        companionRecentMicAudioPcm,
+                        companionRecentMicAudioPcm.length - oldBytes,
+                        merged,
+                        0,
+                        oldBytes
+                );
+            }
+            int newBytes = keepBytes - oldBytes;
+            if (newBytes > 0) {
+                System.arraycopy(
+                        pcm16le,
+                        Math.max(0, bytes - newBytes),
+                        merged,
+                        oldBytes,
+                        newBytes
+                );
+            }
+            companionRecentMicAudioPcm = merged;
+            companionRecentMicAudioSampleRate = safeSampleRate;
+            companionRecentMicAudioAtMs = System.currentTimeMillis();
+        }
+    }
+
+    private CompanionRecentMicAudioSnapshot snapshotCompanionRecentMicAudio(int maxWindowMs, long maxAgeMs) {
+        synchronized (companionRecentMicAudioLock) {
+            if (companionRecentMicAudioPcm.length == 0 || companionRecentMicAudioAtMs <= 0L) {
+                return new CompanionRecentMicAudioSnapshot(new byte[0], Math.max(8000, companionRecentMicAudioSampleRate), Long.MAX_VALUE);
+            }
+            long ageMs = Math.max(0L, System.currentTimeMillis() - companionRecentMicAudioAtMs);
+            if (ageMs > Math.max(1000L, maxAgeMs)) {
+                return new CompanionRecentMicAudioSnapshot(new byte[0], Math.max(8000, companionRecentMicAudioSampleRate), ageMs);
+            }
+            int safeSampleRate = Math.max(8000, companionRecentMicAudioSampleRate);
+            int wantedBytes = (int) ((((long) safeSampleRate) * 2L * Math.max(1000, maxWindowMs)) / 1000L);
+            int start = Math.max(0, companionRecentMicAudioPcm.length - wantedBytes);
+            byte[] snapshot = new byte[companionRecentMicAudioPcm.length - start];
+            System.arraycopy(companionRecentMicAudioPcm, start, snapshot, 0, snapshot.length);
+            return new CompanionRecentMicAudioSnapshot(snapshot, safeSampleRate, ageMs);
+        }
+    }
+
+    private void clearCompanionRecentMicAudio() {
+        synchronized (companionRecentMicAudioLock) {
+            companionRecentMicAudioPcm = new byte[0];
+            companionRecentMicAudioAtMs = 0L;
+            companionRecentMicAudioSampleRate = 16000;
+        }
     }
 
     private void writeLeInt(DataOutputStream dos, int value) throws IOException {
@@ -10358,15 +15573,18 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
     private byte[] synthWindowsToWavBytesViaAgent(String text) throws Exception {
-        return synthWindowsToWavBytesViaAgent(text, null, null, null);
+        return synthWindowsToWavBytesViaAgent(text, (Integer) null, (Integer) null, (String) null);
     }
     private byte[] synthWindowsToWavBytesViaAgent(String text, Integer rate, Integer volume) throws Exception {
+        return synthWindowsToWavBytesViaAgent(text, rate, volume, null);
+    }
+    private byte[] synthWindowsToWavBytesViaAgent(String text, Integer rate, Integer volume, String voiceOverride) throws Exception {
         if (text == null || text.isBlank()) return null;
 
         synchronized (psLock) {
             ensurePsServerLocked();
 
-            String voice = resolveWindowsAutoVoiceName();
+            String voice = resolveWindowsVoiceName(voiceOverride);
             String id = Long.toHexString(System.nanoTime());
             String b64Text = Base64.getEncoder().encodeToString(text.getBytes(StandardCharsets.UTF_8));
 
@@ -10408,12 +15626,15 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
     private byte[] synthWindowsToWavBytesViaAgent(String text, String ssml, Integer rate, Integer volume) throws Exception {
+        return synthWindowsToWavBytesViaAgent(text, ssml, rate, volume, null);
+    }
+    private byte[] synthWindowsToWavBytesViaAgent(String text, String ssml, Integer rate, Integer volume, String voiceOverride) throws Exception {
         if ((text == null || text.isBlank()) && (ssml == null || ssml.isBlank())) return null;
 
         synchronized (psLock) {
             ensurePsServerLocked();
 
-            String voice = resolveWindowsAutoVoiceName();
+            String voice = resolveWindowsVoiceName(voiceOverride);
 
             String id = Long.toHexString(System.nanoTime());
             String payload = (ssml != null && !ssml.isBlank()) ? ssml : text;
@@ -10551,6 +15772,9 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
     byte[] applyVoicegerTtsBytesIfEnabled(String text, Preferences prefs) {
+        return requestVoicegerTtsBytes(text, prefs, false);
+    }
+    private byte[] requestVoicegerTtsBytes(String text, Preferences prefs, boolean forceEnabled) {
         try {
             // 優先：tts.engine で管理（Voiceger(TTS)選択時だけ有効）
             String engine = prefs.get("tts.engine", "auto")
@@ -10561,7 +15785,7 @@ public class MobMateWhisp implements NativeKeyListener {
             boolean enabledLegacy = prefs.getBoolean("voiceger.enabled", false);
             boolean ttsEnabledLegacy = prefs.getBoolean("voiceger.tts.enabled", false);
 
-            boolean ttsEnabled = ttsByEngine || (enabledLegacy && ttsEnabledLegacy);
+            boolean ttsEnabled = forceEnabled || ttsByEngine || (enabledLegacy && ttsEnabledLegacy);
             if (!ttsEnabled) return null;
 
             // キー統一：voiceger.api.base
@@ -10765,7 +15989,7 @@ public class MobMateWhisp implements NativeKeyListener {
                 profile = profile.asContourDriven();
             }
             if (profile == null || !profile.isUsable()) {
-                Config.logDebug("[TTS_PROSODY][VV] no-conf text=" + shortenForProsodyLog(text, 48));
+                Config.logDebug("[TTS_PROSODY][VV] no-conf text=" + shortenForProsodyLog(text, 160));
                 return queryJson;
             }
 
@@ -10835,7 +16059,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     + " tonePref=" + tonePref
                     + melodyInfo
                     + timingInfo
-                    + " text=" + shortenForProsodyLog(text, 48));
+                    + " text=" + shortenForProsodyLog(text, 160));
             return query.toString();
         } catch (Exception ex) {
             Config.logDebug("[TTS_PROSODY][VV] skipped: " + ex.getMessage());
@@ -12029,6 +17253,597 @@ public class MobMateWhisp implements NativeKeyListener {
             Config.logDebug("[WIN ERROR] " + ex.getMessage());
         }
     }
+    public void speakCompanionText(String text) {
+        if (text == null || text.isBlank()) return;
+        String outputDevice = prefs.get("companion.output.device", "").trim();
+        if (outputDevice.isBlank()) {
+            outputDevice = getPreferredCompanionOutputDevice();
+        }
+        try {
+            Config.logDebug("[Companion][TTS] start engine="
+                    + prefs.get("companion.tts.engine", "windows").trim().toLowerCase(Locale.ROOT)
+                    + " locale=" + resolveCompanionSpeakLocale(text)
+                    + " model=" + effectiveCompanionPiperPlusModelIdForLog()
+                    + " output=" + (outputDevice == null || outputDevice.isBlank() ? "(auto)" : outputDevice));
+            byte[] wavBytes = synthCompanionSpeechBytes(text);
+            if (!looksLikeWav(wavBytes)) {
+                Config.logDebug("[Companion][TTS] unusable_wav engine="
+                        + prefs.get("companion.tts.engine", "windows").trim().toLowerCase(Locale.ROOT));
+                return;
+            }
+            wavBytes = applyCompanionVolumeIfNeeded(wavBytes);
+            companionSuppressUntilMs = System.currentTimeMillis() + 3500L;
+            playViaPowerShellBytesAsync(wavBytes, outputDevice, true);
+        } catch (Exception ex) {
+            Config.logDebug("[Companion][TTS ERROR] " + ex.getMessage());
+        }
+    }
+    private byte[] synthCompanionSpeechBytes(String text) throws Exception {
+        String engine = prefs.get("companion.tts.engine", "windows").trim().toLowerCase(Locale.ROOT);
+        String locale = resolveCompanionSpeakLocale(text);
+        String windowsVoice = prefs.get("companion.windows.voice", "auto");
+
+        try {
+            return switch (engine) {
+                case "voicevox" -> {
+                    byte[] primary = synthCompanionVoiceVoxBytes(text);
+                    if (looksLikeWav(primary)) {
+                        Config.logDebug("[Companion][TTS route] engine=voicevox route=voicevox locale=" + locale);
+                        yield primary;
+                    }
+                    Config.logDebug("[Companion][TTS route] engine=voicevox route=windows_fallback locale=" + locale
+                            + " reason=voicevox_unavailable");
+                    yield synthCompanionWindowsBytes(text, windowsVoice);
+                }
+                case "piper_plus" -> {
+                    String modelId = effectiveCompanionPiperPlusModelIdForLog();
+                    byte[] primary = synthCompanionPiperPlusBytes(text, locale);
+                    if (looksLikeWav(primary)) {
+                        Config.logDebug("[Companion][TTS route] engine=piper_plus route=piper_plus locale=" + locale
+                                + " model=" + modelId);
+                        yield primary;
+                    }
+                    Config.logDebug("[Companion][TTS route] engine=piper_plus route=windows_fallback locale=" + locale
+                            + " model=" + modelId + " reason=piper_plus_unavailable");
+                    yield synthCompanionWindowsBytes(text, windowsVoice);
+                }
+                case "voiceger" -> {
+                    byte[] primary = synthCompanionVoicegerBytes(text, windowsVoice);
+                    if (looksLikeWav(primary)) {
+                        Config.logDebug("[Companion][TTS route] engine=voiceger route=voiceger locale=" + locale);
+                        yield primary;
+                    }
+                    Config.logDebug("[Companion][TTS route] engine=voiceger route=windows_fallback locale=" + locale
+                            + " reason=voiceger_unavailable");
+                    yield synthCompanionWindowsBytes(text, windowsVoice);
+                }
+                default -> {
+                    Config.logDebug("[Companion][TTS route] engine=windows route=windows locale=" + locale);
+                    yield synthCompanionWindowsBytes(text, windowsVoice);
+                }
+            };
+        } catch (Exception ex) {
+            Config.logDebug("[Companion][TTS route fallback] engine=" + engine + " err=" + ex.getMessage());
+            return synthCompanionWindowsBytes(text, windowsVoice);
+        }
+    }
+    private byte[] synthCompanionWindowsBytes(String text, String voiceOverride) throws Exception {
+        return synthWindowsToWavBytesViaAgent(text, (Integer) null, (Integer) null, voiceOverride);
+    }
+    private byte[] synthCompanionVoiceVoxBytes(String text) throws Exception {
+        if (!isVoiceVoxAvailable()) return null;
+        String api = Config.getString("voicevox.api", "").trim();
+        if (api.isBlank()) return null;
+        String basePref = prefs.get("companion.voicevox.speaker", "auto").trim();
+        if (basePref.isBlank() || "auto".equalsIgnoreCase(basePref)) {
+            basePref = prefs.get("tts.voice", "3").trim();
+        }
+        int base = Integer.parseInt(basePref);
+        String uiLang = prefs.get("ui.language", "en");
+        boolean autoEmotion = prefs.getBoolean("voicevox.auto_emotion", true);
+        int styleId = autoEmotion
+                ? VoiceVoxStyles.pickStyleId(text, base, api, uiLang)
+                : base;
+        return synthVoiceVoxToWavBytes(text, String.valueOf(styleId), api, null);
+    }
+    private byte[] synthCompanionPiperPlusBytes(String text, String locale) throws Exception {
+        String normalized = PiperPlusCatalog.normalizeOutputLanguage(locale == null ? "auto" : locale);
+        String modelId = effectiveCompanionPiperPlusModelId();
+        if (modelId.isBlank() || "auto".equalsIgnoreCase(modelId)) {
+            Config.logDebug("[Companion][TTS piper_plus] model_not_selected locale=" + normalized);
+            return null;
+        }
+        PiperPlusCatalog.Entry entry = PiperPlusCatalog.resolveForLanguage(
+                modelId,
+                normalized
+        );
+        if (entry == null) {
+            Config.logDebug("[Companion][TTS piper_plus] resolve_failed model=" + modelId + " locale=" + normalized);
+            return null;
+        }
+        if (!PiperPlusModelManager.isRuntimeAvailable()) {
+            Config.logDebug("[Companion][TTS piper_plus] runtime_unavailable model=" + modelId
+                    + " entry=" + entry.id() + " locale=" + normalized);
+            return null;
+        }
+        if (isKnownUnstableBuiltInPiperPlusEntry(entry)) {
+            Config.logDebug("[Companion][TTS piper_plus] blocked_known_unstable model=" + modelId
+                    + " entry=" + entry.id() + " locale=" + normalized);
+            return null;
+        }
+        if (!PiperPlusModelManager.isInstalled(entry)) {
+            Config.logDebug("[Companion][TTS piper_plus] model_not_installed model=" + modelId
+                    + " entry=" + entry.id() + " dir=" + PiperPlusModelManager.getModelDir(entry).toAbsolutePath());
+            return null;
+        }
+        Path exePath = PiperPlusModelManager.findBundledExe();
+        if (exePath == null) {
+            Config.logDebug("[Companion][TTS piper_plus] exe_missing model=" + modelId
+                    + " entry=" + entry.id() + " locale=" + normalized);
+            return null;
+        }
+        try {
+            byte[] wavBytes = synthPiperPlusToWavBytes(exePath, entry, text, null);
+            if (!looksLikeWav(wavBytes)) {
+                Config.logDebug("[Companion][TTS piper_plus] invalid_wav model=" + modelId
+                        + " entry=" + entry.id() + " exe=" + exePath.toAbsolutePath());
+                return null;
+            }
+            Config.logDebug("[Companion][TTS piper_plus] synth_ok model=" + modelId
+                    + " entry=" + entry.id() + " exe=" + exePath.toAbsolutePath());
+            return wavBytes;
+        } catch (Exception ex) {
+            Config.logDebug("[Companion][TTS piper_plus] synth_fail model=" + modelId
+                    + " entry=" + entry.id() + " err=" + ex.getMessage());
+            throw ex;
+        }
+    }
+    private String effectiveCompanionPiperPlusModelId() {
+        String modelId = prefs.get("companion.piper.plus.model_id", "auto").trim();
+        if (modelId.isBlank() || "auto".equalsIgnoreCase(modelId)) {
+            modelId = prefs.get("piper.plus.model_id", "").trim();
+        }
+        return modelId;
+    }
+
+    private String effectiveCompanionPiperPlusModelIdForLog() {
+        String modelId = effectiveCompanionPiperPlusModelId();
+        return (modelId == null || modelId.isBlank()) ? "auto" : modelId;
+    }
+    private byte[] synthCompanionVoicegerBytes(String text, String voiceOverride) throws Exception {
+        Preferences companionVoicegerPrefs = buildCompanionVoicegerPrefs();
+        byte[] ttsBytes = requestVoicegerTtsBytes(text, companionVoicegerPrefs, true);
+        if (looksLikeWav(ttsBytes)) {
+            return ttsBytes;
+        }
+        byte[] windowsBytes = synthCompanionWindowsBytes(text, voiceOverride);
+        byte[] converted = applyVoicegerVcBytesIfEnabled(windowsBytes, companionVoicegerPrefs);
+        return looksLikeWav(converted) ? converted : windowsBytes;
+    }
+    private Preferences buildCompanionVoicegerPrefs() {
+        try {
+            Preferences node = Preferences.userRoot().node("/MobMateWhispTalk/companion_voiceger_runtime");
+            node.put("tts.engine", "voiceger_vc");
+            node.putBoolean("voiceger.enabled", prefs.getBoolean("voiceger.enabled", false));
+            node.put("voiceger.api.base", prefs.get("voiceger.api.base", prefs.get("voiceger.api_base", "http://127.0.0.1:8501")));
+            String lang = prefs.get("companion.voiceger.lang", "auto").trim();
+            if (lang.isBlank() || "auto".equalsIgnoreCase(lang)) {
+                lang = prefs.get("voiceger.tts.lang", "all_ja").trim();
+            }
+            node.put("voiceger.tts.lang", lang);
+            return node;
+        } catch (Exception ex) {
+            return prefs;
+        }
+    }
+    private byte[] firstUsableWav(byte[] primary, byte[] fallback) {
+        return looksLikeWav(primary) ? primary : fallback;
+    }
+
+    private byte[] applyCompanionVolumeIfNeeded(byte[] wavBytes) {
+        int percent = getCompanionVolumePercent();
+        if (percent >= 100 || wavBytes == null || wavBytes.length < 44) {
+            return wavBytes;
+        }
+        float gain = Math.max(0.1f, Math.min(1.0f, percent / 100.0f));
+        byte[] adjusted = Arrays.copyOf(wavBytes, wavBytes.length);
+        if (!applyWavGain16BitInPlace(adjusted, gain)) {
+            return wavBytes;
+        }
+        return adjusted;
+    }
+
+    private int getCompanionVolumePercent() {
+        String raw = prefs.get("companion.volume.percent", "100").trim();
+        if (raw.endsWith("%")) {
+            raw = raw.substring(0, raw.length() - 1).trim();
+        }
+        int percent = 100;
+        try {
+            percent = Integer.parseInt(raw);
+        } catch (NumberFormatException ignore) {}
+        percent = Math.max(10, Math.min(100, percent));
+        return (percent / 10) * 10;
+    }
+
+    private boolean applyWavGain16BitInPlace(byte[] wavBytes, float gain) {
+        if (wavBytes == null || wavBytes.length < 44 || gain <= 0f) return false;
+        if (!matchesWavTag(wavBytes, 0, "RIFF") || !matchesWavTag(wavBytes, 8, "WAVE")) return false;
+
+        int bitsPerSample = 0;
+        int audioFormat = 0;
+        int offset = 12;
+        boolean touched = false;
+        while (offset + 8 <= wavBytes.length) {
+            int chunkSize = readLeIntFromBytes(wavBytes, offset + 4);
+            int chunkDataOffset = offset + 8;
+            if (chunkSize < 0 || chunkDataOffset > wavBytes.length) break;
+            int safeChunkLength = Math.min(chunkSize, wavBytes.length - chunkDataOffset);
+            if (matchesWavTag(wavBytes, offset, "fmt ") && safeChunkLength >= 16) {
+                audioFormat = readLeShortFromBytes(wavBytes, chunkDataOffset) & 0xFFFF;
+                bitsPerSample = readLeShortFromBytes(wavBytes, chunkDataOffset + 14) & 0xFFFF;
+            } else if (matchesWavTag(wavBytes, offset, "data") && bitsPerSample == 16 && audioFormat == 1) {
+                applyPcmGain16leInPlace(wavBytes, chunkDataOffset, safeChunkLength, gain);
+                touched = true;
+            }
+            int padded = (chunkSize + 1) & ~1;
+            offset = chunkDataOffset + padded;
+        }
+        return touched;
+    }
+
+    private static void applyPcmGain16leInPlace(byte[] pcm, int offset, int len, float gain) {
+        if (pcm == null || offset < 0 || len <= 0 || gain == 1.0f) return;
+        int end = Math.min(pcm.length, offset + len);
+        for (int i = offset; i + 1 < end; i += 2) {
+            int sample = (short) (((pcm[i + 1] & 0xFF) << 8) | (pcm[i] & 0xFF));
+            int amplified = Math.round(sample * gain);
+            if (amplified > 32767) amplified = 32767;
+            else if (amplified < -32768) amplified = -32768;
+            pcm[i] = (byte) (amplified & 0xFF);
+            pcm[i + 1] = (byte) ((amplified >> 8) & 0xFF);
+        }
+    }
+
+    private void beginRecognitionAssistSession() {
+        synchronized (recognitionAssistLock) {
+            recognitionAssistHistory.clear();
+            recognitionAssistSessionStartedAtMs = System.currentTimeMillis();
+            recognitionAssistAdjustments = 0;
+            recognitionAssistBaseInputGain = prefs == null ? 1.0f : prefs.getFloat("audio.inputGainMultiplier", 1.0f);
+            recognitionAssistBasePrefilter = prefs == null ? "normal" : normalizeAudioPrefilterMode(prefs.get("audio.prefilter.mode", "normal"));
+            sessionInputGainOverride = Float.NaN;
+            sessionAudioPrefilterOverride = null;
+            sessionSpeakerThresholdOverride = Float.NaN;
+            if (speakerProfile != null) {
+                speakerProfile.setSessionThresholdOverride(null);
+            }
+            recognitionAssistCollapsedFinalCount = 0;
+            recognitionAssistLastCollapsedFinalAtMs = 0L;
+            recognitionAssistSessionActive = isRecognitionAssistEnabled();
+            recognitionAssistSpeakerRejectCount = 0;
+            recognitionAssistSpeakerPassCount = 0;
+            recognitionAssistSessionEverPassed = false;
+            recognitionAssistUiMode = recognitionAssistSessionActive ? "collecting" : "off";
+            if (recognitionAssistSessionActive) {
+                Config.logDebug("[AI Assist] session start baseGain="
+                        + String.format(Locale.ROOT, "%.1f", recognitionAssistBaseInputGain)
+                        + " basePrefilter=" + recognitionAssistBasePrefilter);
+            }
+            refreshRecognitionAssistStatusLocked("session start");
+        }
+    }
+
+    private void endRecognitionAssistSession() {
+        synchronized (recognitionAssistLock) {
+            if (recognitionAssistSessionActive || !recognitionAssistHistory.isEmpty()) {
+                Config.logDebug("[AI Assist] session end gain="
+                        + String.format(Locale.ROOT, "%.1f", getEffectiveInputGainMultiplier())
+                        + " prefilter=" + getEffectiveTalkAudioPrefilterMode()
+                        + " adjustments=" + recognitionAssistAdjustments);
+            }
+            recognitionAssistHistory.clear();
+            recognitionAssistSessionActive = false;
+            recognitionAssistSessionStartedAtMs = 0L;
+            recognitionAssistAdjustments = 0;
+            sessionInputGainOverride = Float.NaN;
+            sessionAudioPrefilterOverride = null;
+            sessionSpeakerThresholdOverride = Float.NaN;
+            if (speakerProfile != null) {
+                speakerProfile.setSessionThresholdOverride(null);
+            }
+            recognitionAssistCollapsedFinalCount = 0;
+            recognitionAssistLastCollapsedFinalAtMs = 0L;
+            recognitionAssistSpeakerRejectCount = 0;
+            recognitionAssistSpeakerPassCount = 0;
+            recognitionAssistSessionEverPassed = false;
+            recognitionAssistUiMode = "idle";
+            refreshRecognitionAssistStatusLocked("idle");
+        }
+    }
+
+    private void maybeTuneRecognitionAssist(CompanionObservation observation) {
+        if (observation == null || !isRecognitionAssistEnabled()) {
+            return;
+        }
+        synchronized (recognitionAssistLock) {
+            if (!recognitionAssistSessionActive) {
+                return;
+            }
+            recognitionAssistHistory.addLast(observation);
+            while (recognitionAssistHistory.size() > 10) {
+                recognitionAssistHistory.removeFirst();
+            }
+            if (recognitionAssistHistory.size() < 2) {
+                recognitionAssistUiMode = "collecting";
+                refreshRecognitionAssistStatusLocked("collecting");
+                return;
+            }
+
+            double avgProcRms = 0.0d;
+            double avgRawRms = 0.0d;
+            double avgPeak = 0.0d;
+            int weakCount = 0;
+            int overFilteredCount = 0;
+            int noisyCount = 0;
+            int suppressedCount = 0;
+            int rescueCount = 0;
+            int clippedCount = 0;
+            int shortUtteranceCount = 0;
+            int tinyAudioCount = 0;
+            int count = 0;
+            for (CompanionObservation item : recognitionAssistHistory) {
+                if (item == null) continue;
+                avgProcRms += item.procRms;
+                avgRawRms += item.rawRms;
+                avgPeak += item.maxPeak;
+                count++;
+                if (item.procRms <= 900.0d || item.maxPeak <= 3500) {
+                    weakCount++;
+                }
+                if (item.rawRms >= Math.max(300.0d, item.procRms * 1.9d) && item.procRms <= 1200.0d) {
+                    overFilteredCount++;
+                }
+                if (item.rawRms >= 1800.0d && item.procRms > 0.0d && (item.procRms / item.rawRms) <= 0.58d) {
+                    noisyCount++;
+                }
+                if (item.rawRms >= 1200.0d && item.procRms > 0.0d && (item.procRms / item.rawRms) <= 0.46d) {
+                    suppressedCount++;
+                }
+                if (item.rescuedFromPartial) {
+                    rescueCount++;
+                }
+                if (item.rawPeak >= 30000 || item.procPeak >= 28000) {
+                    clippedCount++;
+                }
+                if (item.speechDurationMs > 0L && item.speechDurationMs <= RECOGNITION_ASSIST_SHORT_UTTERANCE_MS) {
+                    shortUtteranceCount++;
+                }
+                if (item.rawRms <= 260.0d || item.procRms <= 180.0d || item.maxAvg <= 320) {
+                    tinyAudioCount++;
+                }
+            }
+            if (count <= 0) {
+                return;
+            }
+            avgProcRms /= count;
+            avgRawRms /= count;
+            avgPeak /= count;
+
+            boolean lowGainMic = vad != null && vad.getNoiseProfile() != null && vad.getNoiseProfile().isLowGainMic;
+            String currentPrefilter = getEffectiveTalkAudioPrefilterMode();
+            float currentGain = getEffectiveInputGainMultiplier();
+            String targetPrefilter = currentPrefilter;
+            float targetGain = currentGain;
+            float currentSpeakerThreshold = getEffectiveSpeakerThreshold();
+            float targetSpeakerThreshold = currentSpeakerThreshold;
+            String reason = "";
+            boolean rejectDominant = recognitionAssistSpeakerRejectCount >= Math.max(3, recognitionAssistSpeakerPassCount + 3);
+            boolean everPassed = recognitionAssistSessionEverPassed || recognitionAssistSpeakerPassCount > 0;
+            boolean trustPositive = everPassed || rescueCount >= 2;
+            float gainCap = getRecognitionAssistGainCap(trustPositive);
+            boolean recentCollapse = recognitionAssistLastCollapsedFinalAtMs > 0L
+                    && (System.currentTimeMillis() - recognitionAssistLastCollapsedFinalAtMs) <= RECOGNITION_ASSIST_COLLAPSE_GUARD_WINDOW_MS;
+            boolean hallucinationGuard = rejectDominant && recentCollapse;
+            boolean shortWeakDominant = shortUtteranceCount >= Math.max(2, count - 2)
+                    && (tinyAudioCount >= Math.max(2, count - 2) || weakCount >= Math.max(2, count - 2));
+            boolean rejectOnlySession = !everPassed && recognitionAssistSpeakerRejectCount >= 3;
+            boolean rejectOnlyGuard = rejectOnlySession
+                    && (recentCollapse || shortWeakDominant || recognitionAssistSpeakerRejectCount >= 6);
+
+            if ("strong".equals(currentPrefilter) && recognitionAssistCollapsedFinalCount >= 1) {
+                targetPrefilter = "normal";
+                reason = "collapsed_final";
+            } else if ("strong".equals(currentPrefilter) && overFilteredCount >= 2) {
+                targetPrefilter = "normal";
+                reason = "over_filtered";
+            } else if ("normal".equals(currentPrefilter)
+                    && (suppressedCount >= 2 || rescueCount >= 2
+                    || (recognitionAssistSpeakerRejectCount >= 4
+                    && recognitionAssistSpeakerRejectCount >= (recognitionAssistSpeakerPassCount + 3)
+                    && (suppressedCount >= 1 || rescueCount >= 1)))) {
+                targetPrefilter = "off";
+                reason = "voice_suppressed";
+            } else if ("off".equals(currentPrefilter) && noisyCount >= 2) {
+                targetPrefilter = "normal";
+                reason = "noise_floor";
+            } else if ("normal".equals(currentPrefilter)
+                    && recognitionAssistCollapsedFinalCount == 0
+                    && noisyCount >= 4
+                    && recognitionAssistSpeakerRejectCount <= recognitionAssistSpeakerPassCount + 1) {
+                targetPrefilter = "strong";
+                reason = "persistent_noise";
+            }
+
+            if (rejectOnlyGuard
+                    && currentGain > (recognitionAssistBaseInputGain + 0.05f)) {
+                targetGain = Math.max(recognitionAssistBaseInputGain, previousRecognitionAssistGain(currentGain));
+                reason = reason.isBlank() ? "reject_only_session" : (reason + "+reject_only_session");
+            } else if (hallucinationGuard
+                    && recognitionAssistSpeakerPassCount == 0
+                    && currentGain > (recognitionAssistBaseInputGain + 0.05f)) {
+                targetGain = Math.max(recognitionAssistBaseInputGain, previousRecognitionAssistGain(currentGain));
+                reason = reason.isBlank() ? "hallucination_risk" : (reason + "+hallucination_risk");
+            } else if (rejectDominant && currentGain > (gainCap + 0.05f)) {
+                targetGain = Math.max(gainCap, previousRecognitionAssistGain(currentGain));
+                reason = reason.isBlank() ? "reject_dominant" : (reason + "+reject_dominant");
+            } else if (clippedCount >= 2 && currentGain > 1.0f) {
+                targetGain = previousRecognitionAssistGain(currentGain);
+                reason = reason.isBlank() ? "clipping" : (reason + "+clipping");
+            } else if (!hallucinationGuard
+                    && !rejectOnlySession
+                    && (lowGainMic || weakCount >= 2 || rescueCount >= 2 || avgRawRms < 900.0d || avgPeak < 3200.0d)
+                    && avgRawRms < 1800.0d
+                    && clippedCount == 0
+                    && currentGain < (gainCap - 0.05f)) {
+                targetGain = Math.min(nextRecognitionAssistGain(currentGain), gainCap);
+                reason = reason.isBlank() ? "low_gain" : (reason + "+low_gain");
+            }
+
+            boolean changed = false;
+            if (!Objects.equals(targetPrefilter, currentPrefilter)) {
+                sessionAudioPrefilterOverride = targetPrefilter;
+                changed = true;
+            }
+            if (Math.abs(targetGain - currentGain) >= 0.39f) {
+                sessionInputGainOverride = targetGain;
+                changed = true;
+            }
+            if (!changed) {
+                if (recognitionAssistHistory.size() >= 4) {
+                    Config.logDebug("[AI Assist] keep session settings gain="
+                            + String.format(Locale.ROOT, "%.1f", currentGain)
+                            + " prefilter=" + currentPrefilter
+                            + " spk=" + String.format(Locale.ROOT, "%.2f", currentSpeakerThreshold)
+                            + " avgProcRms=" + String.format(Locale.ROOT, "%.1f", avgProcRms)
+                            + " avgRawRms=" + String.format(Locale.ROOT, "%.1f", avgRawRms)
+                            + " avgPeak=" + String.format(Locale.ROOT, "%.0f", avgPeak)
+                            + " suppressed=" + suppressedCount + "/" + count
+                            + " rescue=" + rescueCount + "/" + count
+                            + " clipped=" + clippedCount + "/" + count
+                            + " short=" + shortUtteranceCount + "/" + count
+                            + " tiny=" + tinyAudioCount + "/" + count
+                            + " collapse=" + recognitionAssistCollapsedFinalCount
+                            + " reject=" + recognitionAssistSpeakerRejectCount
+                            + " pass=" + recognitionAssistSpeakerPassCount
+                            + " everPassed=" + everPassed);
+                }
+                recognitionAssistUiMode = "monitoring";
+                refreshRecognitionAssistStatusLocked("monitoring");
+                return;
+            }
+
+            recognitionAssistAdjustments++;
+            recognitionAssistUiMode = "adjusting";
+            Config.logDebug("[AI Assist] applied session tuning reason=" + reason
+                    + " gain=" + String.format(Locale.ROOT, "%.1f", currentGain) + "->" + String.format(Locale.ROOT, "%.1f", getEffectiveInputGainMultiplier())
+                    + " prefilter=" + currentPrefilter + "->" + getEffectiveTalkAudioPrefilterMode()
+                    + " spk=" + String.format(Locale.ROOT, "%.2f", currentSpeakerThreshold) + "->" + String.format(Locale.ROOT, "%.2f", getEffectiveSpeakerThreshold())
+                    + " avgProcRms=" + String.format(Locale.ROOT, "%.1f", avgProcRms)
+                    + " avgRawRms=" + String.format(Locale.ROOT, "%.1f", avgRawRms)
+                    + " avgPeak=" + String.format(Locale.ROOT, "%.0f", avgPeak)
+                    + " weak=" + weakCount + "/" + count
+                    + " noisy=" + noisyCount + "/" + count
+                    + " overFiltered=" + overFilteredCount + "/" + count
+                    + " suppressed=" + suppressedCount + "/" + count
+                    + " rescue=" + rescueCount + "/" + count
+                    + " clipped=" + clippedCount + "/" + count
+                    + " short=" + shortUtteranceCount + "/" + count
+                    + " tiny=" + tinyAudioCount + "/" + count
+                    + " collapse=" + recognitionAssistCollapsedFinalCount
+                    + " reject=" + recognitionAssistSpeakerRejectCount
+                    + " pass=" + recognitionAssistSpeakerPassCount
+                    + " everPassed=" + everPassed
+                    + " lowGainMic=" + lowGainMic);
+            refreshRecognitionAssistStatusLocked(reason);
+        }
+    }
+
+    private float nextRecognitionAssistGain(float current) {
+        float[] steps = {1.0f, 1.8f, 2.6f, 3.4f, 4.2f, 5.0f, 5.8f, 6.6f, 7.4f, 8.2f, 9.4f, 10.6f, 11.8f, 13.0f, 14.5f, 16.0f, 17.5f, 19.0f, 20.5f, 22.0f, 23.5f, 25.0f};
+        for (float step : steps) {
+            if (step > (current + 0.05f)) {
+                return step;
+            }
+        }
+        return current;
+    }
+
+    private float previousRecognitionAssistGain(float current) {
+        float[] steps = {1.0f, 1.8f, 2.6f, 3.4f, 4.2f, 5.0f, 5.8f, 6.6f, 7.4f, 8.2f, 9.4f, 10.6f, 11.8f, 13.0f, 14.5f, 16.0f, 17.5f, 19.0f, 20.5f, 22.0f, 23.5f, 25.0f};
+        float previous = steps[0];
+        for (float step : steps) {
+            if (current <= (step + 0.05f)) {
+                return previous;
+            }
+            previous = step;
+        }
+        return previous;
+    }
+
+    private float getRecognitionAssistGainCap(boolean trustPositive) {
+        float cap = trustPositive ? RECOGNITION_ASSIST_TRUSTED_GAIN_CAP : RECOGNITION_ASSIST_UNTRUSTED_GAIN_CAP;
+        return Math.max(recognitionAssistBaseInputGain, cap);
+    }
+
+    private float nextRecognitionAssistSpeakerThreshold(float current) {
+        float[] steps = {0.60f, 0.57f, 0.54f, 0.51f, 0.48f, 0.45f, 0.42f, 0.39f, 0.36f, 0.33f, 0.30f};
+        for (int i = 0; i < steps.length; i++) {
+            if (current > (steps[i] + 0.005f)) {
+                return steps[i];
+            }
+        }
+        return current;
+    }
+
+    private void noteRecognitionAssistCollapsedFinal(AudioPrefilter.VoiceMetrics rawMetrics, AudioPrefilter.VoiceMetrics filteredMetrics) {
+        if (!isRecognitionAssistEnabled()) {
+            return;
+        }
+        synchronized (recognitionAssistLock) {
+            if (!recognitionAssistSessionActive) {
+                return;
+            }
+            recognitionAssistCollapsedFinalCount++;
+            recognitionAssistLastCollapsedFinalAtMs = System.currentTimeMillis();
+            if ("strong".equals(getEffectiveTalkAudioPrefilterMode())) {
+                String currentPrefilter = getEffectiveTalkAudioPrefilterMode();
+                sessionAudioPrefilterOverride = "normal";
+                recognitionAssistAdjustments++;
+                recognitionAssistUiMode = "adjusting";
+                Config.logDebug("[AI Assist] applied session tuning reason=collapsed_final"
+                        + " gain=" + String.format(Locale.ROOT, "%.1f", getEffectiveInputGainMultiplier())
+                        + " prefilter=" + currentPrefilter + "->" + getEffectiveTalkAudioPrefilterMode()
+                        + " rawRms=" + String.format(Locale.ROOT, "%.1f", rawMetrics == null ? 0.0d : rawMetrics.rms)
+                        + " filteredRms=" + String.format(Locale.ROOT, "%.1f", filteredMetrics == null ? 0.0d : filteredMetrics.rms)
+                        + " rawPeak=" + (rawMetrics == null ? 0 : rawMetrics.peak)
+                        + " filteredPeak=" + (filteredMetrics == null ? 0 : filteredMetrics.peak));
+            }
+            refreshRecognitionAssistStatusLocked("collapsed final");
+        }
+    }
+
+    private void noteRecognitionAssistSpeakerGate(boolean speakerOk) {
+        if (!isRecognitionAssistEnabled()) {
+            return;
+        }
+        synchronized (recognitionAssistLock) {
+            if (!recognitionAssistSessionActive) {
+                return;
+            }
+            if (speakerOk) {
+                recognitionAssistSpeakerPassCount++;
+                recognitionAssistSessionEverPassed = true;
+            } else {
+                recognitionAssistSpeakerRejectCount++;
+            }
+            if (!"adjusting".equals(recognitionAssistUiMode)) {
+                recognitionAssistUiMode = "monitoring";
+            }
+            refreshRecognitionAssistStatusLocked(speakerOk ? "speaker pass" : "speaker reject");
+        }
+    }
+
     private WindowsNarratorProsodySettings buildWindowsNarratorProsodySettings(String text, TtsProsodyProfile profile) {
         if (text == null || text.isBlank()) {
             return new WindowsNarratorProsodySettings(0, 100, null, "mode=plain-empty");
@@ -12318,6 +18133,13 @@ public class MobMateWhisp implements NativeKeyListener {
         @SuppressWarnings("unused")
         private String logLine() { return logLine; }
     }
+    private String resolveWindowsVoiceName(String voiceOverride) {
+        String override = (voiceOverride == null) ? "" : voiceOverride.trim();
+        if (!override.isBlank() && !"auto".equalsIgnoreCase(override)) {
+            return override;
+        }
+        return resolveWindowsAutoVoiceName();
+    }
     private String resolveWindowsAutoVoiceName() {
         String configured = "auto";
         try {
@@ -12575,6 +18397,12 @@ public class MobMateWhisp implements NativeKeyListener {
         }
         return voices;
     }
+    public List<String> getCompanionVoiceChoices() {
+        List<String> voices = new ArrayList<>();
+        voices.add("auto");
+        voices.addAll(getWindowsVoices());
+        return voices;
+    }
     private final ExecutorService playExecutor =
             Executors.newSingleThreadExecutor(r -> {
                 Thread t = new Thread(r, "tts-play-thread");
@@ -12609,11 +18437,15 @@ public class MobMateWhisp implements NativeKeyListener {
                     String outputDeviceName = prefs.get("audio.output.device", "").trim();
                     int devIndex = findOutputDeviceIndex(outputDeviceName);
                     String outputDeviceB64 = encodeOutputDeviceNameForAgent(outputDeviceName);
+                    int monitorVolumePercent = getTtsMonitorVolumePercent();
                     String escapedPath = wavPath.toAbsolutePath().toString().replace("\"", "\\\"");
                     StringBuilder cmd = new StringBuilder("PLAY \"")
                             .append(escapedPath)
                             .append("\" ")
                             .append(devIndex);
+                    if (monitorVolumePercent > 0) {
+                        cmd.append(" MON").append(monitorVolumePercent);
+                    }
                     if (!outputDeviceB64.isEmpty()) {
                         cmd.append(' ').append(outputDeviceB64);
                     }
@@ -12650,6 +18482,12 @@ public class MobMateWhisp implements NativeKeyListener {
         return Base64.getEncoder().encodeToString(name.getBytes(StandardCharsets.UTF_8));
     }
     public void playViaPowerShellBytesAsync(byte[] wavBytes) {
+        playViaPowerShellBytesAsync(wavBytes, null, false);
+    }
+    public void playViaPowerShellBytesAsync(byte[] wavBytes, String outputDeviceOverride) {
+        playViaPowerShellBytesAsync(wavBytes, outputDeviceOverride, false);
+    }
+    public void playViaPowerShellBytesAsync(byte[] wavBytes, String outputDeviceOverride, boolean stopBeforePlay) {
         if (wavBytes == null || wavBytes.length < 256) return;
 
         // ★スピーカー出力レベルを計算してメーターに反映
@@ -12663,9 +18501,22 @@ public class MobMateWhisp implements NativeKeyListener {
                 try {
                     ensurePsServerLocked();
 
-                    String outputDeviceName = prefs.get("audio.output.device", "").trim();
+                    if (stopBeforePlay) {
+                        psWriter.write("STOP\n");
+                        psWriter.flush();
+                        String stopResp = psReader.readLine();
+                        if (!"DONE".equals(stopResp)) {
+                            psHealthCounter = 0;
+                            throw new IOException("tts_agent stop bad response: " + stopResp);
+                        }
+                    }
+
+                    String outputDeviceName = (outputDeviceOverride == null || outputDeviceOverride.isBlank())
+                            ? prefs.get("audio.output.device", "").trim()
+                            : outputDeviceOverride.trim();
                     int devIndex = findOutputDeviceIndex(outputDeviceName);
                     String outputDeviceB64 = encodeOutputDeviceNameForAgent(outputDeviceName);
+                    int monitorVolumePercent = getTtsMonitorVolumePercent();
 
                     String id = Long.toHexString(System.nanoTime());
                     String b64 = Base64.getEncoder().encodeToString(wavBytes);
@@ -12674,6 +18525,9 @@ public class MobMateWhisp implements NativeKeyListener {
                             .append(devIndex)
                             .append(' ')
                             .append(id);
+                    if (monitorVolumePercent > 0) {
+                        cmd.append(" MON").append(monitorVolumePercent);
+                    }
                     if (!outputDeviceB64.isEmpty()) {
                         cmd.append(' ').append(outputDeviceB64);
                     }
@@ -12734,6 +18588,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     String outputDeviceName = prefs.get("audio.output.device", "").trim();
                     int devIndex = findOutputDeviceIndex(outputDeviceName);
                     String outputDeviceB64 = encodeOutputDeviceNameForAgent(outputDeviceName);
+                    int monitorVolumePercent = getTtsMonitorVolumePercent();
 
                     String id = Long.toHexString(System.nanoTime());
                     String b64 = Base64.getEncoder().encodeToString(pcmBytes);
@@ -12744,6 +18599,9 @@ public class MobMateWhisp implements NativeKeyListener {
                             .append(devIndex)
                             .append(' ')
                             .append(id);
+                    if (monitorVolumePercent > 0) {
+                        cmd.append(" MON").append(monitorVolumePercent);
+                    }
                     if (!outputDeviceB64.isEmpty()) {
                         cmd.append(' ').append(outputDeviceB64);
                     }
@@ -13750,9 +19608,14 @@ public class MobMateWhisp implements NativeKeyListener {
                 (historyFrame != null && historyFrame.isVisible());
         final boolean hearingWasOpen =
                 (hearingFrame != null && hearingFrame.isVisible());
-        Config.log("[SOFT_RESTART] historyWasOpen=" + historyWasOpen + ", hearingWasOpen=" + hearingWasOpen);
+        final boolean companionWasOpen =
+                (companionFrame != null && companionFrame.isVisible());
+        Config.log("[SOFT_RESTART] historyWasOpen=" + historyWasOpen
+                + ", hearingWasOpen=" + hearingWasOpen
+                + ", companionWasOpen=" + companionWasOpen);
         setHistoryStartupPref(historyWasOpen);
         pendingHistoryRestore = historyWasOpen;
+        pendingCompanionRestore = companionWasOpen;
         suppressHistoryCloseCallbacks = true;
 
         // (1) 録音停止
@@ -13851,6 +19714,16 @@ public class MobMateWhisp implements NativeKeyListener {
             } catch (Throwable ignore) {}
             historyFrame = null;
         }
+        if (companionFrame != null) {
+            try {
+                companionFrame.shutdownForExit();
+                companionFrame.dispose();
+            } catch (Throwable ignore) {}
+            companionFrame = null;
+        }
+        try {
+            companionSidecarClient.close();
+        } catch (Throwable ignore) {}
 
         // (7) トレイアイコン削除
         if (trayIcon != null && SystemTray.isSupported()) {
@@ -14021,6 +19894,14 @@ public class MobMateWhisp implements NativeKeyListener {
                 Config.log("[SOFT_RESTART] HearingFrame restored");
             } catch (Throwable t) {
                 Config.logError("[SOFT_RESTART] HearingFrame restore failed: " + t, t);
+            }
+        }
+        if (companionWasOpen) {
+            try {
+                showCompanionWindow();
+                Config.log("[SOFT_RESTART] CompanionFrame restored");
+            } catch (Throwable t) {
+                Config.logError("[SOFT_RESTART] CompanionFrame restore failed: " + t, t);
             }
         }
 
