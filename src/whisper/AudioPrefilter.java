@@ -157,6 +157,10 @@ public final class AudioPrefilter {
     }
 
     public static byte[] normalizeFinalChunkForAsr(byte[] pcm16le, int bytes) {
+        return normalizeFinalChunkForAsr(pcm16le, bytes, TARGET_FINAL_RMS_DBFS);
+    }
+
+    public static byte[] normalizeFinalChunkForAsr(byte[] pcm16le, int bytes, double targetDbfs) {
         if (pcm16le == null || bytes < 4) return pcm16le;
         long sumSq = 0L;
         int peak = 0;
@@ -171,7 +175,7 @@ public final class AudioPrefilter {
         double rms = Math.sqrt((double) sumSq / (double) samples);
         if (rms < MIN_NORMALIZE_RMS || peak <= 0) return pcm16le;
 
-        double targetLinear = dbfsToLinear(TARGET_FINAL_RMS_DBFS) * Short.MAX_VALUE;
+        double targetLinear = dbfsToLinear(targetDbfs) * Short.MAX_VALUE;
         double ceilingLinear = dbfsToLinear(PEAK_CEILING_DBFS) * Short.MAX_VALUE;
         double gain = targetLinear / Math.max(1.0, rms);
         gain = Math.min(gain, ceilingLinear / Math.max(1.0, peak));

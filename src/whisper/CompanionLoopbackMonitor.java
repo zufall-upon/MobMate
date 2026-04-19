@@ -5,6 +5,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import javax.sound.sampled.AudioFormat;
 import java.util.Base64;
 import java.util.Locale;
 import java.util.Arrays;
@@ -22,6 +23,22 @@ final class CompanionLoopbackMonitor {
     private static final int LOOPBACK_SAMPLE_RATE = 16000;
     private static final int LOOPBACK_BYTES_PER_SECOND = LOOPBACK_SAMPLE_RATE * 2;
     private static final int MULTIMODAL_AUDIO_WINDOW_MS = 12_000;
+    private static final AudioFormat LOOPBACK_AUDIO_FORMAT =
+            new AudioFormat(LOOPBACK_SAMPLE_RATE, 16, 1, true, false);
+    private static final long SEMANTIC_GATE_STREAK_RESET_MS = 3_200L;
+    private static final long SEMANTIC_GATE_MIN_INTERVAL_MS = 5_500L;
+    private static final long SEMANTIC_GATE_STRONG_INTERVAL_MS = 3_000L;
+    private static final int SEMANTIC_GATE_REQUIRED_STREAK = 2;
+    private static final long SEMANTIC_GATE_MIN_ACTIVE_MS = 650L;
+    private static final long SEMANTIC_GATE_VERY_STRONG_ACTIVE_MS = 420L;
+    private static final double SEMANTIC_GATE_MIN_RMS = 760.0d;
+    private static final int SEMANTIC_GATE_MIN_PEAK = 4300;
+    private static final double SEMANTIC_GATE_MIN_VBR = 0.78d;
+    private static final double SEMANTIC_GATE_MIN_ZCR = 0.045d;
+    private static final double SEMANTIC_GATE_MAX_ZCR = 0.19d;
+    private static final double SEMANTIC_GATE_VERY_STRONG_VBR = 0.82d;
+    private static final int SEMANTIC_GATE_VERY_STRONG_PEAK = 5200;
+    private static final double SEMANTIC_GATE_VERY_STRONG_RMS = 980.0d;
 
     private final MobMateWhisp host;
     private final Object loopLock = new Object();
@@ -45,6 +62,9 @@ final class CompanionLoopbackMonitor {
     private volatile long lastSeAtMs = 0L;
     private volatile String lastSeKind = "";
     private volatile byte[] recentAudioPcm = new byte[0];
+    private volatile int semanticCandidateStreak = 0;
+    private volatile long semanticCandidateLastAtMs = 0L;
+    private volatile long lastSemanticAttemptAtMs = 0L;
 
     CompanionLoopbackMonitor(MobMateWhisp host) {
         this.host = host;
@@ -85,6 +105,9 @@ final class CompanionLoopbackMonitor {
         lastLoopbackStatusLogMs = 0L;
         lastSeAtMs = 0L;
         lastSeKind = "";
+        semanticCandidateStreak = 0;
+        semanticCandidateLastAtMs = 0L;
+        lastSemanticAttemptAtMs = 0L;
     }
 
     private void resetRuntimeState() {
@@ -416,6 +439,24 @@ final class CompanionLoopbackMonitor {
             return;
         }
 
+        long activeSpeechMs = estimateActiveSpeechMs(pcm16k16mono, metrics);
+        SemanticGateDecision semanticGate = evaluateSemanticGate(metrics, floorSnapshot, activeSpeechMs);
+        if (!semanticGate.isAllowed()) {
+            Config.logDebug(String.format(
+                    Locale.ROOT,
+                    "[Companion][Loopback][Semantic] skip reason=%s active=%dms streak=%d rms=%.1f zcr=%.3f vbr=%.3f floor=%.1f peak=%d",
+                    semanticGate.reason(),
+                    activeSpeechMs,
+                    semanticCandidateStreak,
+                    metrics.rms,
+                    metrics.zcr,
+                    metrics.voiceBandRatio,
+                    floorSnapshot,
+                    metrics.peak
+            ));
+            return;
+        }
+
         filteredChunk = AudioPrefilter.normalizeFinalChunkForAsr(filteredChunk, filteredChunk.length);
         String caption = host.transcribeCompanionSpeechSemanticRaw(filteredChunk);
         if (!running || caption == null) {
@@ -427,6 +468,72 @@ final class CompanionLoopbackMonitor {
         }
         Config.log("[Companion][Loopback][Caption] accepted text=" + trimmed);
         host.noteDesktopAudioCaptionForCompanion(ROUTE, trimmed);
+    }
+
+    private long estimateActiveSpeechMs(byte[] pcm16k16mono, AudioPrefilter.VoiceMetrics metrics) {
+        if (pcm16k16mono == null || pcm16k16mono.length < 4) {
+            return 0L;
+        }
+        int absThreshold = 260;
+        if (metrics != null && metrics.peak > 0) {
+            absThreshold = Math.max(220, Math.min(700, metrics.peak / 18));
+        }
+        byte[] trimmed = MobMateWhisp.trimPcmSilence16le(
+                pcm16k16mono,
+                LOOPBACK_AUDIO_FORMAT,
+                absThreshold,
+                80
+        );
+        if (trimmed == null || trimmed.length < 4) {
+            return 0L;
+        }
+        return Math.max(0L, (trimmed.length * 1000L) / LOOPBACK_BYTES_PER_SECOND);
+    }
+
+    private SemanticGateDecision evaluateSemanticGate(AudioPrefilter.VoiceMetrics metrics,
+                                                      double floorSnapshot,
+                                                      long activeSpeechMs) {
+        long now = System.currentTimeMillis();
+        if ((now - semanticCandidateLastAtMs) > SEMANTIC_GATE_STREAK_RESET_MS) {
+            semanticCandidateStreak = 0;
+        }
+
+        double floor = Math.max(60.0d, floorSnapshot);
+        boolean strongCandidate = activeSpeechMs >= SEMANTIC_GATE_MIN_ACTIVE_MS
+                && metrics.rms >= Math.max(SEMANTIC_GATE_MIN_RMS, floor * 2.25d)
+                && metrics.peak >= SEMANTIC_GATE_MIN_PEAK
+                && metrics.voiceBandRatio >= SEMANTIC_GATE_MIN_VBR
+                && metrics.zcr >= SEMANTIC_GATE_MIN_ZCR
+                && metrics.zcr <= SEMANTIC_GATE_MAX_ZCR;
+        boolean veryStrongCandidate = activeSpeechMs >= SEMANTIC_GATE_VERY_STRONG_ACTIVE_MS
+                && metrics.rms >= Math.max(SEMANTIC_GATE_VERY_STRONG_RMS, floor * 3.0d)
+                && metrics.peak >= SEMANTIC_GATE_VERY_STRONG_PEAK
+                && metrics.voiceBandRatio >= SEMANTIC_GATE_VERY_STRONG_VBR
+                && metrics.zcr >= 0.035d
+                && metrics.zcr <= 0.22d;
+
+        if (!strongCandidate && !veryStrongCandidate) {
+            semanticCandidateStreak = 0;
+            semanticCandidateLastAtMs = now;
+            return SemanticGateDecision.reject("semantic_gate");
+        }
+
+        semanticCandidateLastAtMs = now;
+        semanticCandidateStreak = Math.max(1, semanticCandidateStreak + 1);
+
+        if (!veryStrongCandidate && semanticCandidateStreak < SEMANTIC_GATE_REQUIRED_STREAK) {
+            return SemanticGateDecision.reject("semantic_warmup");
+        }
+
+        long intervalMs = veryStrongCandidate
+                ? SEMANTIC_GATE_STRONG_INTERVAL_MS
+                : SEMANTIC_GATE_MIN_INTERVAL_MS;
+        if ((now - lastSemanticAttemptAtMs) < intervalMs) {
+            return SemanticGateDecision.reject("semantic_interval");
+        }
+
+        lastSemanticAttemptAtMs = now;
+        return SemanticGateDecision.allow();
     }
 
     private void maybeLogLoopbackChunkStatus(AudioPrefilter.VoiceMetrics metrics, boolean voiceLike, double floorSnapshot) {
@@ -524,6 +631,32 @@ final class CompanionLoopbackMonitor {
             noiseFloorRms = Math.min(NOISE_FLOOR_MAX_RMS, (noiseFloorRms * 0.82) + (clamped * 0.18));
         } else {
             noiseFloorRms = (noiseFloorRms * 0.97) + (clamped * 0.03);
+        }
+    }
+
+    private static final class SemanticGateDecision {
+        private final boolean allow;
+        private final String reason;
+
+        private SemanticGateDecision(boolean allow, String reason) {
+            this.allow = allow;
+            this.reason = reason == null ? "" : reason;
+        }
+
+        static SemanticGateDecision allow() {
+            return new SemanticGateDecision(true, "allow");
+        }
+
+        static SemanticGateDecision reject(String reason) {
+            return new SemanticGateDecision(false, reason);
+        }
+
+        boolean isAllowed() {
+            return allow;
+        }
+
+        String reason() {
+            return reason;
         }
     }
 }

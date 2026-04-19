@@ -90,6 +90,7 @@ public class CompanionFrame extends JFrame {
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
+                setVisible(false);
                 host.setCompanionEnabled(false);
                 persistVisibleState(false);
                 balloonWindow.hideBalloon();
@@ -525,10 +526,10 @@ public class CompanionFrame extends JFrame {
 
     public void showWindow() {
         refreshChoices();
-        setToggleSelected(true);
-        host.setCompanionEnabled(true);
         persistVisibleState(true);
         setVisible(true);
+        setToggleSelected(true);
+        host.setCompanionEnabled(true);
         toFront();
         requestFocus();
         balloonWindow.reposition();
@@ -553,11 +554,11 @@ public class CompanionFrame extends JFrame {
     }
 
     public void hideWindow() {
+        setVisible(false);
         setToggleSelected(false);
         host.setCompanionEnabled(false);
         persistVisibleState(false);
         balloonWindow.hideBalloon();
-        setVisible(false);
     }
 
     public void updateStatus(String text) {

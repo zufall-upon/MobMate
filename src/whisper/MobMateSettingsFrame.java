@@ -36,6 +36,7 @@ public class MobMateSettingsFrame extends JDialog {
     private final Map<String, File> moonModelMap = new LinkedHashMap<>();
     private final AtomicBoolean ttsListsLoaded = new AtomicBoolean(false);
     private final AtomicBoolean ttsListsLoading = new AtomicBoolean(false);
+    private boolean syncingTtsControls = false;
 
     // ===== General =====
     private JComboBox<Choice<String>> actionCombo;
@@ -48,6 +49,7 @@ public class MobMateSettingsFrame extends JDialog {
     // ===== Audio =====
     private JComboBox<String> inputCombo;
     private JComboBox<String> outputCombo;
+    private JComboBox<String> monitorVolumeCombo;
     private JCheckBox autoGainCheck;
     private JCheckBox aiAssistCheck;
     private JComboBox<Choice<String>> audioPrefilterModeCombo;
@@ -70,7 +72,11 @@ public class MobMateSettingsFrame extends JDialog {
 
     // ===== TTS =====
     private JComboBox<Choice<String>> ttsEngineCombo;
+    private JComboBox<String> ttsPrimaryVoiceCombo;
     private JComboBox<Choice<Integer>> ttsConfirmSecCombo;
+    private JToggleButton ttsConfirmInstantButton;
+    private JToggleButton ttsConfirmPendingButton;
+    private boolean syncingPendingControls = false;
     private JComboBox<String> windowsVoiceCombo;
     private JComboBox<String> voicevoxSpeakerCombo;
     private JComboBox<String> piperPlusModelCombo;
@@ -104,6 +110,7 @@ public class MobMateSettingsFrame extends JDialog {
 
     // ===== Text / _outtts =====
     private JComboBox<String> whisperLanguageCombo;
+    private JComboBox<String> talkTranslateTargetCombo;
     private JTextArea initialPromptArea;
     private JTextArea hearingInitialPromptArea;
     private JTextField voicevoxExeField;
@@ -122,6 +129,9 @@ public class MobMateSettingsFrame extends JDialog {
     // ===== Radio / Overlay =====
     private JComboBox<Choice<Integer>> radioModCombo;
     private JComboBox<Choice<Integer>> radioKeyCombo;
+    private JTextField radioShortcutDisplayField;
+    private JComboBox<Choice<String>> radioBgPresetCombo;
+    private JComboBox<Choice<String>> radioFgPresetCombo;
     private JCheckBox overlayEnableCheck;
     private JComboBox<Choice<String>> overlayPosCombo;
     private JComboBox<Choice<Integer>> overlayDisplayCombo;    // ★CHANGE
@@ -129,6 +139,7 @@ public class MobMateSettingsFrame extends JDialog {
     private JSlider overlayOpacitySlider;
     private JComboBox<Choice<String>> overlayThemePresetCombo;
     private boolean overlayThemePresetApplying = false;
+    private boolean syncingRadioControls = false;
     private JSpinner overlayMarginSpinner;
     private JSpinner overlayMaxLinesSpinner;
     private JComboBox<String> overlayPageChangeCombo;          // ★CHANGE
@@ -138,6 +149,7 @@ public class MobMateSettingsFrame extends JDialog {
     // ===== Appearance =====
     private JComboBox<Choice<String>> uiLangCombo;
     private JComboBox<Choice<Integer>> uiFontSizeCombo;
+    private JComboBox<Choice<String>> uiMainModeCombo;
     private JCheckBox darkThemeCheck;
 
     public MobMateSettingsFrame(Frame owner, MobMateWhisp app) {
@@ -317,6 +329,9 @@ public class MobMateSettingsFrame extends JDialog {
 
         inputCombo = new JComboBox<>();
         outputCombo = new JComboBox<>();
+        monitorVolumeCombo = new JComboBox<>(new String[]{
+                "0%", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%"
+        });
         autoGainCheck = new JCheckBox(tt("menu.autoGainTuner", "Auto gain"));
         aiAssistCheck = new JCheckBox(tt("settings.audio.aiAssist", "AI setting assist"));
         audioPrefilterModeCombo = new JComboBox<>(new Choice[]{
@@ -339,6 +354,10 @@ public class MobMateSettingsFrame extends JDialog {
 
         addRow(form, row++, tt("settings.label.inputDevice", "Input device"), inputCombo);
         addRow(form, row++, tt("settings.label.outputDevice", "Output device"), outputCombo);
+        JTextArea audioGuideNote = helperNote(tt("settings.page.audio.discordGuide",
+                "Discord example: “Microphone input” is your usual microphone. Set a virtual device for “TTS output target” so Discord can use it as its microphone, and keep Discord's speaker on your usual headset or speakers."));
+        addRow(form, row++, "", audioGuideNote);
+        addRow(form, row++, tt("settings.label.monitorVolume", "Monitor volume"), monitorVolumeCombo);
         addRow(form, row++, "", autoGainCheck);
         addRow(form, row++, "", aiAssistCheck);
         addRow(form, row++, tt("settings.label.audioPrefilter", "Voice audio filter"), audioPrefilterModeCombo);
@@ -427,29 +446,60 @@ public class MobMateSettingsFrame extends JDialog {
                 new Choice<>("Voiceger (VC)", "voiceger_vc"),
                 new Choice<>("Voiceger (TTS)", "voiceger_tts")
         });
+        ttsEngineCombo.setRenderer(new DefaultListCellRenderer() {
+            @Override
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
+                super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                setText(displaySettingsTtsEngine(value));
+                return this;
+            }
+        });
+        ttsPrimaryVoiceCombo = new JComboBox<>();
         ttsConfirmSecCombo = new JComboBox<>(new Choice[]{
-                new Choice<>("1", 1),
-                new Choice<>("2", 2),
-                new Choice<>("3", 3),
-                new Choice<>("4", 4),
-                new Choice<>("5", 5),
-                new Choice<>("6", 6),
-                new Choice<>("7", 7),
-                new Choice<>("8", 8),
-                new Choice<>("9", 9),
-                new Choice<>("10", 10),
-                new Choice<>("11", 11),
-                new Choice<>("12", 12),
-                new Choice<>("13", 13),
-                new Choice<>("14", 14),
-                new Choice<>("15", 15)
+                new Choice<>("1 sec", 1),
+                new Choice<>("2 sec", 2),
+                new Choice<>("3 sec", 3),
+                new Choice<>("4 sec", 4),
+                new Choice<>("5 sec", 5),
+                new Choice<>("6 sec", 6),
+                new Choice<>("7 sec", 7),
+                new Choice<>("8 sec", 8),
+                new Choice<>("9 sec", 9),
+                new Choice<>("10 sec", 10),
+                new Choice<>("11 sec", 11),
+                new Choice<>("12 sec", 12),
+                new Choice<>("13 sec", 13),
+                new Choice<>("14 sec", 14),
+                new Choice<>("15 sec", 15)
+        });
+        ttsConfirmInstantButton = new JToggleButton(tt("pending.mode.instant", "Instant"));
+        ttsConfirmPendingButton = new JToggleButton(tt("pending.mode.wait", "Wait"));
+        ButtonGroup pendingModeGroup = new ButtonGroup();
+        pendingModeGroup.add(ttsConfirmInstantButton);
+        pendingModeGroup.add(ttsConfirmPendingButton);
+        styleSettingsPendingModeButtons();
+        ttsConfirmInstantButton.addActionListener(e -> {
+            if (syncingPendingControls) return;
+            app.setConfirmModeFromUi(false);
+            refreshPendingSelections();
+        });
+        ttsConfirmPendingButton.addActionListener(e -> {
+            if (syncingPendingControls) return;
+            app.setConfirmModeFromUi(true);
+            refreshPendingSelections();
+        });
+        ttsConfirmSecCombo.addActionListener(e -> {
+            if (syncingPendingControls) return;
+            Integer value = selectedValue(ttsConfirmSecCombo);
+            if (value != null) {
+                app.setConfirmSecondsFromUi(value);
+                refreshPendingSelections();
+            }
         });
 
         windowsVoiceCombo = new JComboBox<>();
         voicevoxSpeakerCombo = new JComboBox<>();
         piperPlusModelCombo = new JComboBox<>();
-        JButton reloadVoicevoxBtn = new JButton(tt("settings.voicevox.reload", "Reload"));
-        reloadVoicevoxBtn.addActionListener(e -> ensureTtsListsLoadedAsync(true));
         piperPlusDownloadBtn = new JButton(tt("settings.piperPlus.download", "Download / Update"));
         piperPlusDownloadBtn.addActionListener(e -> handleSelectedPiperPlusPrimaryAction());
         JButton piperPlusRemoveBtn = new JButton(tt("settings.piperPlus.remove", "Remove"));
@@ -477,11 +527,21 @@ public class MobMateSettingsFrame extends JDialog {
                 new Choice<>("Cantonese", "all_yue")
         });
 
-        form.add(sectionLabel(tt("settings.section.ttsConfirm", "Pending Confirm")), sectionGbc(row++));
-        addRow(form, row++, tt("settings.label.ttsConfirmSec", "Pending confirm seconds"), ttsConfirmSecCombo);
+        form.add(sectionLabel(tt("settings.section.ttsConfirm", "Speech pending mode")), sectionGbc(row++));
+        JTextArea pendingNote = helperNote(tt("settings.section.ttsConfirm.desc",
+                "Choose whether speech is confirmed immediately or after a short wait. Radio Chat shortcuts can quickly select speak or discard too."));
+        addRow(form, row++, "", pendingNote);
+        JPanel pendingModePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        pendingModePanel.setOpaque(false);
+        pendingModePanel.add(ttsConfirmInstantButton);
+        pendingModePanel.add(ttsConfirmPendingButton);
+        pendingModePanel.add(new JLabel(tt("pending.wait_seconds", "Wait time")));
+        pendingModePanel.add(ttsConfirmSecCombo);
+        addRow(form, row++, tt("settings.label.ttsPendingCompact", "Speech pending mode"), pendingModePanel);
 
         form.add(sectionLabel(tt("settings.section.ttsVoice", "Voice Output")), sectionGbc(row++));
-        addRow(form, row++, tt("settings.label.ttsEngine", "TTS engine"), ttsEngineCombo);
+        JPanel primaryVoicePanel = createResponsiveDualFieldPanel(ttsEngineCombo, ttsPrimaryVoiceCombo);
+        addRow(form, row++, tt("settings.label.ttsVoiceCompact", "TTS / Voice"), primaryVoicePanel);
         ttsWindowsVoiceRow = addTrackedRow(form, row++, tt("settings.label.windowsVoice", "Windows voice"), windowsVoiceCombo);
 
         JPanel piperPanel = new JPanel(new BorderLayout(8, 0));
@@ -499,10 +559,9 @@ public class MobMateSettingsFrame extends JDialog {
         ttsPiperPlusStatusRow = addTrackedRow(form, row++, "", piperPlusStatusLabel);
         ttsPiperPlusProsodyRow = addTrackedRow(form, row++, "", piperPlusProsodyLabel);
 
-        JPanel vvPanel = new JPanel(new BorderLayout(8, 0));
-        vvPanel.add(voicevoxSpeakerCombo, BorderLayout.CENTER);
-        vvPanel.add(reloadVoicevoxBtn, BorderLayout.EAST);
-        ttsVoicevoxSpeakerRow = addTrackedRow(form, row++, tt("settings.label.voicevoxSpeaker", "VOICEVOX speaker"), vvPanel);
+        // Keep the detailed VOICEVOX combo off-screen so legacy save/load paths and compact-row sync
+        // can continue to share the same backing selection without exposing a duplicate row in Settings.
+        ttsVoicevoxSpeakerRow = null;
 
         ttsVoicevoxAutoEmotionRow = addTrackedRow(form, row++, "", voicevoxAutoEmotionCheck);
         ttsReflectEmotionRow = addTrackedRow(form, row++, "", ttsReflectEmotionCheck);
@@ -529,13 +588,36 @@ public class MobMateSettingsFrame extends JDialog {
 
         ttsSetupButtonsRow = addTrackedRow(form, row++, tt("settings.label.ttsSetup", "Open setup"), setupButtons);
 
-        JLabel note = new JLabel("<html><span style='color:#888888;'>"
-                + tt("settings.ttsSetup.note",
-                "Open VOICEVOX / XTTS / Voiceger setup pages when you need advanced setup.")
-                + "</span></html>");
+        JTextArea note = helperNote(tt("settings.ttsSetup.note",
+                "Open VOICEVOX / XTTS / Voiceger setup pages when you need advanced setup."));
         ttsSetupNoteRow = addTrackedRow(form, row++, "", note);
 
-        ttsEngineCombo.addActionListener(e -> updateTtsUiState());
+        ttsEngineCombo.addActionListener(e -> {
+            if (syncingTtsControls) return;
+            updateTtsPrimaryVoiceChoices();
+            updateTtsUiState();
+        });
+        ttsPrimaryVoiceCombo.addActionListener(e -> {
+            if (syncingTtsControls) return;
+            syncDetailedTtsSelectionFromPrimary();
+        });
+        windowsVoiceCombo.addActionListener(e -> {
+            if (syncingTtsControls) return;
+            refreshPrimaryVoiceSelectionFromDetailed();
+        });
+        voicevoxSpeakerCombo.addActionListener(e -> {
+            if (syncingTtsControls) return;
+            refreshPrimaryVoiceSelectionFromDetailed();
+        });
+        piperPlusModelCombo.addActionListener(e -> {
+            if (syncingTtsControls) return;
+            refreshPrimaryVoiceSelectionFromDetailed();
+        });
+        voicegerLangCombo.addActionListener(e -> {
+            if (syncingTtsControls) return;
+            refreshPrimaryVoiceSelectionFromDetailed();
+        });
+        updateTtsPrimaryVoiceChoices();
         updateTtsUiState();
 
         return wrapPage(
@@ -551,6 +633,8 @@ public class MobMateSettingsFrame extends JDialog {
 
         whisperLanguageCombo = new JComboBox<>(LanguageOptions.whisperLangs());
         whisperLanguageCombo.setRenderer(LanguageOptions.whisperRenderer());
+        talkTranslateTargetCombo = new JComboBox<>(LanguageOptions.translationTargets());
+        talkTranslateTargetCombo.setRenderer(LanguageOptions.translationRenderer());
         initialPromptArea = new JTextArea(4, 40);
         initialPromptArea.setLineWrap(true);
         initialPromptArea.setWrapStyleWord(true);
@@ -577,6 +661,7 @@ public class MobMateSettingsFrame extends JDialog {
         vadToleranceSpinner   = new JSpinner(new SpinnerNumberModel(5, 1, 10, 1));   
 
         addRow(form, row++, tt("settings.label.whisperLang", "Talk language (Whisper)"), whisperLanguageCombo);
+        addRow(form, row++, tt("settings.label.translateTarget", "Translation target"), talkTranslateTargetCombo);
         addRow(form, row++, tt("settings.label.initialPrompt", "Initial prompt"),
                 new JScrollPane(initialPromptArea), true);
         addRow(form, row++, tt("settings.label.hearingInitialPrompt", "Hearing prompt (Whisper)"),
@@ -683,46 +768,91 @@ public class MobMateSettingsFrame extends JDialog {
         overlayBgField = new JTextField();
         overlayFgField = new JTextField();
 
+        radioShortcutDisplayField = new JTextField();
+        radioShortcutDisplayField.setEditable(false);
+        radioShortcutDisplayField.setColumns(16);
+
+        radioBgPresetCombo = new JComboBox<>();
+        radioFgPresetCombo = new JComboBox<>();
+        repopulateRadioPresetCombo(radioBgPresetCombo, true, "#1D6F5A");
+        repopulateRadioPresetCombo(radioFgPresetCombo, false, "#FFFFFF");
+
         overlayThemePresetCombo.addActionListener(e -> {
             if (overlayThemePresetApplying) return;
             applyOverlayThemePreset(selectedValue(overlayThemePresetCombo));
         });
         installOverlayThemeTracking(overlayBgField);
         installOverlayThemeTracking(overlayFgField);
+        radioBgPresetCombo.addActionListener(e -> {
+            if (syncingRadioControls) return;
+            String bgHex = selectedValue(radioBgPresetCombo);
+            String fgHex = selectedValue(radioFgPresetCombo);
+            if (bgHex != null) overlayBgField.setText(bgHex);
+            if (fgHex != null) overlayFgField.setText(fgHex);
+            app.setRadioOverlayColors(
+                    Objects.toString(bgHex, overlayBgField.getText()).trim(),
+                    Objects.toString(fgHex, overlayFgField.getText()).trim()
+            );
+        });
+        radioFgPresetCombo.addActionListener(e -> {
+            if (syncingRadioControls) return;
+            String bgHex = selectedValue(radioBgPresetCombo);
+            String fgHex = selectedValue(radioFgPresetCombo);
+            if (bgHex != null) overlayBgField.setText(bgHex);
+            if (fgHex != null) overlayFgField.setText(fgHex);
+            app.setRadioOverlayColors(
+                    Objects.toString(bgHex, overlayBgField.getText()).trim(),
+                    Objects.toString(fgHex, overlayFgField.getText()).trim()
+            );
+        });
 
         overlayEnableCheck.addActionListener(e -> updateOverlayDetailEnabled()); 
 
         form.add(sectionLabel(tt("settings.section.radioChat", "Radio Chat Mode")), sectionGbc(row++));
-        JLabel radioNote = new JLabel("<html><span style='color:#888888;'>"
-                + tt("settings.section.radioChat.desc",
-                "Choose the key combination used for Radio Chat mode during gameplay.")
-                + "</span></html>");
+        JTextArea radioNote = helperNote(tt("settings.section.radioChat.desc",
+                "Use the same simple controls as the main window so shortcut, position, and colors stay in sync."));
         addRow(form, row++, "", radioNote);
-        addRow(form, row++, tt("settings.label.radioModifier", "Modifier key"), radioModCombo);
-        addRow(form, row++, tt("settings.label.radioKey", "Radio key"), radioKeyCombo);
 
-        form.add(sectionLabel(tt("settings.section.overlay", "Subtitle Overlay")), sectionGbc(row++));
-        JLabel overlayNote = new JLabel("<html><span style='color:#888888;'>"
-                + tt("settings.section.overlay.desc",
-                "Configure where Radio Chat subtitles appear on screen and how they look.")
-                + "</span></html>");
-        addRow(form, row++, "", overlayNote);
+        JButton captureRadioShortcutButton = new JButton(tt("settings.radio.capture", "Capture shortcut"));
+        captureRadioShortcutButton.addActionListener(e -> {
+            app.captureRadioHotkeyFromUi(this);
+            refreshRadioSelections();
+        });
+        JButton previewOverlayButton = new JButton(tt("settings.radio.preview", "Preview overlay"));
+        previewOverlayButton.addActionListener(e -> app.previewRadioOverlayFromUi());
+        JPanel shortcutPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        shortcutPanel.setOpaque(false);
+        shortcutPanel.add(radioShortcutDisplayField);
+        shortcutPanel.add(captureRadioShortcutButton);
+        shortcutPanel.add(previewOverlayButton);
+        addTrackedRow(form, row++, tt("settings.label.radioShortcut", "Shortcut"), shortcutPanel);
+
+        JTextArea radioHint = helperNote(tt("settings.radio.shortcut.recommend",
+                "Recommended: Scroll Lock / Pause / Ctrl+Alt+Shift+M"));
+        addTrackedRow(form, row++, "", radioHint);
+        addTrackedRow(form, row++, tt("settings.label.overlayPosition", "Screen position"), overlayPosCombo);
+        addTrackedRow(form, row++, tt("settings.label.overlayBgPreset", "Background color"), radioBgPresetCombo);
+        addTrackedRow(form, row++, tt("settings.label.overlayFgPreset", "Text color"), radioFgPresetCombo);
+
+        JButton openRadioConfigButton = new JButton(tt("settings.radio.openConfig", "Open radio chat config file"));
+        openRadioConfigButton.addActionListener(e -> app.openRadioChatConfigFileFromUi());
+        addTrackedRow(form, row++, "", openRadioConfigButton);
+
+        JTextArea overlayNote = helperNote(tt("settings.section.overlay.desc",
+                "Advanced overlay tuning is still available below when you need display, opacity, or page change details."));
+        addTrackedRow(form, row++, "", overlayNote);
+
+        form.add(sectionLabel(tt("settings.section.overlayAdvanced", "Overlay Advanced")), sectionGbc(row++));
         addRow(form, row++, "", overlayEnableCheck);
-        addRow(form, row++, tt("settings.label.overlayPosition", "Screen position"), overlayPosCombo);
         addRow(form, row++, tt("settings.label.overlayDisplay", "Display"), overlayDisplayCombo);
         addRow(form, row++, tt("settings.label.overlayFontSize", "Text size"), overlayFontSizeSpinner);
         addRow(form, row++, tt("settings.label.overlayOpacity", "Background opacity"), overlayOpacitySlider);
-        addRow(form, row++, tt("settings.label.overlayThemePreset", "Theme preset"), overlayThemePresetCombo);
         addRow(form, row++, tt("settings.label.overlayMargin", "Screen edge margin"), overlayMarginSpinner);
         addRow(form, row++, tt("settings.label.overlayMaxLines", "Visible lines"), overlayMaxLinesSpinner);
         addRow(form, row++, tt("settings.label.overlayPageChange", "Page change key"), overlayPageChangeCombo);
-        addRow(form, row++, tt("settings.label.overlayBg", "Background color"), overlayBgField);
-        addRow(form, row++, tt("settings.label.overlayFg", "Text color"), overlayFgField);
 
-        JLabel note = new JLabel("<html><span style='color:#888888;'>"
-                + tt("settings.overlay.theme.note",
-                "Picking a preset fills bg/fg automatically. Editing bg/fg switches back to Custom.")
-                + "</span></html>");
+        JTextArea note = helperNote(tt("settings.overlay.theme.note",
+                "Color presets match the Simple mode card. Advanced overlay rows below stay available for fine tuning."));
         addRow(form, row++, "", note);
 
         updateOverlayDetailEnabled();
@@ -755,11 +885,16 @@ public class MobMateSettingsFrame extends JDialog {
                 new Choice<>("22", 22),
                 new Choice<>("24", 24)
         });
+        uiMainModeCombo = new JComboBox<>(new Choice[]{
+                new Choice<>("Simple", MobMateWhisp.UI_MAIN_MODE_SIMPLE),
+                new Choice<>("Classic", MobMateWhisp.UI_MAIN_MODE_CLASSIC)
+        });
 
         darkThemeCheck = new JCheckBox(tt("settings.label.darkTheme", "Dark theme"));
 
         addRow(form, row++, tt("settings.label.uiLanguage", "UI language"), uiLangCombo);
         addRow(form, row++, tt("settings.label.uiFont", "UI font size"), uiFontSizeCombo);
+        addRow(form, row++, tt("settings.label.mainWindowMode", "Main window mode"), uiMainModeCombo);
         addRow(form, row++, "", darkThemeCheck);
 
         return wrapPage(
@@ -771,9 +906,149 @@ public class MobMateSettingsFrame extends JDialog {
 
     public void refreshLinkedSelections() {
         SwingUtilities.invokeLater(() -> {
+            refreshAudioSelections();
+            refreshVoiceSelections();
+            refreshPendingSelections();
+            refreshRadioSelections();
             selectChoice(voicegerLangCombo, MobMateWhisp.prefs.get("voiceger.tts.lang", "all_ja"));
             selectStringComboValue(whisperLanguageCombo, app.getTalkLanguage(), app.getTalkLanguage());
+            selectStringComboValue(talkTranslateTargetCombo, app.getTalkTranslateTarget(), app.getTalkTranslateTarget());
         });
+    }
+
+    private void refreshAudioSelections() {
+        if (inputCombo != null) {
+            Object selectedInput = inputCombo.getSelectedItem();
+            String desiredInput = MobMateWhisp.prefs.get("audio.device", "");
+            inputCombo.removeAllItems();
+            for (String s : app.getInputsMixerNames()) inputCombo.addItem(s);
+            selectStringComboValue(inputCombo, desiredInput, Objects.toString(selectedInput, ""));
+        }
+        if (outputCombo != null) {
+            Object selectedOutput = outputCombo.getSelectedItem();
+            String desiredOutput = MobMateWhisp.prefs.get("audio.output.device", "");
+            outputCombo.removeAllItems();
+            for (String s : app.getOutputMixerNames()) outputCombo.addItem(s);
+            selectStringComboValue(outputCombo, desiredOutput, Objects.toString(selectedOutput, ""));
+        }
+        if (monitorVolumeCombo != null) {
+            selectStringComboValue(
+                    monitorVolumeCombo,
+                    app.getTtsMonitorVolumePercentForUi() + "%",
+                    "0%"
+            );
+        }
+        if (aiAssistCheck != null) {
+            aiAssistCheck.setSelected(app.isAiAssistEnabledForUi());
+        }
+    }
+
+    private void refreshVoiceSelections() {
+        if (recogEngineCombo != null) {
+            selectChoice(recogEngineCombo, MobMateWhisp.prefs.get("recog.engine", "whisper"));
+            updateRecognitionUiState();
+        }
+        if (ttsEngineCombo != null) {
+            selectChoice(ttsEngineCombo, MobMateWhisp.prefs.get("tts.engine", "auto"));
+        }
+        if (windowsVoiceCombo != null) {
+            if (windowsVoiceCombo.getItemCount() == 0) {
+                windowsVoiceCombo.addItem("auto");
+            }
+            selectStringComboValue(windowsVoiceCombo, MobMateWhisp.prefs.get("tts.windows.voice", "auto"), "auto");
+        }
+        if (piperPlusModelCombo != null) {
+            reloadPiperPlusModelChoices();
+        }
+        if (voicegerLangCombo != null) {
+            selectChoice(voicegerLangCombo, MobMateWhisp.prefs.get("voiceger.tts.lang", "all_ja"));
+        }
+        if (voicevoxSpeakerCombo != null && ttsListsLoaded.get() && !ttsListsLoading.get()) {
+            applyVoiceVoxSpeakerList(app.getVoiceVoxSpeakersForSettings());
+        }
+        updateTtsPrimaryVoiceChoices();
+        updatePiperPlusSelectionDetails();
+        updateTtsUiState();
+    }
+
+    private void refreshPendingSelections() {
+        syncingPendingControls = true;
+        try {
+            boolean pendingMode = app.isTtsConfirmModeEnabled();
+            if (ttsConfirmInstantButton != null) {
+                ttsConfirmInstantButton.setSelected(!pendingMode);
+            }
+            if (ttsConfirmPendingButton != null) {
+                ttsConfirmPendingButton.setSelected(pendingMode);
+            }
+            if (ttsConfirmSecCombo != null) {
+                selectChoice(ttsConfirmSecCombo, app.getConfirmSecondsForUi());
+            }
+            styleSettingsPendingModeButtons();
+        } finally {
+            syncingPendingControls = false;
+        }
+    }
+
+    private void refreshRadioSelections() {
+        syncingRadioControls = true;
+        try {
+            if (radioModCombo != null) {
+                selectChoice(radioModCombo, MobMateWhisp.prefs.getInt("radio.modMask", 0));
+            }
+            if (radioKeyCombo != null) {
+                selectChoice(radioKeyCombo, MobMateWhisp.prefs.getInt("radio.keyCode", NativeKeyEvent.VC_F18));
+            }
+            if (radioShortcutDisplayField != null) {
+                radioShortcutDisplayField.setText(app.getRadioHotkeyDisplayForUi());
+            }
+            if (overlayEnableCheck != null) {
+                overlayEnableCheck.setSelected(Config.getBool("overlay.enable", true));
+            }
+            if (overlayPosCombo != null) {
+                selectChoice(overlayPosCombo, app.getOverlayPositionForUi().trim().toUpperCase(Locale.ROOT));
+            }
+            int overlayDisplay = Math.max(0, Config.getInt("overlay.display", 0));
+            ensureOverlayDisplayChoice(overlayDisplay);
+            if (overlayDisplayCombo != null) {
+                selectChoice(overlayDisplayCombo, overlayDisplay);
+            }
+            if (overlayFontSizeSpinner != null) {
+                overlayFontSizeSpinner.setValue(Math.max(10, Config.getInt("overlay.font_size", 16)));
+            }
+            if (overlayOpacitySlider != null) {
+                overlayOpacitySlider.setValue((int) (Config.getFloat("overlay.opacity", 0.78f) * 100f));
+            }
+            if (overlayMarginSpinner != null) {
+                overlayMarginSpinner.setValue(Math.max(0, Config.getInt("overlay.margin", 12)));
+            }
+            if (overlayMaxLinesSpinner != null) {
+                overlayMaxLinesSpinner.setValue(Math.max(4, Config.getInt("overlay.max_lines", 12)));
+            }
+            if (overlayPageChangeCombo != null) {
+                selectStringComboValue(
+                        overlayPageChangeCombo,
+                        Config.getString("overlay.page_change", "0").trim(),
+                        "0"
+                );
+            }
+            String bgHex = normalizeHex(toHex(app.getOverlayBgForUi()));
+            String fgHex = normalizeHex(toHex(app.getOverlayFgForUi()));
+            if (overlayBgField != null) overlayBgField.setText(bgHex);
+            if (overlayFgField != null) overlayFgField.setText(fgHex);
+            if (radioBgPresetCombo != null) {
+                repopulateRadioPresetCombo(radioBgPresetCombo, true, bgHex);
+            }
+            if (radioFgPresetCombo != null) {
+                repopulateRadioPresetCombo(radioFgPresetCombo, false, fgHex);
+            }
+            if (overlayThemePresetCombo != null) {
+                selectChoice(overlayThemePresetCombo, detectOverlayThemePreset(bgHex, fgHex));
+            }
+            updateOverlayDetailEnabled();
+        } finally {
+            syncingRadioControls = false;
+        }
     }
     private void loadCurrentValues() {
         // ===== General =====
@@ -785,16 +1060,8 @@ public class MobMateSettingsFrame extends JDialog {
         silenceDetectionCheck.setSelected(MobMateWhisp.prefs.getBoolean("silence-detection", true));
 
         // ===== Audio =====
-        inputCombo.removeAllItems();
-        for (String s : app.getInputsMixerNames()) inputCombo.addItem(s);
-        inputCombo.setSelectedItem(MobMateWhisp.prefs.get("audio.device", ""));
-
-        outputCombo.removeAllItems();
-        for (String s : app.getOutputMixerNames()) outputCombo.addItem(s);
-        outputCombo.setSelectedItem(MobMateWhisp.prefs.get("audio.output.device", ""));
-
+        refreshAudioSelections();
         autoGainCheck.setSelected(MobMateWhisp.prefs.getBoolean("audio.autoGain", true));
-        aiAssistCheck.setSelected(MobMateWhisp.prefs.getBoolean("audio.ai_assist", false));
         selectChoice(audioPrefilterModeCombo, MobMateWhisp.getAudioPrefilterMode());
         selectChoice(inputGainCombo, MobMateWhisp.prefs.getFloat("audio.inputGainMultiplier", 1.0f));
 
@@ -837,7 +1104,7 @@ public class MobMateSettingsFrame extends JDialog {
 
         // ===== TTS =====
         selectChoice(ttsEngineCombo, MobMateWhisp.prefs.get("tts.engine", "auto"));
-        selectChoice(ttsConfirmSecCombo, MobMateWhisp.prefs.getInt("tts.confirm_sec", 3));
+        refreshPendingSelections();
 
         windowsVoiceCombo.removeAllItems();
         windowsVoiceCombo.addItem("auto");
@@ -853,11 +1120,13 @@ public class MobMateSettingsFrame extends JDialog {
         selectChoice(ttsContourStrengthCombo, MobMateWhisp.prefs.get("tts.reflect.contour_strength", "normal"));
         selectChoice(ttsToneEmphasisCombo, MobMateWhisp.prefs.get("tts.reflect.tone_emphasis", "normal"));
         selectChoice(voicegerLangCombo, MobMateWhisp.prefs.get("voiceger.tts.lang", "all_ja"));
+        updateTtsPrimaryVoiceChoices();
         updatePiperPlusSelectionDetails();
         updateTtsUiState();
 
         // ===== Text / _outtts =====
         selectStringComboValue(whisperLanguageCombo, app.getTalkLanguage(), app.getTalkLanguage());
+        selectStringComboValue(talkTranslateTargetCombo, app.getTalkTranslateTarget(), app.getTalkTranslateTarget());
         initialPromptArea.setText(Config.getString("initial_prompt", ""));
         hearingInitialPromptArea.setText(MobMateWhisp.prefs.get("hearing.initial_prompt", ""));
         voicevoxExeField.setText(Config.getString("voicevox.exe", ""));
@@ -877,37 +1146,12 @@ public class MobMateSettingsFrame extends JDialog {
         vadToleranceSpinner.setValue(Math.max(1, Math.min(10, vadTol)));
 
         // ===== Radio / Overlay =====
-        selectChoice(radioModCombo, MobMateWhisp.prefs.getInt("radio.modMask", 0));
-        selectChoice(radioKeyCombo, MobMateWhisp.prefs.getInt("radio.keyCode", NativeKeyEvent.VC_F18));
-
-        overlayEnableCheck.setSelected(Config.getBool("overlay.enable", true));
-        selectChoice(overlayPosCombo, Config.getString("overlay.position", "TOP_LEFT").trim().toUpperCase(Locale.ROOT));
-
-        int overlayDisplay = Math.max(0, Config.getInt("overlay.display", 0));
-        ensureOverlayDisplayChoice(overlayDisplay);
-        selectChoice(overlayDisplayCombo, overlayDisplay);
-
-        overlayFontSizeSpinner.setValue(Math.max(10, Config.getInt("overlay.font_size", 16)));
-        overlayOpacitySlider.setValue((int) (Config.getFloat("overlay.opacity", 0.78f) * 100f));
-        overlayMarginSpinner.setValue(Math.max(0, Config.getInt("overlay.margin", 12)));
-        overlayMaxLinesSpinner.setValue(Math.max(4, Config.getInt("overlay.max_lines", 12)));
-
-        selectStringComboValue(
-                overlayPageChangeCombo,
-                Config.getString("overlay.page_change", "0").trim(),
-                "0"
-        );
-
-        overlayBgField.setText(Config.getString("overlay.bg", "#1D6F5A"));
-        overlayFgField.setText(Config.getString("overlay.fg", "#FFFFFF"));
-        selectChoice(overlayThemePresetCombo,
-                detectOverlayThemePreset(overlayBgField.getText(), overlayFgField.getText()));
-
-        updateOverlayDetailEnabled();
+        refreshRadioSelections();
 
         // ===== Appearance =====
         selectChoice(uiLangCombo, MobMateWhisp.prefs.get("ui.language", "en"));
         selectChoice(uiFontSizeCombo, MobMateWhisp.prefs.getInt("ui.font.size", 16));
+        selectChoice(uiMainModeCombo, MobMateWhisp.prefs.get(MobMateWhisp.PREF_UI_MAIN_MODE, MobMateWhisp.UI_MAIN_MODE_SIMPLE));
         darkThemeCheck.setSelected(MobMateWhisp.prefs.getBoolean("ui.theme.dark", true));
     }
 
@@ -1136,6 +1380,16 @@ public class MobMateSettingsFrame extends JDialog {
             needSoftRestart = true;
         }
 
+        int oldMonitorVolume = app.getTtsMonitorVolumePercentForUi();
+        String monitorText = Objects.toString(monitorVolumeCombo.getSelectedItem(), oldMonitorVolume + "%");
+        int newMonitorVolume = oldMonitorVolume;
+        try {
+            newMonitorVolume = Integer.parseInt(monitorText.replace("%", "").trim());
+        } catch (NumberFormatException ignore) {}
+        if (oldMonitorVolume != newMonitorVolume) {
+            app.setTtsMonitorVolumePercentFromUi(newMonitorVolume);
+        }
+
         boolean oldAutoGain = MobMateWhisp.prefs.getBoolean("audio.autoGain", true);
         boolean newAutoGain = autoGainCheck.isSelected();
         if (oldAutoGain != newAutoGain) {
@@ -1220,9 +1474,11 @@ public class MobMateSettingsFrame extends JDialog {
         String newTtsEngine = selectedValue(ttsEngineCombo);
         MobMateWhisp.prefs.put("tts.engine", newTtsEngine);
         MobMateWhisp.prefs.put("piper.plus.model_id", selectedPiperPlusModelId());
+        boolean newPendingMode = ttsConfirmPendingButton != null && ttsConfirmPendingButton.isSelected();
+        app.setConfirmModeFromUi(newPendingMode);
         Integer confirmSec = selectedValue(ttsConfirmSecCombo);
         if (confirmSec != null) {
-            MobMateWhisp.prefs.putInt("tts.confirm_sec", confirmSec);
+            app.setConfirmSecondsFromUi(confirmSec);
         }
 
         if (ttsListsLoaded.get() && !ttsListsLoading.get()) {
@@ -1274,6 +1530,13 @@ public class MobMateSettingsFrame extends JDialog {
             if (!Objects.equals(oldTalkLang, newTalkLang) && app.applyTalkLanguageSelection(newTalkLang)) {
                 needSoftRestart = true;
             }
+        }
+        String oldTranslateTarget = app.getTalkTranslateTarget();
+        String newTranslateTarget = selectedStringOrFallback(talkTranslateTargetCombo, oldTranslateTarget);
+        if (!Objects.equals(oldTranslateTarget, newTranslateTarget)) {
+            app.setTalkTranslateTarget(newTranslateTarget);
+            app.prewarmPiperPlusForTalkTargetSelection(this, newTranslateTarget);
+            app.maybeRecommendTalkTtsRoute(this, "settings-talk-translate-target");
         }
         writeOutttsKey("language", app.getTalkLanguage(), false);
         writeOutttsKey("initial_prompt", oneLine(initialPromptArea.getText()), false);
@@ -1349,6 +1612,13 @@ public class MobMateSettingsFrame extends JDialog {
         if (newFontSize != null) {
             MobMateWhisp.prefs.putInt("ui.font.size", newFontSize);
             applyFontSizeNow(newFontSize);
+        }
+
+        String oldMainMode = MobMateWhisp.prefs.get(MobMateWhisp.PREF_UI_MAIN_MODE, MobMateWhisp.UI_MAIN_MODE_SIMPLE);
+        String newMainMode = selectedValue(uiMainModeCombo);
+        if (!Objects.equals(oldMainMode, newMainMode)) {
+            MobMateWhisp.prefs.put(MobMateWhisp.PREF_UI_MAIN_MODE, newMainMode);
+            needSoftRestart = true;
         }
 
         boolean oldDark = MobMateWhisp.prefs.getBoolean("ui.theme.dark", true);
@@ -1796,8 +2066,7 @@ public class MobMateSettingsFrame extends JDialog {
         lc.fill = GridBagConstraints.HORIZONTAL;
         lc.weightx = 0.0;
 
-        JLabel l = new JLabel(label == null ? "" : label);
-        l.setPreferredSize(new Dimension(180, large ? 80 : 26));
+        JComponent l = createRowLabel(label == null ? "" : label, large);
         form.add(l, lc);
 
         GridBagConstraints cc = new GridBagConstraints();
@@ -1809,7 +2078,7 @@ public class MobMateSettingsFrame extends JDialog {
         cc.weightx = 1.0;
         if (large) cc.weighty = 1.0;
 
-        form.add(comp, cc);
+        form.add(adaptSettingsFieldComponent(comp, large), cc);
     }
 
     private GridBagConstraints sectionGbc(int row) {
@@ -1933,6 +2202,79 @@ public class MobMateSettingsFrame extends JDialog {
         if (!t.startsWith("#")) t = "#" + t;
         if (t.length() != 7) return t;
         return t;
+    }
+
+    private String toHex(Color color) {
+        if (color == null) return "#000000";
+        return String.format(Locale.ROOT, "#%02X%02X%02X", color.getRed(), color.getGreen(), color.getBlue());
+    }
+
+    private void styleSettingsPendingModeButtons() {
+        styleSettingsPendingModeButton(ttsConfirmInstantButton, ttsConfirmInstantButton != null && ttsConfirmInstantButton.isSelected());
+        styleSettingsPendingModeButton(ttsConfirmPendingButton, ttsConfirmPendingButton != null && ttsConfirmPendingButton.isSelected());
+    }
+
+    private void styleSettingsPendingModeButton(AbstractButton button, boolean active) {
+        if (button == null) return;
+        button.setFocusPainted(false);
+        button.setOpaque(true);
+        button.setBorderPainted(true);
+        if (active) {
+            button.setForeground(Color.WHITE);
+            button.setBackground(new Color(0x74, 0xBC, 0xB6));
+            button.setBorder(BorderFactory.createLineBorder(new Color(0x5C, 0xA7, 0xA1)));
+        } else {
+            button.setForeground(UIManager.getColor("Label.foreground"));
+            button.setBackground(UIManager.getColor("Panel.background"));
+            Color borderColor = UIManager.getColor("Component.borderColor");
+            if (borderColor == null) borderColor = new Color(0x66, 0x66, 0x66);
+            button.setBorder(BorderFactory.createLineBorder(borderColor));
+        }
+    }
+
+    private void repopulateRadioPresetCombo(JComboBox<Choice<String>> combo, boolean background, String currentHex) {
+        if (combo == null) return;
+        String normalizedCurrent = normalizeHex(currentHex);
+        combo.removeAllItems();
+        for (Choice<String> choice : radioPresetChoices(background)) {
+            combo.addItem(choice);
+        }
+        boolean matched = false;
+        for (int i = 0; i < combo.getItemCount(); i++) {
+            Choice<String> choice = combo.getItemAt(i);
+            if (Objects.equals(normalizedCurrent, normalizeHex(choice.value))) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched && !normalizedCurrent.isBlank()) {
+            combo.insertItemAt(
+                    new Choice<>(
+                            tt("settings.overlay.preset.current", "Current") + "  " + normalizedCurrent,
+                            normalizedCurrent
+                    ),
+                    0
+            );
+        }
+        selectChoice(combo, normalizedCurrent);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Choice<String>[] radioPresetChoices(boolean background) {
+        if (background) {
+            return new Choice[]{
+                    new Choice<>(tt("settings.overlay.preset.deepGreen", "Deep green  #1D6F5A"), "#1D6F5A"),
+                    new Choice<>(tt("settings.overlay.preset.navy", "Navy  #304A6E"), "#304A6E"),
+                    new Choice<>(tt("settings.overlay.preset.charcoal", "Charcoal  #2F3A4B"), "#2F3A4B"),
+                    new Choice<>(tt("settings.overlay.preset.wine", "Wine  #7A3E4B"), "#7A3E4B")
+            };
+        }
+        return new Choice[]{
+                new Choice<>(tt("settings.overlay.preset.white", "White  #FFFFFF"), "#FFFFFF"),
+                new Choice<>(tt("settings.overlay.preset.ivory", "Ivory  #F8F3E7"), "#F8F3E7"),
+                new Choice<>(tt("settings.overlay.preset.navyText", "Navy  #26374C"), "#26374C"),
+                new Choice<>(tt("settings.overlay.preset.yellow", "Yellow  #F4E38A"), "#F4E38A")
+        };
     }
 
     private void installOverlayThemeTracking(JTextField field) {
@@ -2206,6 +2548,128 @@ public class MobMateSettingsFrame extends JDialog {
         }
     }
 
+    private void updateTtsPrimaryVoiceChoices() {
+        if (ttsPrimaryVoiceCombo == null) return;
+        String engine = selectedValue(ttsEngineCombo);
+        if (engine == null || engine.isBlank()) engine = "auto";
+        final String engineValue = engine;
+        withSyncingTtsControls(() -> {
+            ttsPrimaryVoiceCombo.removeAllItems();
+            for (String voice : app.getSimpleTtsVoiceChoices(engineValue)) {
+                ttsPrimaryVoiceCombo.addItem(voice);
+            }
+            ttsPrimaryVoiceCombo.setRenderer(new DefaultListCellRenderer() {
+                @Override
+                public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
+                    super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                    setText(displaySettingsVoiceLabel(engineValue, value == null ? "auto" : value.toString()));
+                    return this;
+                }
+            });
+            ttsPrimaryVoiceCombo.setSelectedItem(app.getSelectedSimpleTtsVoice(engineValue));
+            if (ttsPrimaryVoiceCombo.getSelectedItem() == null && ttsPrimaryVoiceCombo.getItemCount() > 0) {
+                ttsPrimaryVoiceCombo.setSelectedIndex(0);
+            }
+        });
+    }
+
+    private void refreshPrimaryVoiceSelectionFromDetailed() {
+        if (ttsPrimaryVoiceCombo == null) return;
+        String engine = selectedValue(ttsEngineCombo);
+        if (engine == null || engine.isBlank()) engine = "auto";
+        String selected = switch (engine.toLowerCase(Locale.ROOT)) {
+            case "voicevox" -> Objects.toString(voicevoxSpeakerCombo.getSelectedItem(), app.getSelectedSimpleTtsVoice(engine));
+            case "windows" -> Objects.toString(windowsVoiceCombo.getSelectedItem(), app.getSelectedSimpleTtsVoice(engine));
+            case "piper_plus" -> selectedPiperPlusModelId().isBlank() ? "auto" : selectedPiperPlusModelId();
+            case "voiceger_tts", "voiceger" -> {
+                String value = selectedValue(voicegerLangCombo);
+                yield (value == null || value.isBlank()) ? "auto" : value;
+            }
+            default -> "auto";
+        };
+        selectStringComboValue(ttsPrimaryVoiceCombo, selected, "auto");
+    }
+
+    private void syncDetailedTtsSelectionFromPrimary() {
+        if (ttsPrimaryVoiceCombo == null) return;
+        if (ttsPrimaryVoiceCombo.getSelectedItem() == null) return;
+        String engine = selectedValue(ttsEngineCombo);
+        if (engine == null || engine.isBlank()) engine = "auto";
+        String value = Objects.toString(ttsPrimaryVoiceCombo.getSelectedItem(), "auto");
+        final String engineValue = engine;
+        withSyncingTtsControls(() -> {
+            switch (engineValue.toLowerCase(Locale.ROOT)) {
+                case "voicevox" -> selectStringComboValue(voicevoxSpeakerCombo, value, "auto");
+                case "windows" -> selectStringComboValue(windowsVoiceCombo, value, "auto");
+                case "piper_plus" -> {
+                    if ("auto".equalsIgnoreCase(value)) {
+                        if (piperPlusModelCombo.getItemCount() > 0) piperPlusModelCombo.setSelectedIndex(0);
+                    } else {
+                        PiperPlusCatalog.Entry entry = PiperPlusCatalog.findById(value);
+                        selectStringComboValue(
+                                piperPlusModelCombo,
+                                entry != null ? entry.comboLabel() : value,
+                                piperPlusModelCombo.getItemCount() > 0 ? Objects.toString(piperPlusModelCombo.getItemAt(0), "") : ""
+                        );
+                    }
+                }
+                case "voiceger_tts", "voiceger" -> selectChoice(voicegerLangCombo, "auto".equalsIgnoreCase(value) ? "all_ja" : value);
+                default -> {
+                }
+            }
+        });
+    }
+
+    private void withSyncingTtsControls(Runnable task) {
+        boolean old = syncingTtsControls;
+        syncingTtsControls = true;
+        try {
+            task.run();
+        } finally {
+            syncingTtsControls = old;
+        }
+    }
+
+    private String displaySettingsTtsEngine(Object value) {
+        String raw = value instanceof Choice<?> choice
+                ? Objects.toString(choice.value, "auto")
+                : Objects.toString(value, "auto");
+        return switch (raw.toLowerCase(Locale.ROOT)) {
+            case "voicevox" -> "VOICEVOX";
+            case "windows" -> "Windows";
+            case "piper_plus" -> "Piper+";
+            case "voiceger_tts" -> "Voiceger";
+            case "voiceger_vc" -> "Voiceger (VC)";
+            case "xtts" -> "XTTS";
+            default -> tt("common.auto", "Auto");
+        };
+    }
+
+    private String displaySettingsVoiceLabel(String engine, String value) {
+        if ("voicevox".equalsIgnoreCase(engine)) {
+            return "auto".equalsIgnoreCase(value) ? tt("common.auto", "Auto") : value;
+        }
+        if ("windows".equalsIgnoreCase(engine)) {
+            return "auto".equalsIgnoreCase(value) ? tt("common.auto", "Auto") : value;
+        }
+        if ("piper_plus".equalsIgnoreCase(engine)) {
+            if ("auto".equalsIgnoreCase(value)) return tt("common.auto", "Auto");
+            PiperPlusCatalog.Entry entry = PiperPlusCatalog.findById(value);
+            return entry != null ? entry.comboLabel() : value;
+        }
+        if ("voiceger_tts".equalsIgnoreCase(engine) || "voiceger".equalsIgnoreCase(engine)) {
+            return switch (value.toLowerCase(Locale.ROOT)) {
+                case "all_ja" -> tt("lang.japanese", "Japanese");
+                case "en" -> tt("lang.english", "English");
+                case "all_zh" -> tt("lang.chinese", "Chinese");
+                case "all_ko" -> tt("lang.korean", "Korean");
+                case "all_yue" -> tt("lang.cantonese", "Cantonese");
+                default -> "auto".equalsIgnoreCase(value) ? tt("common.auto", "Auto") : value;
+            };
+        }
+        return tt("common.auto", "Auto");
+    }
+
     private FormRow addTrackedRow(JPanel form, int row, String label, Component comp) {
         GridBagConstraints lc = new GridBagConstraints();
         lc.gridx = 0;
@@ -2215,8 +2679,7 @@ public class MobMateSettingsFrame extends JDialog {
         lc.fill = GridBagConstraints.HORIZONTAL;
         lc.weightx = 0.0;
 
-        JLabel l = new JLabel(label == null ? "" : label);
-        l.setPreferredSize(new Dimension(180, 26));
+        JComponent l = createRowLabel(label == null ? "" : label, false);
         form.add(l, lc);
 
         GridBagConstraints cc = new GridBagConstraints();
@@ -2226,8 +2689,56 @@ public class MobMateSettingsFrame extends JDialog {
         cc.anchor = GridBagConstraints.NORTHWEST;
         cc.fill = GridBagConstraints.HORIZONTAL;
         cc.weightx = 1.0;
-        form.add(comp, cc);
-        return new FormRow(l, comp);
+        Component rowComponent = adaptSettingsFieldComponent(comp, false);
+        form.add(rowComponent, cc);
+        return new FormRow(l, rowComponent);
+    }
+
+    private Component adaptSettingsFieldComponent(Component comp, boolean large) {
+        if (!(comp instanceof JComponent jc)) return comp;
+        if (large) {
+            if (jc instanceof JScrollPane || jc instanceof JTextArea || jc instanceof JPanel || jc instanceof JLabel) {
+                return new ResponsiveSingleFieldPanel(jc, 760, 220);
+            }
+            return comp;
+        }
+        if (jc instanceof JComboBox<?> || jc instanceof JTextField || jc instanceof JSpinner || jc instanceof JSlider
+                || jc instanceof JScrollPane || jc instanceof JTextArea || jc instanceof JButton || jc instanceof JPanel || jc instanceof JLabel) {
+            return new ResponsiveSingleFieldPanel(jc, 520, 150);
+        }
+        return comp;
+    }
+
+    private JComponent createRowLabel(String text, boolean large) {
+        JTextArea area = new JTextArea(text == null ? "" : text);
+        area.setOpaque(false);
+        area.setEditable(false);
+        area.setFocusable(false);
+        area.setLineWrap(true);
+        area.setWrapStyleWord(true);
+        area.setBorder(BorderFactory.createEmptyBorder());
+        area.setFont(UIManager.getFont("Label.font"));
+        area.setForeground(UIManager.getColor("Label.foreground"));
+        area.setPreferredSize(new Dimension(180, large ? 80 : 26));
+        area.setMinimumSize(new Dimension(120, large ? 48 : 26));
+        return area;
+    }
+
+    private JTextArea helperNote(String text) {
+        JTextArea area = new JTextArea(text == null ? "" : text);
+        area.setOpaque(false);
+        area.setEditable(false);
+        area.setFocusable(false);
+        area.setLineWrap(true);
+        area.setWrapStyleWord(true);
+        area.setBorder(BorderFactory.createEmptyBorder());
+        area.setFont(UIManager.getFont("Label.font"));
+        area.setForeground(Color.GRAY);
+        return area;
+    }
+
+    private JPanel createResponsiveDualFieldPanel(JComponent left, JComponent right) {
+        return new ResponsiveDualFieldPanel(left, right, 8, 170, 170, 300, 300);
     }
 
     private void setRowVisible(FormRow row, boolean visible) {
@@ -2248,10 +2759,10 @@ public class MobMateSettingsFrame extends JDialog {
     }
 
     private static final class FormRow {
-        final JLabel label;
+        final Component label;
         final Component component;
 
-        FormRow(JLabel label, Component component) {
+        FormRow(Component label, Component component) {
             this.label = label;
             this.component = component;
         }
@@ -2264,6 +2775,122 @@ public class MobMateSettingsFrame extends JDialog {
         void setEnabled(boolean enabled) {
             if (label != null) label.setEnabled(enabled);
             if (component != null) component.setEnabled(enabled);
+        }
+    }
+
+    private static final class ResponsiveSingleFieldPanel extends JPanel {
+        private final JComponent child;
+        private final int maxWidth;
+        private final int minWidth;
+
+        ResponsiveSingleFieldPanel(JComponent child, int maxWidth, int minWidth) {
+            super(null);
+            this.child = child;
+            this.maxWidth = maxWidth;
+            this.minWidth = minWidth;
+            setOpaque(false);
+            add(child);
+        }
+
+        @Override
+        public void doLayout() {
+            Dimension pref = child.getPreferredSize();
+            int h = Math.max(pref.height, getHeight());
+            int available = Math.max(0, getWidth());
+            int target = Math.min(maxWidth, available);
+            if (available > 0) {
+                target = Math.max(Math.min(minWidth, available), target);
+            } else {
+                target = Math.max(minWidth, Math.min(maxWidth, pref.width));
+            }
+            child.setBounds(0, 0, target, h);
+        }
+
+        @Override
+        public Dimension getPreferredSize() {
+            Dimension pref = child.getPreferredSize();
+            int width = Math.min(maxWidth, Math.max(minWidth, pref.width));
+            return new Dimension(width, pref.height);
+        }
+
+        @Override
+        public Dimension getMinimumSize() {
+            Dimension pref = child.getMinimumSize();
+            return new Dimension(Math.min(minWidth, Math.max(80, pref.width)), child.getPreferredSize().height);
+        }
+    }
+
+    private static final class ResponsiveDualFieldPanel extends JPanel {
+        private final JComponent left;
+        private final JComponent right;
+        private final int gap;
+        private final int leftMin;
+        private final int rightMin;
+        private final int leftMax;
+        private final int rightMax;
+
+        ResponsiveDualFieldPanel(JComponent left, JComponent right, int gap, int leftMin, int rightMin, int leftMax, int rightMax) {
+            super(null);
+            this.left = left;
+            this.right = right;
+            this.gap = gap;
+            this.leftMin = leftMin;
+            this.rightMin = rightMin;
+            this.leftMax = leftMax;
+            this.rightMax = rightMax;
+            setOpaque(false);
+            add(left);
+            add(right);
+        }
+
+        @Override
+        public void doLayout() {
+            int available = Math.max(0, getWidth());
+            int usable = Math.max(0, available - gap);
+            int half = usable / 2;
+            int leftWidth = Math.min(leftMax, Math.max(Math.min(leftMin, usable), half));
+            int rightWidth = Math.min(rightMax, Math.max(Math.min(rightMin, usable - leftWidth), usable - leftWidth));
+
+            if (leftWidth + rightWidth > usable) {
+                int overflow = leftWidth + rightWidth - usable;
+                if (rightWidth >= leftWidth) {
+                    rightWidth = Math.max(80, rightWidth - overflow);
+                } else {
+                    leftWidth = Math.max(80, leftWidth - overflow);
+                }
+            }
+
+            if (usable > 0 && leftWidth + rightWidth < usable) {
+                int extra = usable - (leftWidth + rightWidth);
+                int leftRoom = Math.max(0, leftMax - leftWidth);
+                int addLeft = Math.min(leftRoom, extra / 2);
+                leftWidth += addLeft;
+                extra -= addLeft;
+                int rightRoom = Math.max(0, rightMax - rightWidth);
+                int addRight = Math.min(rightRoom, extra);
+                rightWidth += addRight;
+            }
+
+            int height = Math.max(left.getPreferredSize().height, right.getPreferredSize().height);
+            int leftBoxWidth = Math.max(80, leftWidth);
+            int rightBoxWidth = Math.max(80, rightWidth);
+            left.setBounds(0, 0, leftBoxWidth, height);
+            right.setBounds(Math.min(Math.max(0, available - rightBoxWidth), leftBoxWidth + gap), 0, rightBoxWidth, height);
+        }
+
+        @Override
+        public Dimension getPreferredSize() {
+            int height = Math.max(left.getPreferredSize().height, right.getPreferredSize().height);
+            int width = Math.min(leftMax, Math.max(leftMin, left.getPreferredSize().width))
+                    + gap
+                    + Math.min(rightMax, Math.max(rightMin, right.getPreferredSize().width));
+            return new Dimension(width, height);
+        }
+
+        @Override
+        public Dimension getMinimumSize() {
+            int height = Math.max(left.getPreferredSize().height, right.getPreferredSize().height);
+            return new Dimension(Math.max(200, leftMin + gap + rightMin), height);
         }
     }
 }

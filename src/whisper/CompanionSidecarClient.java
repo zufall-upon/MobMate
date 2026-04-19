@@ -15,8 +15,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 final class CompanionSidecarClient implements AutoCloseable {
     private static final Duration CHAT_TIMEOUT = Duration.ofSeconds(30);
@@ -44,9 +48,27 @@ final class CompanionSidecarClient implements AutoCloseable {
     private Process process;
     private URI baseUri;
     private int port = -1;
+    private final AtomicBoolean runtimeAllowed = new AtomicBoolean(false);
 
     CompanionSidecarClient(MobMateWhisp host) {
         this.host = host;
+    }
+
+    void setRuntimeAllowed(boolean allowed) {
+        runtimeAllowed.set(allowed);
+    }
+
+    static void cleanupStaleRuntimeLlamaServers(Path exeDir, String reason) {
+        if (exeDir == null) {
+            return;
+        }
+        Path target = exeDir.resolve("mobecho")
+                .resolve("llamacpp")
+                .resolve("bin")
+                .resolve("llama-server.exe")
+                .toAbsolutePath()
+                .normalize();
+        cleanupMatchingRuntimeLlamaServers(target, reason);
     }
 
     synchronized boolean isInstalled() {
@@ -159,6 +181,9 @@ final class CompanionSidecarClient implements AutoCloseable {
     }
 
     synchronized void ensureStarted() throws IOException, InterruptedException {
+        if (!runtimeAllowed.get()) {
+            throw new IOException("MobEcho runtime disabled while window hidden");
+        }
         File runtimeDir = getRuntimeDir();
         File jarFile = getJarFile();
         if (!isInstalled()) {
@@ -170,6 +195,7 @@ final class CompanionSidecarClient implements AutoCloseable {
         }
 
         stopProcessLocked();
+        cleanupRuntimeLlamaServerProcesses("before_start");
         port = pickFreePort();
         baseUri = URI.create("http://127.0.0.1:" + port);
         Files.createDirectories(runtimeDir.toPath().resolve("logs"));
@@ -302,7 +328,76 @@ final class CompanionSidecarClient implements AutoCloseable {
             } catch (Exception ignore) {
             } finally {
                 terminateDescendants(descendants);
+                cleanupRuntimeLlamaServerProcesses("after_stop");
             }
+        }
+    }
+
+    private void cleanupRuntimeLlamaServerProcesses(String reason) {
+        Path target = getRuntimeDir().toPath()
+                .resolve("llamacpp")
+                .resolve("bin")
+                .resolve("llama-server.exe")
+                .toAbsolutePath()
+                .normalize();
+        cleanupMatchingRuntimeLlamaServers(target, reason);
+    }
+
+    private static void cleanupMatchingRuntimeLlamaServers(Path target, String reason) {
+        if (target == null) {
+            return;
+        }
+        List<ProcessHandle> victims = new ArrayList<>();
+        for (ProcessHandle handle : ProcessHandle.allProcesses().toList()) {
+            try {
+                if (matchesExecutable(handle, target)) {
+                    victims.add(handle);
+                }
+            } catch (Throwable ignore) {
+            }
+        }
+        if (victims.isEmpty()) {
+            return;
+        }
+        System.out.println("[Companion][MobEcho] stale_llama_sweep reason=" + reason
+                + " count=" + victims.size());
+        for (ProcessHandle handle : victims) {
+            try {
+                if (handle.isAlive()) {
+                    handle.destroy();
+                }
+            } catch (Throwable ignore) {
+            }
+        }
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(900L);
+        for (ProcessHandle handle : victims) {
+            try {
+                while (handle.isAlive() && System.nanoTime() < deadline) {
+                    Thread.sleep(40L);
+                }
+                if (handle.isAlive()) {
+                    handle.destroyForcibly();
+                }
+            } catch (Throwable ignore) {
+            }
+        }
+    }
+
+    private static boolean matchesExecutable(ProcessHandle handle, Path target) {
+        if (handle == null || target == null || !handle.isAlive()) {
+            return false;
+        }
+        Optional<String> commandOpt = handle.info().command();
+        if (commandOpt.isEmpty() || commandOpt.get().isBlank()) {
+            return false;
+        }
+        try {
+            Path commandPath = Path.of(commandOpt.get()).toAbsolutePath().normalize();
+            return commandPath.toString().equalsIgnoreCase(target.toString());
+        } catch (Exception ex) {
+            String command = commandOpt.get().trim().toLowerCase(Locale.ROOT).replace('/', '\\');
+            return command.endsWith("\\mobecho\\llamacpp\\bin\\llama-server.exe")
+                    || command.endsWith("\\llamacpp\\bin\\llama-server.exe");
         }
     }
 

@@ -3,6 +3,7 @@ package whisper;
 import com.sun.jna.*;
 import com.sun.jna.ptr.PointerByReference;
 import java.util.function.Consumer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
@@ -40,10 +41,18 @@ public class LocalMoonshineSTT {
     private static final int LINE_OFF_WORDS            = 64;  // transcript_word_t* (8)
     private static final int LINE_OFF_WORD_COUNT       = 72;  // uint64_t            (8)
     private static final int LINE_SIZE                 = 80;  // total
+    // transcript_word_t の手動オフセット (64-bit Windows MSVC)
+    // const char* + float + float + float + 4 bytes padding = 24 bytes
+    private static final int WORD_OFF_TEXT             = 0;   // const char* (8)
+    private static final int WORD_OFF_START            = 8;   // float       (4)
+    private static final int WORD_OFF_END              = 12;  // float       (4)
+    private static final int WORD_OFF_CONFIDENCE       = 16;  // float       (4)
+    private static final int WORD_SIZE                 = 24;  // total
 
     // transcript_t のオフセット
     private static final int TX_OFF_LINES      = 0;  // transcript_line_t* (8)
     private static final int TX_OFF_LINE_COUNT = 8;  // uint64_t           (8)
+    private static final int WORD_TIMESTAMP_DIAG_BUDGET = 12;
 
     // ---- JNA インターフェース ----
     public interface MoonshineLib extends Library {
@@ -74,6 +83,9 @@ public class LocalMoonshineSTT {
         int  moonshine_transcribe_stream(
                 int handle, int stream,
                 int flags, PointerByReference out);
+        int  moonshine_transcribe_without_streaming(
+                int handle, float[] data, long length,
+                int sampleRate, int flags, PointerByReference out);
     }
 
     // ★Moonshine公式 options 用
@@ -91,6 +103,47 @@ public class LocalMoonshineSTT {
     private double vadWindowDuration = 0.15;      // default 0.5 → 短発話向けに短縮
     private int    vadLookBehindSamples = 20000;  // default 8192 → 文頭救済を増やす
     private double vadThreshold = 0.30;           // default 0.5 → 少し感度を上げる
+    private boolean wordTimestampsEnabled = true;
+
+    public static final class OneShotWordTiming {
+        public final String text;
+        public final float startSec;
+        public final float endSec;
+        public final float confidence;
+
+        OneShotWordTiming(String text, float startSec, float endSec, float confidence) {
+            this.text = text == null ? "" : text;
+            this.startSec = startSec;
+            this.endSec = endSec;
+            this.confidence = confidence;
+        }
+    }
+    public static final class OneShotTranscriptResult {
+        public static final OneShotTranscriptResult EMPTY =
+                new OneShotTranscriptResult("", Float.NaN, 0, -1, java.util.Collections.emptyList());
+
+        public final String text;
+        public final float lineConfidence;
+        public final int wordCount;
+        public final int latencyMs;
+        public final List<OneShotWordTiming> words;
+
+        OneShotTranscriptResult(String text,
+                                float lineConfidence,
+                                int wordCount,
+                                int latencyMs,
+                                List<OneShotWordTiming> words) {
+            this.text = text == null ? "" : text;
+            this.lineConfidence = lineConfidence;
+            this.wordCount = Math.max(0, wordCount);
+            this.latencyMs = latencyMs;
+            this.words = words == null ? java.util.Collections.emptyList() : words;
+        }
+
+        public boolean hasConfidence() {
+            return !Float.isNaN(lineConfidence) && lineConfidence >= 0.0f;
+        }
+    }
 
     public void setVadWindowDuration(double sec) {
         this.vadWindowDuration = Math.max(0.05, Math.min(1.00, sec));
@@ -103,7 +156,7 @@ public class LocalMoonshineSTT {
     }
 
     private TranscriberOption[] buildLoadOptions() {
-        TranscriberOption[] opts = (TranscriberOption[]) new TranscriberOption().toArray(3);
+        TranscriberOption[] opts = (TranscriberOption[]) new TranscriberOption().toArray(4);
 
         opts[0].name  = "vad_window_duration";
         opts[0].value = String.format(Locale.ROOT, "%.3f", vadWindowDuration);
@@ -113,6 +166,9 @@ public class LocalMoonshineSTT {
 
         opts[2].name  = "vad_threshold";
         opts[2].value = String.format(Locale.ROOT, "%.3f", vadThreshold);
+
+        opts[3].name  = "word_timestamps";
+        opts[3].value = wordTimestampsEnabled ? "true" : "false";
 
         for (TranscriberOption opt : opts) {
             opt.write();
@@ -138,6 +194,7 @@ public class LocalMoonshineSTT {
     // ★v1.5.0: Whisperから移植可能な設定値
     private int pollIntervalMs = 500;     // ポーリング間隔(ms)
     private int numThreads     = -1;      // スレッド数(-1=auto)
+    private int wordTimestampDiagBudget = WORD_TIMESTAMP_DIAG_BUDGET;
 
     //** ポーリング間隔を設定（50-2000ms）。推論レイテンシの都合上150ms未満は空振りが増える */
     public void setPollInterval(int ms) {
@@ -200,7 +257,8 @@ public class LocalMoonshineSTT {
             Config.log("[Moonshine] load options:"
                     + " vad_window_duration=" + vadWindowDuration
                     + ", vad_look_behind_sample_count=" + vadLookBehindSamples
-                    + ", vad_threshold=" + vadThreshold);
+                    + ", vad_threshold=" + vadThreshold
+                    + ", word_timestamps=" + wordTimestampsEnabled);
 
             int transcriberHandle = MoonshineLib.INSTANCE
                     .moonshine_load_transcriber_from_files(
@@ -538,12 +596,48 @@ public class LocalMoonshineSTT {
     private void injectTailSilencePadding() {
         injectTailSilencePaddingMs(300);
     }
+    private static final class OneShotDecodeOptions {
+        final int leadingPaddingMs;
+        final int tailPaddingMs;
+        final int passes;
+        final int settleSleepMs;
+        final boolean useWithoutStreaming;
+
+        OneShotDecodeOptions(int leadingPaddingMs, int tailPaddingMs, int passes, int settleSleepMs, boolean useWithoutStreaming) {
+            this.leadingPaddingMs = Math.max(50, Math.min(1000, leadingPaddingMs));
+            this.tailPaddingMs = Math.max(50, Math.min(1000, tailPaddingMs));
+            this.passes = Math.max(1, Math.min(4, passes));
+            this.settleSleepMs = Math.max(0, Math.min(120, settleSleepMs));
+            this.useWithoutStreaming = useWithoutStreaming;
+        }
+    }
+    private static final OneShotDecodeOptions DEFAULT_ONE_SHOT_OPTIONS =
+            new OneShotDecodeOptions(300, 300, 2, 35, false);
+    private static final OneShotDecodeOptions ACCURATE_ONE_SHOT_OPTIONS =
+            new OneShotDecodeOptions(300, 450, 3, 45, true);
     /**
      * ★Hearing用ワンショット推論: PCMを投入してストリームを即時フラッシュし結果を返す
      * onCompleted/onPartialコールバックは呼ばない（Hearing専用経路用）
      */
     public synchronized String transcribeOneShot(float[] pcmFloat) {
-        if (transcriber < 0 || pcmFloat == null || pcmFloat.length == 0) return "";
+        return transcribeOneShotDetailed(pcmFloat).text;
+    }
+    public synchronized String transcribeOneShotAccurate(float[] pcmFloat) {
+        return transcribeOneShotAccurateDetailed(pcmFloat).text;
+    }
+    public synchronized OneShotTranscriptResult transcribeOneShotDetailed(float[] pcmFloat) {
+        return transcribeOneShotInternal(pcmFloat, DEFAULT_ONE_SHOT_OPTIONS, "oneShot");
+    }
+    public synchronized OneShotTranscriptResult transcribeOneShotAccurateDetailed(float[] pcmFloat) {
+        return transcribeOneShotInternal(pcmFloat, ACCURATE_ONE_SHOT_OPTIONS, "oneShot+");
+    }
+    private OneShotTranscriptResult transcribeOneShotInternal(float[] pcmFloat,
+                                                              OneShotDecodeOptions options,
+                                                              String logTag) {
+        if (transcriber < 0 || pcmFloat == null || pcmFloat.length == 0) return OneShotTranscriptResult.EMPTY;
+        if (options.useWithoutStreaming) {
+            return transcribeOneShotWithoutStreaming(pcmFloat, options, logTag);
+        }
         try {
             if (stream >= 0) {
                 try { MoonshineLib.INSTANCE.moonshine_stop_stream(transcriber, stream); } catch (Error ignore) {}
@@ -552,25 +646,25 @@ public class LocalMoonshineSTT {
             }
 
             stream = MoonshineLib.INSTANCE.moonshine_create_stream(transcriber, 0);
-            if (stream < 0) return "";
+            if (stream < 0) return OneShotTranscriptResult.EMPTY;
             lastCompletedCount = 0;
 
             int err = MoonshineLib.INSTANCE.moonshine_start_stream(transcriber, stream);
             if (err != 0) {
                 stream = -1;
-                return "";
+                return OneShotTranscriptResult.EMPTY;
             }
 
-            injectSilencePaddingMs(300);
+            injectSilencePaddingMs(options.leadingPaddingMs);
             MoonshineLib.INSTANCE.moonshine_transcribe_add_audio_to_stream(
                     transcriber, stream, pcmFloat, (long) pcmFloat.length, 16000, 0);
-            injectTailSilencePaddingMs(300);
+            injectTailSilencePaddingMs(options.tailPaddingMs);
 
-            String best = null;
-            for (int pass = 0; pass < 2; pass++) {
+            OneShotTranscriptResult best = null;
+            for (int pass = 0; pass < options.passes; pass++) {
                 if (pass > 0) {
                     try {
-                        Thread.sleep(35);
+                        Thread.sleep(options.settleSleepMs);
                     } catch (InterruptedException ie) {
                         Thread.currentThread().interrupt();
                     }
@@ -589,22 +683,180 @@ public class LocalMoonshineSTT {
 
                 for (long i = 0; i < lineCount; i++) {
                     long base = i * LINE_SIZE;
-                    Pointer pText = pLines.getPointer(base + LINE_OFF_TEXT);
-                    if (pText == null) continue;
-                    try {
-                        String text = pText.getString(0, "UTF-8").trim();
-                        if (!text.isEmpty()) best = text;
-                    } catch (Error ignore) {}
+                    OneShotTranscriptResult line = readOneShotTranscriptLine(pLines, base);
+                    if (!line.text.isEmpty()) best = line;
                 }
                 if (best != null) break;
             }
 
-            Config.logDebug("[Moonshine][Hearing] oneShot: " + best);
-            return (best != null) ? best : "";
+            Config.logDebug("[Moonshine][Hearing] " + logTag + ": "
+                    + (best == null ? "null" : best.text)
+                    + (best != null && best.wordCount > 0
+                    ? " words=" + best.wordCount
+                    + (best.hasConfidence()
+                    ? " conf=" + String.format(Locale.ROOT, "%.3f", best.lineConfidence)
+                    : " conf=NA")
+                    : ""));
+            return (best != null) ? best : OneShotTranscriptResult.EMPTY;
         } catch (Error e) {
-            Config.logDebug("[Moonshine][Hearing] transcribeOneShot ERROR: " + e.getMessage());
-            return "";
+            Config.logDebug("[Moonshine][Hearing] " + logTag + " ERROR: " + e.getMessage());
+            return OneShotTranscriptResult.EMPTY;
         }
+    }
+    private OneShotTranscriptResult transcribeOneShotWithoutStreaming(float[] pcmFloat,
+                                                                      OneShotDecodeOptions options,
+                                                                      String logTag) {
+        if (transcriber < 0 || pcmFloat == null || pcmFloat.length == 0) return OneShotTranscriptResult.EMPTY;
+        try {
+            int leadingSamples = Math.max(160, (16000 * options.leadingPaddingMs) / 1000);
+            int tailSamples = Math.max(160, (16000 * options.tailPaddingMs) / 1000);
+            float[] padded = new float[leadingSamples + pcmFloat.length + tailSamples];
+            System.arraycopy(pcmFloat, 0, padded, leadingSamples, pcmFloat.length);
+            PointerByReference pRef = new PointerByReference();
+            int err = MoonshineLib.INSTANCE.moonshine_transcribe_without_streaming(
+                    transcriber, padded, (long) padded.length, 16000, 0, pRef);
+            if (err != 0) {
+                Config.logDebug("[Moonshine][Hearing] " + logTag + " without_streaming err=" + err);
+                return OneShotTranscriptResult.EMPTY;
+            }
+            OneShotTranscriptResult best = readBestTranscriptResult(pRef.getValue(), logTag + " without_streaming");
+            Config.logDebug("[Moonshine][Hearing] " + logTag + " without_streaming: "
+                    + (best.text.isEmpty() ? "null" : best.text)
+                    + (best.wordCount > 0
+                    ? " words=" + best.wordCount
+                    + (best.hasConfidence()
+                    ? " conf=" + String.format(Locale.ROOT, "%.3f", best.lineConfidence)
+                    : " conf=NA")
+                    : ""));
+            return best;
+        } catch (Error e) {
+            Config.logDebug("[Moonshine][Hearing] " + logTag + " without_streaming ERROR: " + e.getMessage());
+            return OneShotTranscriptResult.EMPTY;
+        }
+    }
+    private OneShotTranscriptResult readBestTranscriptResult(Pointer pTx, String debugContext) {
+        if (pTx == null) return OneShotTranscriptResult.EMPTY;
+        Pointer pLines = pTx.getPointer(TX_OFF_LINES);
+        long lineCount = pTx.getLong(TX_OFF_LINE_COUNT);
+        if (pLines == null || lineCount <= 0) return OneShotTranscriptResult.EMPTY;
+        OneShotTranscriptResult best = OneShotTranscriptResult.EMPTY;
+        for (long i = 0; i < lineCount; i++) {
+            long base = i * LINE_SIZE;
+            OneShotTranscriptResult line = readOneShotTranscriptLine(pTx, pLines, base, debugContext);
+            if (!line.text.isEmpty()) best = line;
+        }
+        return best;
+    }
+    private OneShotTranscriptResult readOneShotTranscriptLine(Pointer pLines, long base) {
+        return readOneShotTranscriptLine(null, pLines, base, null);
+    }
+    private OneShotTranscriptResult readOneShotTranscriptLine(Pointer pTx, Pointer pLines, long base, String debugContext) {
+        Pointer pText = pLines.getPointer(base + LINE_OFF_TEXT);
+        if (pText == null) return OneShotTranscriptResult.EMPTY;
+        String text;
+        try {
+            text = pText.getString(0, "UTF-8").trim();
+        } catch (Error ignore) {
+            return OneShotTranscriptResult.EMPTY;
+        }
+        if (text.isEmpty()) return OneShotTranscriptResult.EMPTY;
+        int latencyMs = pLines.getInt(base + LINE_OFF_LATENCY_MS);
+        Pointer pWords = pLines.getPointer(base + LINE_OFF_WORDS);
+        long rawWordCount = pLines.getLong(base + LINE_OFF_WORD_COUNT);
+        long rawWordCount32 = Integer.toUnsignedLong(pLines.getInt(base + LINE_OFF_WORD_COUNT));
+        int wordCount = normalizeWordCount(rawWordCount);
+        if (wordCount == 0 && rawWordCount32 > 0L && rawWordCount32 <= 4096L) {
+            wordCount = (int) rawWordCount32;
+        }
+        ArrayList<OneShotWordTiming> words = new ArrayList<>();
+        float lineConfidence = Float.NaN;
+        if (pWords != null && wordCount > 0) {
+            double weightedConfidence = 0.0d;
+            double totalWeight = 0.0d;
+            for (int wi = 0; wi < wordCount; wi++) {
+                long wordBase = (long) wi * WORD_SIZE;
+                Pointer pWordText = pWords.getPointer(wordBase + WORD_OFF_TEXT);
+                String wordText = "";
+                if (pWordText != null) {
+                    try {
+                        wordText = pWordText.getString(0, "UTF-8").trim();
+                    } catch (Error ignore) {
+                        wordText = "";
+                    }
+                }
+                float startSec = pWords.getFloat(wordBase + WORD_OFF_START);
+                float endSec = pWords.getFloat(wordBase + WORD_OFF_END);
+                float confidence = pWords.getFloat(wordBase + WORD_OFF_CONFIDENCE);
+                words.add(new OneShotWordTiming(wordText, startSec, endSec, confidence));
+                if (confidence >= 0.0f && confidence <= 1.0f) {
+                    double durationWeight = Math.max(0.02d, Math.min(1.25d, endSec - startSec));
+                    weightedConfidence += confidence * durationWeight;
+                    totalWeight += durationWeight;
+                }
+            }
+            if (totalWeight > 0.0d) {
+                lineConfidence = (float) (weightedConfidence / totalWeight);
+            }
+        } else if (pTx != null && wordTimestampDiagBudget > 0 && !text.isEmpty()) {
+            logWordTimestampDiagnostic(debugContext, pTx, pLines, base, text, latencyMs, pWords, rawWordCount, rawWordCount32);
+        }
+        return new OneShotTranscriptResult(text, lineConfidence, wordCount, latencyMs, words);
+    }
+    private int normalizeWordCount(long rawWordCount) {
+        return (rawWordCount <= 0L || rawWordCount > 4096L) ? 0 : (int) rawWordCount;
+    }
+    private void logWordTimestampDiagnostic(String debugContext,
+                                            Pointer pTx,
+                                            Pointer pLines,
+                                            long base,
+                                            String text,
+                                            int latencyMs,
+                                            Pointer pWords,
+                                            long rawWordCount,
+                                            long rawWordCount32) {
+        if (!Config.getBool("log.debug", false)) return;
+        wordTimestampDiagBudget--;
+        String transcriptDump = "";
+        try {
+            transcriptDump = MoonshineLib.INSTANCE.moonshine_transcript_to_string(pTx);
+        } catch (Error ignore) {
+            transcriptDump = "";
+        }
+        String lineHex = "";
+        try {
+            lineHex = bytesToHex(pLines.getByteArray(base, LINE_SIZE), LINE_SIZE);
+        } catch (Error ignore) {
+            lineHex = "";
+        }
+        Config.logDebug("[Moonshine][Diag] "
+                + (debugContext == null ? "oneShot" : debugContext)
+                + " no word data: text=" + shortenForLog(text, 80)
+                + " latency=" + latencyMs
+                + " pWords=" + formatPointer(pWords)
+                + " rawWordCount64=" + rawWordCount
+                + " rawWordCount32=" + rawWordCount32
+                + (transcriptDump == null || transcriptDump.isBlank() ? "" : " tx=" + shortenForLog(transcriptDump, 220))
+                + (lineHex.isBlank() ? "" : " lineHex=" + lineHex));
+    }
+    private static String formatPointer(Pointer ptr) {
+        if (ptr == null) return "null";
+        return "0x" + Long.toUnsignedString(Pointer.nativeValue(ptr), 16);
+    }
+    private static String shortenForLog(String text, int maxLen) {
+        if (text == null) return "";
+        String normalized = text.replace("\r", " ").replace("\n", " ").trim();
+        if (normalized.length() <= maxLen) return normalized;
+        return normalized.substring(0, Math.max(0, maxLen - 3)) + "...";
+    }
+    private static String bytesToHex(byte[] bytes, int maxBytes) {
+        if (bytes == null || bytes.length == 0 || maxBytes <= 0) return "";
+        int limit = Math.min(bytes.length, maxBytes);
+        StringBuilder sb = new StringBuilder(limit * 3);
+        for (int i = 0; i < limit; i++) {
+            if (i > 0) sb.append(' ');
+            sb.append(String.format(Locale.ROOT, "%02x", bytes[i] & 0xff));
+        }
+        return sb.toString();
     }
     // reset直前に pending transcript を1回だけ吸い上げる
     private void flushPendingTranscriptOnce() {

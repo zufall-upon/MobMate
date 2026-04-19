@@ -45,6 +45,13 @@ public class SpeakerProfile {
     private int consecutiveRejects = 0;
     private static final int RESCUE_REJECT_THRESHOLD = 15; // 15連続REJECTで救済発動
     private static final double RESCUE_SCORE_MIN = 0.35;   // この以上なら「近い声」とみなす
+    private transient boolean loadedFromFile;
+    private transient boolean sessionEverPassed;
+    private transient boolean staleSessionBypass;
+    private transient int sessionRejectCount;
+    private static final int STALE_SESSION_REJECT_THRESHOLD = 6;
+    private static final double STALE_SESSION_MAX_SCORE = 0.22;
+    private static final double STALE_SESSION_MIN_VOICED_MS = 700.0;
 
     private final List<double[]> enrolledFeatures = new ArrayList<>();
     private static final double MIN_RMS_FOR_SPEAKER_CHECK = 800.0;
@@ -65,6 +72,10 @@ public class SpeakerProfile {
         this.totalRejected = 0;
         this.avgFeature = null;
         this.enrollmentSpread = 1.0;
+        this.loadedFromFile = false;
+        this.sessionEverPassed = false;
+        this.staleSessionBypass = false;
+        this.sessionRejectCount = 0;
     }
 
     public synchronized void updateSettings(int requiredSamples, double initialThreshold, double targetThreshold) {
@@ -231,6 +242,9 @@ public class SpeakerProfile {
         }
 
         totalAccepted++;
+        sessionEverPassed = true;
+        sessionRejectCount = 0;
+        staleSessionBypass = false;
 
         double progress = Math.min(1.0, totalAccepted / 20.0);
         threshold = initialThreshold + (targetThreshold - initialThreshold) * progress;
@@ -246,6 +260,12 @@ public class SpeakerProfile {
         threshold = initialThreshold;
         enrollmentSpread = 1.0;
         enrolledFeatures.clear();
+        centroids.clear();
+        consecutiveRejects = 0;
+        loadedFromFile = false;
+        sessionEverPassed = false;
+        staleSessionBypass = false;
+        sessionRejectCount = 0;
     }
 
     // ===================================================================
@@ -543,6 +563,11 @@ public class SpeakerProfile {
                 for (int j = 0; j < FEATURE_DIM; j++) c[j] = dis.readDouble();
                 centroids.add(c);
             }
+            consecutiveRejects = 0;
+            loadedFromFile = true;
+            sessionEverPassed = false;
+            staleSessionBypass = false;
+            sessionRejectCount = 0;
             Config.logDebug(String.format("★Speaker loaded: enroll=%d ok=%d thr=%.3f spread=%.3f",
                     enrollCount, totalAccepted, threshold, enrollmentSpread));
             return true;
@@ -552,9 +577,14 @@ public class SpeakerProfile {
         }
     }
 
+    public synchronized boolean isLikelyStaleSession() {
+        return staleSessionBypass;
+    }
+
     public synchronized boolean isMatchingSpeaker(byte[] pcm16le) {
         if (!isReady()) return true;
         if (pcm16le == null || pcm16le.length < FFT_SIZE * 2) return false;
+        if (staleSessionBypass) return true;
 
         byte[] voiced = trimSilentTail(pcm16le);
         if (voiced.length < FFT_SIZE * 2) {
@@ -587,6 +617,7 @@ public class SpeakerProfile {
                 Config.logDebug(String.format("★Speaker: ENERGY_REJECT score=%.3f thr=%.3f rms=%.1f window=%.1f voicedMs=%.0f < %.1f",
                         score, effectiveThreshold, rms, windowRms, voicedMs, MIN_RMS_FOR_SPEAKER_CHECK));
                 totalRejected++;
+                sessionRejectCount++;
                 return false;
             }
             consecutiveRejects = 0;
@@ -601,14 +632,34 @@ public class SpeakerProfile {
 
         if (match) {
             consecutiveRejects = 0;
+            sessionEverPassed = true;
+            sessionRejectCount = 0;
         } else {
             consecutiveRejects++;
+            sessionRejectCount++;
             if (consecutiveRejects >= RESCUE_REJECT_THRESHOLD && score >= RESCUE_SCORE_MIN) {
                 match = true;
                 consecutiveRejects = 0;
+                sessionEverPassed = true;
+                sessionRejectCount = 0;
                 Config.logDebug(String.format("★Speaker: RESCUE PASS (consec=%d score=%.3f)",
                         RESCUE_REJECT_THRESHOLD, score));
             }
+        }
+
+        if (!match
+                && loadedFromFile
+                && !sessionEverPassed
+                && sessionRejectCount >= STALE_SESSION_REJECT_THRESHOLD
+                && effectiveRms >= MIN_RMS_FOR_SPEAKER_CHECK
+                && voicedMs >= STALE_SESSION_MIN_VOICED_MS
+                && score <= STALE_SESSION_MAX_SCORE) {
+            staleSessionBypass = true;
+            consecutiveRejects = 0;
+            sessionRejectCount = 0;
+            Config.log(String.format("★Speaker: STALE_SESSION_BYPASS score=%.3f thr=%.3f rms=%.1f window=%.1f voicedMs=%.0f",
+                    score, effectiveThreshold, rms, windowRms, voicedMs));
+            return true;
         }
 
         Config.logDebug(String.format("★Speaker: score=%.3f thr=%.3f spread=%.3f rms=%.1f window=%.1f %s (ok=%d ng=%d)",
