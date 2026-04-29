@@ -2,6 +2,7 @@ package whisper;
 
 import com.sun.jna.*;
 import com.sun.jna.ptr.PointerByReference;
+import java.io.File;
 import java.util.function.Consumer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -53,6 +54,10 @@ public class LocalMoonshineSTT {
     private static final int TX_OFF_LINES      = 0;  // transcript_line_t* (8)
     private static final int TX_OFF_LINE_COUNT = 8;  // uint64_t           (8)
     private static final int WORD_TIMESTAMP_DIAG_BUDGET = 12;
+    private static final String[] WORD_TIMESTAMP_NON_STREAMING_FILES =
+            new String[] { "decoder_with_attention.ort", "alignment_model.ort" };
+    private static final String[] WORD_TIMESTAMP_STREAMING_FILES =
+            new String[] { "decoder_kv_with_attention.ort" };
 
     // ---- JNA インターフェース ----
     public interface MoonshineLib extends Library {
@@ -103,7 +108,10 @@ public class LocalMoonshineSTT {
     private double vadWindowDuration = 0.15;      // default 0.5 → 短発話向けに短縮
     private int    vadLookBehindSamples = 20000;  // default 8192 → 文頭救済を増やす
     private double vadThreshold = 0.30;           // default 0.5 → 少し感度を上げる
+    private double maxTokensPerSecond = 6.5;      // Moonshine default. Non-English can need a higher cap.
     private boolean wordTimestampsEnabled = true;
+    private boolean effectiveWordTimestampsEnabled = true;
+    private String wordTimestampCapabilityLog = "";
 
     public static final class OneShotWordTiming {
         public final String text;
@@ -144,6 +152,25 @@ public class LocalMoonshineSTT {
             return !Float.isNaN(lineConfidence) && lineConfidence >= 0.0f;
         }
     }
+    private static final class WordTimestampCapability {
+        final boolean available;
+        final boolean streamingArch;
+        final String matchedFile;
+        final String expectedFilesLabel;
+        final String reason;
+
+        WordTimestampCapability(boolean available,
+                                boolean streamingArch,
+                                String matchedFile,
+                                String expectedFilesLabel,
+                                String reason) {
+            this.available = available;
+            this.streamingArch = streamingArch;
+            this.matchedFile = matchedFile == null ? "" : matchedFile;
+            this.expectedFilesLabel = expectedFilesLabel == null ? "" : expectedFilesLabel;
+            this.reason = reason == null ? "" : reason;
+        }
+    }
 
     public void setVadWindowDuration(double sec) {
         this.vadWindowDuration = Math.max(0.05, Math.min(1.00, sec));
@@ -154,9 +181,12 @@ public class LocalMoonshineSTT {
     public void setVadThreshold(double threshold) {
         this.vadThreshold = Math.max(0.05, Math.min(0.95, threshold));
     }
+    public void setMaxTokensPerSecond(double tokensPerSecond) {
+        this.maxTokensPerSecond = Math.max(1.0, Math.min(30.0, tokensPerSecond));
+    }
 
     private TranscriberOption[] buildLoadOptions() {
-        TranscriberOption[] opts = (TranscriberOption[]) new TranscriberOption().toArray(4);
+        TranscriberOption[] opts = (TranscriberOption[]) new TranscriberOption().toArray(5);
 
         opts[0].name  = "vad_window_duration";
         opts[0].value = String.format(Locale.ROOT, "%.3f", vadWindowDuration);
@@ -168,7 +198,10 @@ public class LocalMoonshineSTT {
         opts[2].value = String.format(Locale.ROOT, "%.3f", vadThreshold);
 
         opts[3].name  = "word_timestamps";
-        opts[3].value = wordTimestampsEnabled ? "true" : "false";
+        opts[3].value = effectiveWordTimestampsEnabled ? "true" : "false";
+
+        opts[4].name = "max_tokens_per_second";
+        opts[4].value = String.format(Locale.ROOT, "%.3f", maxTokensPerSecond);
 
         for (TranscriberOption opt : opts) {
             opt.write();
@@ -229,6 +262,14 @@ public class LocalMoonshineSTT {
             Config.log("[Moonshine] ERROR: Directory not found: " + modelPath);
             return false;
         }
+        WordTimestampCapability wordTimestampCapability = resolveWordTimestampCapability(dir, arch);
+        effectiveWordTimestampsEnabled = wordTimestampsEnabled && wordTimestampCapability.available;
+        wordTimestampCapabilityLog = buildWordTimestampCapabilityLog(
+                dir, arch, wordTimestampCapability, wordTimestampsEnabled, effectiveWordTimestampsEnabled);
+        Config.log(wordTimestampCapabilityLog);
+        if (wordTimestampsEnabled && !wordTimestampCapability.available) {
+            Config.log("[Moonshine] WARNING: word confidence is unavailable for this model. " + wordTimestampCapability.reason);
+        }
 
         // ★ 対策2: システムの古い onnxruntime.dll を勝手に読み込んで自爆するのを防ぐため、
         // JNAが動く前に、明示的に横にある正しいDLLを絶対パスで「強制ロード」させるっす！
@@ -258,7 +299,9 @@ public class LocalMoonshineSTT {
                     + " vad_window_duration=" + vadWindowDuration
                     + ", vad_look_behind_sample_count=" + vadLookBehindSamples
                     + ", vad_threshold=" + vadThreshold
-                    + ", word_timestamps=" + wordTimestampsEnabled);
+                    + ", max_tokens_per_second=" + maxTokensPerSecond
+                    + ", word_timestamps_requested=" + wordTimestampsEnabled
+                    + ", word_timestamps_effective=" + effectiveWordTimestampsEnabled);
 
             int transcriberHandle = MoonshineLib.INSTANCE
                     .moonshine_load_transcriber_from_files(
@@ -458,7 +501,8 @@ public class LocalMoonshineSTT {
             Config.log("[Moonshine] reload options:"
                     + " vad_window_duration=" + vadWindowDuration
                     + ", vad_look_behind_sample_count=" + vadLookBehindSamples
-                    + ", vad_threshold=" + vadThreshold);
+                    + ", vad_threshold=" + vadThreshold
+                    + ", max_tokens_per_second=" + maxTokensPerSecond);
 
             int newHandle = MoonshineLib.INSTANCE
                     .moonshine_load_transcriber_from_files(
@@ -631,6 +675,18 @@ public class LocalMoonshineSTT {
     public synchronized OneShotTranscriptResult transcribeOneShotAccurateDetailed(float[] pcmFloat) {
         return transcribeOneShotInternal(pcmFloat, ACCURATE_ONE_SHOT_OPTIONS, "oneShot+");
     }
+    public synchronized OneShotTranscriptResult transcribeOneShotDetailed(float[] pcmFloat,
+                                                                          int leadingPaddingMs,
+                                                                          int tailPaddingMs,
+                                                                          int passes,
+                                                                          int settleSleepMs,
+                                                                          boolean useWithoutStreaming,
+                                                                          String logTag) {
+        OneShotDecodeOptions options = new OneShotDecodeOptions(
+                leadingPaddingMs, tailPaddingMs, passes, settleSleepMs, useWithoutStreaming);
+        String tag = (logTag == null || logTag.isBlank()) ? "oneShotCustom" : logTag.trim();
+        return transcribeOneShotInternal(pcmFloat, options, tag);
+    }
     private OneShotTranscriptResult transcribeOneShotInternal(float[] pcmFloat,
                                                               OneShotDecodeOptions options,
                                                               String logTag) {
@@ -797,10 +853,55 @@ public class LocalMoonshineSTT {
             if (totalWeight > 0.0d) {
                 lineConfidence = (float) (weightedConfidence / totalWeight);
             }
-        } else if (pTx != null && wordTimestampDiagBudget > 0 && !text.isEmpty()) {
+        } else if (effectiveWordTimestampsEnabled && pTx != null && wordTimestampDiagBudget > 0 && !text.isEmpty()) {
             logWordTimestampDiagnostic(debugContext, pTx, pLines, base, text, latencyMs, pWords, rawWordCount, rawWordCount32);
         }
         return new OneShotTranscriptResult(text, lineConfidence, wordCount, latencyMs, words);
+    }
+    private static boolean isStreamingArch(int arch) {
+        return arch == MOONSHINE_MODEL_ARCH_TINY_STREAMING
+                || arch == MOONSHINE_MODEL_ARCH_BASE_STREAMING
+                || arch == MOONSHINE_MODEL_ARCH_SMALL_STREAMING
+                || arch == MOONSHINE_MODEL_ARCH_MEDIUM_STREAMING;
+    }
+    private static WordTimestampCapability resolveWordTimestampCapability(File modelDir, int arch) {
+        boolean streamingArch = isStreamingArch(arch);
+        String[] expectedFiles = streamingArch
+                ? WORD_TIMESTAMP_STREAMING_FILES
+                : WORD_TIMESTAMP_NON_STREAMING_FILES;
+        String expectedFilesLabel = String.join(" or ", expectedFiles);
+        for (String expectedFile : expectedFiles) {
+            File candidate = new File(modelDir, expectedFile);
+            if (candidate.isFile()) {
+                return new WordTimestampCapability(
+                        true,
+                        streamingArch,
+                        expectedFile,
+                        expectedFilesLabel,
+                        "using " + expectedFile);
+            }
+        }
+        return new WordTimestampCapability(
+                false,
+                streamingArch,
+                "",
+                expectedFilesLabel,
+                "missing " + expectedFilesLabel + " in " + modelDir.getAbsolutePath());
+    }
+    private static String buildWordTimestampCapabilityLog(File modelDir,
+                                                          int arch,
+                                                          WordTimestampCapability capability,
+                                                          boolean requested,
+                                                          boolean effective) {
+        return "[Moonshine] word timestamp capability:"
+                + " arch=" + arch
+                + ", mode=" + (capability.streamingArch ? "streaming" : "non-streaming")
+                + ", requested=" + requested
+                + ", available=" + capability.available
+                + ", effective=" + effective
+                + ", expected=" + capability.expectedFilesLabel
+                + (capability.matchedFile.isEmpty() ? "" : ", matched=" + capability.matchedFile)
+                + ", modelDir=" + modelDir.getAbsolutePath();
     }
     private int normalizeWordCount(long rawWordCount) {
         return (rawWordCount <= 0L || rawWordCount > 4096L) ? 0 : (int) rawWordCount;

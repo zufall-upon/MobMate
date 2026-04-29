@@ -14,6 +14,7 @@ import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.net.URL;
@@ -39,6 +40,9 @@ import static whisper.VoicegerManager.checkVoicegerFiles;
 public class FirstLaunchWizard extends JDialog {
 
     private static final String DISCORD_INVITE_URL = "https://discord.gg/CkhYzNw7YF";
+    private static final String VOICEVOX_OFFICIAL_URL = "https://voicevox.hiroshiba.jp/";
+    private static final String VOICEVOX_RELEASE_API_URL = "https://api.github.com/repos/VOICEVOX/voicevox/releases/latest";
+    private static final String VOICEVOX_RELEASES_URL = "https://github.com/VOICEVOX/voicevox/releases/latest";
     private final MobMateWhisp mobmatewhisp;
     private boolean completed = false;
 
@@ -1004,6 +1008,16 @@ public class FirstLaunchWizard extends JDialog {
         rowApi.add(new JLabel(UiText.t("wizard.step3.apiLabel")), BorderLayout.WEST);
         rowApi.add(vvApiField, BorderLayout.CENTER);
 
+        // --- official installer row ---
+        JPanel rowInstaller = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
+        rowInstaller.setOpaque(false);
+        JButton gpuInstaller = new JButton(UiText.t("wizard.step3.gpuInstaller"));
+        JButton officialSite = new JButton(UiText.t("wizard.step3.officialSite"));
+        gpuInstaller.addActionListener(e -> confirmAndInstallVoiceVoxGpu());
+        officialSite.addActionListener(e -> openBrowser(VOICEVOX_OFFICIAL_URL));
+        rowInstaller.add(gpuInstaller);
+        rowInstaller.add(officialSite);
+
         // --- buttons row ---
         JPanel rowBtns = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
         rowBtns.setOpaque(false);
@@ -1048,6 +1062,10 @@ public class FirstLaunchWizard extends JDialog {
         rowSpk.add(new JLabel(UiText.t("wizard.step3.speakerLabel")), BorderLayout.WEST);
         rowSpk.add(vvSpeakerCombo, BorderLayout.CENTER);
 
+        p.add(rowInstaller);
+        p.add(Box.createVerticalStrut(8));
+        p.add(text("wizard.step3.gpuInstaller.guide"));
+        p.add(Box.createVerticalStrut(8));
         p.add(rowExe);
         p.add(Box.createVerticalStrut(8));
         p.add(rowApi);
@@ -1116,6 +1134,133 @@ public class FirstLaunchWizard extends JDialog {
                 SwingUtilities.invokeLater(() -> vvStatusLabel.setText(UiText.t("wizard.step3.launchFailed")));
             }
         }, "WizardVVLaunch").start();
+    }
+
+    private void confirmAndInstallVoiceVoxGpu() {
+        int result = JOptionPane.showConfirmDialog(
+                this,
+                UiText.t("wizard.step3.gpuInstaller.notice"),
+                UiText.t("wizard.step3.gpuInstaller.title"),
+                JOptionPane.OK_CANCEL_OPTION,
+                JOptionPane.INFORMATION_MESSAGE);
+        if (result != JOptionPane.OK_OPTION) return;
+
+        openBrowser(VOICEVOX_OFFICIAL_URL);
+        if (vvStatusLabel != null) vvStatusLabel.setText(UiText.t("wizard.step3.gpuInstaller.downloading"));
+
+        new Thread(() -> {
+            try {
+                Path installer = downloadLatestVoiceVoxGpuInstaller();
+                SwingUtilities.invokeLater(() -> {
+                    if (vvStatusLabel != null) vvStatusLabel.setText(UiText.t("wizard.step3.gpuInstaller.launching"));
+                });
+                new ProcessBuilder(installer.toAbsolutePath().toString())
+                        .directory(installer.getParent().toFile())
+                        .start();
+                SwingUtilities.invokeLater(() -> {
+                    if (vvStatusLabel != null) vvStatusLabel.setText(UiText.t("wizard.step3.gpuInstaller.started"));
+                });
+            } catch (Exception ex) {
+                Config.logError("Failed to download or launch VOICEVOX GPU installer", ex);
+                SwingUtilities.invokeLater(() -> {
+                    if (vvStatusLabel != null) vvStatusLabel.setText(UiText.t("wizard.step3.gpuInstaller.failed"));
+                    JOptionPane.showMessageDialog(
+                            this,
+                            UiText.t("wizard.step3.gpuInstaller.failed") + "\n" + ex.getMessage(),
+                            "MobMate",
+                            JOptionPane.ERROR_MESSAGE);
+                    openBrowser(VOICEVOX_RELEASES_URL);
+                });
+            }
+        }, "WizardVoiceVoxGpuInstaller").start();
+    }
+
+    private Path downloadLatestVoiceVoxGpuInstaller() throws Exception {
+        JSONObject release = getJson(VOICEVOX_RELEASE_API_URL);
+        JSONArray assets = release.optJSONArray("assets");
+        if (assets == null) {
+            throw new IllegalStateException(UiText.t("wizard.step3.gpuInstaller.assetNotFound"));
+        }
+
+        JSONObject asset = null;
+        int bestScore = 0;
+        for (int i = 0; i < assets.size(); i++) {
+            JSONObject candidate = assets.optJSONObject(i);
+            if (candidate == null) continue;
+            String name = candidate.optString("name", "");
+            int score = scoreVoiceVoxGpuInstallerCandidate(name);
+            if (score > bestScore) {
+                bestScore = score;
+                asset = candidate;
+            }
+        }
+        if (asset == null) {
+            throw new IllegalStateException(UiText.t("wizard.step3.gpuInstaller.assetNotFound"));
+        }
+
+        String name = asset.getString("name");
+        long expectedSize = asset.optLong("size", -1);
+        String downloadUrl = asset.getString("browser_download_url");
+        Path dir = getVoiceVoxInstallerDownloadDir();
+        Files.createDirectories(dir);
+        Path dest = dir.resolve(name);
+        if (Files.isRegularFile(dest) && (expectedSize <= 0 || Files.size(dest) == expectedSize)) {
+            return dest;
+        }
+
+        Path tmp = dir.resolve(name + ".download");
+        HttpURLConnection conn = openHttp(downloadUrl);
+        try (InputStream in = conn.getInputStream()) {
+            Files.copy(in, tmp, StandardCopyOption.REPLACE_EXISTING);
+        } finally {
+            conn.disconnect();
+        }
+        if (expectedSize > 0 && Files.size(tmp) != expectedSize) {
+            Files.deleteIfExists(tmp);
+            throw new IllegalStateException(UiText.t("wizard.step3.gpuInstaller.sizeMismatch"));
+        }
+        Files.move(tmp, dest, StandardCopyOption.REPLACE_EXISTING);
+        return dest;
+    }
+
+    private int scoreVoiceVoxGpuInstallerCandidate(String assetName) {
+        String name = assetName == null ? "" : assetName.toLowerCase(Locale.ROOT);
+        if (!name.endsWith(".exe")) return 0;
+        if (name.contains("cpu")) return 0;
+
+        if (name.contains("directml") && name.contains("setup")) return 300;
+        if (name.startsWith("voicevox.web.setup.")) return 250;
+        if (name.contains("gpu") && name.contains("setup")) return 220;
+        if (name.contains("cuda") && name.contains("setup")) return 180;
+        if (name.contains("voicevox") && name.contains("web.setup")) return 160;
+        if (name.contains("voicevox") && name.contains("setup")) return 80;
+        return 0;
+    }
+
+    private JSONObject getJson(String url) throws Exception {
+        HttpURLConnection conn = openHttp(url);
+        try (InputStream in = conn.getInputStream()) {
+            String body = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+            return new JSONObject(body);
+        } finally {
+            conn.disconnect();
+        }
+    }
+
+    private HttpURLConnection openHttp(String url) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setConnectTimeout(15_000);
+        conn.setReadTimeout(60_000);
+        conn.setRequestProperty("User-Agent", "MobMateWhispTalk");
+        return conn;
+    }
+
+    private Path getVoiceVoxInstallerDownloadDir() {
+        String localAppData = System.getenv("LOCALAPPDATA");
+        if (localAppData != null && !localAppData.isBlank()) {
+            return Paths.get(localAppData, "MobMateWhispTalk", "downloads", "voicevox");
+        }
+        return Paths.get(System.getProperty("user.home"), "MobMateWhispTalk", "downloads", "voicevox");
     }
 
     private record VvStyle(int id, String label) {

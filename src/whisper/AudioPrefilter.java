@@ -34,6 +34,35 @@ public final class AudioPrefilter {
         }
     }
 
+    public static final class LowFrequencyPeriodicMetrics {
+        public final double lowToVoiceRatio;
+        public final double dominantLowHz;
+        public final double zcr;
+        public final double rms;
+        public final int peak;
+
+        private LowFrequencyPeriodicMetrics(double lowToVoiceRatio,
+                                            double dominantLowHz,
+                                            double zcr,
+                                            double rms,
+                                            int peak) {
+            this.lowToVoiceRatio = lowToVoiceRatio;
+            this.dominantLowHz = dominantLowHz;
+            this.zcr = zcr;
+            this.rms = rms;
+            this.peak = peak;
+        }
+
+        public boolean likelyMechanicalNoise() {
+            return peak >= 900
+                    && rms >= 220.0
+                    && zcr <= 0.0145
+                    && dominantLowHz >= 45.0
+                    && dominantLowHz <= 180.0
+                    && lowToVoiceRatio >= 120.0;
+        }
+    }
+
     public enum Mode {
         TALK,
         HEARING
@@ -91,6 +120,10 @@ public final class AudioPrefilter {
     private static final double STRONG_HP_CUTOFF_HZ = 75.0;
     private static final double STRONG_LP_CUTOFF_HZ = 6000.0;
     private static final double STRONG_PRE_EMPHASIS_ALPHA = 0.42;
+    private static final double TALK_NORMAL_HP_CUTOFF_HZ = 115.0;
+    private static final double TALK_NORMAL_NOISY_HP_CUTOFF_HZ = 180.0;
+    private static final double TALK_NORMAL_PRE_EMPHASIS_ALPHA = 0.08;
+    private static final double TALK_NORMAL_NOISY_PRE_EMPHASIS_ALPHA = 0.18;
     private static final double NORMAL_LIMIT_DRIVE = 0.92;
     private static final double STRONG_LIMIT_DRIVE = 0.86;
     private static final double TARGET_FINAL_RMS_DBFS = -21.0;
@@ -153,7 +186,7 @@ public final class AudioPrefilter {
             System.arraycopy(pcm16le, 0, copy, 0, bytes);
             return copy;
         }
-        return filterVoiceBand(pcm16le, bytes, Math.max(8000, sampleRateHz), useProfile, useState);
+        return filterVoiceBand(pcm16le, bytes, Math.max(8000, sampleRateHz), mode, useProfile, useState);
     }
 
     public static byte[] normalizeFinalChunkForAsr(byte[] pcm16le, int bytes) {
@@ -336,9 +369,58 @@ public final class AudioPrefilter {
         return metrics.voiceBandRatio >= minBandRatio;
     }
 
+    public static LowFrequencyPeriodicMetrics analyzeLowFrequencyPeriodicNoise(byte[] pcm16le,
+                                                                               int bytes,
+                                                                               int sampleRateHz) {
+        VoiceMetrics voice = analyzeVoiceLike(pcm16le, bytes, sampleRateHz);
+        if (pcm16le == null || bytes < 512 || sampleRateHz <= 0) {
+            return new LowFrequencyPeriodicMetrics(0.0, 0.0,
+                    voice == null ? 0.0 : voice.zcr,
+                    voice == null ? 0.0 : voice.rms,
+                    voice == null ? 0 : voice.peak);
+        }
+
+        int samples = Math.min(bytes / 2, Math.min(sampleRateHz, 4096));
+        if (samples < 256) {
+            return new LowFrequencyPeriodicMetrics(0.0, 0.0, voice.zcr, voice.rms, voice.peak);
+        }
+        double[] frame = new double[samples];
+        for (int i = 0; i < samples; i++) {
+            double hann = 0.5 - (0.5 * Math.cos((2.0 * Math.PI * i) / Math.max(1, samples - 1)));
+            frame[i] = readPcm16le(pcm16le, i * 2) * hann;
+        }
+
+        double lowPower = 0.0;
+        double voicePower = 0.0;
+        double dominantLowHz = 0.0;
+        double dominantLowPower = 0.0;
+        double[] lowFreqs = {45, 50, 55, 60, 75, 90, 100, 105, 120, 150, 180};
+        double[] voiceFreqs = {220, 300, 400, 600, 800, 1000, 1400, 1800, 2400, 3000};
+        for (double f : lowFreqs) {
+            double power = goertzelPower(frame, sampleRateHz, f);
+            lowPower += power;
+            if (power > dominantLowPower) {
+                dominantLowPower = power;
+                dominantLowHz = f;
+            }
+        }
+        for (double f : voiceFreqs) {
+            voicePower += goertzelPower(frame, sampleRateHz, f);
+        }
+
+        return new LowFrequencyPeriodicMetrics(
+                lowPower / Math.max(1.0, voicePower),
+                dominantLowHz,
+                voice.zcr,
+                voice.rms,
+                voice.peak
+        );
+    }
+
     private static byte[] filterVoiceBand(byte[] pcm16le,
                                           int bytes,
                                           int sampleRateHz,
+                                          Mode mode,
                                           Profile profile,
                                           State state) {
         byte[] out = new byte[bytes];
@@ -348,6 +430,12 @@ public final class AudioPrefilter {
         double hpCutoff = (profile == Profile.STRONG) ? STRONG_HP_CUTOFF_HZ : DEFAULT_HP_CUTOFF_HZ;
         double lpCutoff = (profile == Profile.STRONG) ? STRONG_LP_CUTOFF_HZ : DEFAULT_LP_CUTOFF_HZ;
         double preAlpha = (profile == Profile.STRONG) ? STRONG_PRE_EMPHASIS_ALPHA : 0.0;
+        if (profile == Profile.NORMAL && mode == Mode.TALK) {
+            LowFrequencyPeriodicMetrics periodic = analyzeLowFrequencyPeriodicNoise(pcm16le, bytes, sampleRateHz);
+            boolean lowDominant = periodic.likelyMechanicalNoise() || periodic.lowToVoiceRatio >= 24.0;
+            hpCutoff = lowDominant ? TALK_NORMAL_NOISY_HP_CUTOFF_HZ : TALK_NORMAL_HP_CUTOFF_HZ;
+            preAlpha = lowDominant ? TALK_NORMAL_NOISY_PRE_EMPHASIS_ALPHA : TALK_NORMAL_PRE_EMPHASIS_ALPHA;
+        }
 
         double dt = 1.0 / sampleRateHz;
         double hpRc = 1.0 / (2.0 * Math.PI * hpCutoff);
@@ -587,6 +675,23 @@ public final class AudioPrefilter {
             }
             out[t] = sum / n;
         }
+    }
+
+    private static double goertzelPower(double[] frame, int sampleRateHz, double targetHz) {
+        int n = frame.length;
+        if (n <= 0 || sampleRateHz <= 0 || targetHz <= 0.0) return 0.0;
+        double k = 0.5 + ((n * targetHz) / sampleRateHz);
+        double omega = (2.0 * Math.PI * k) / n;
+        double coeff = 2.0 * Math.cos(omega);
+        double s0 = 0.0;
+        double s1 = 0.0;
+        double s2 = 0.0;
+        for (double sample : frame) {
+            s0 = sample + (coeff * s1) - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        return (s1 * s1) + (s2 * s2) - (coeff * s1 * s2);
     }
 
     private static void mirrorSpectrum(double[] re, double[] im, int bins) {

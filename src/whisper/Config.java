@@ -1,8 +1,11 @@
 package whisper;
 
+import com.sun.management.OperatingSystemMXBean;
+
 import javax.swing.*;
 import java.awt.*;
 import java.io.*;
+import java.lang.management.ManagementFactory;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.time.LocalDateTime;
@@ -15,6 +18,10 @@ public final class Config {
 
     private static final Path OUT_TTS =
             Paths.get(System.getProperty("user.dir"), "_outtts.txt");
+    private static final Path LOG_FILE =
+            Paths.get(System.getProperty("user.dir"), "_log.txt");
+    private static final long LOG_MAX_BYTES = 2 * 1024 * 1024; // 2MB
+    private static final Object LOG_LOCK = new Object();
 
     private static PrintWriter LOG;
     private static final DateTimeFormatter LOG_TIME =
@@ -22,8 +29,8 @@ public final class Config {
 
     static {
         try {
-            File out = new File("_log.txt");
-            LOG = new PrintWriter(new FileWriter(out, true));
+            trimFileBySize(LOG_FILE, LOG_MAX_BYTES);
+            LOG = openLogWriter();
             log("=== MobMateWhisp Started ===");
         } catch (Exception e) {
 
@@ -36,9 +43,12 @@ public final class Config {
                 LocalDateTime.now().format(LOG_TIME), s
         );
         System.out.println(line);
-        if (LOG != null) {
-            LOG.println(line);
-            LOG.flush();
+        synchronized (LOG_LOCK) {
+            if (LOG != null) {
+                LOG.println(line);
+                LOG.flush();
+                maybeTrimLogFile();
+            }
         }
     }
     public static void logDebug(String s) {
@@ -349,7 +359,6 @@ public final class Config {
     }
 
     private static final int OUTTTS_MAX_LINES = 500;
-    private static final long LOG_MAX_BYTES = 2 * 1024 * 1024; // 2MB
     private static final String OUTTTS_MARKER =
             "↑Settings↓Logs below";
     public static void trimOutttsSafely(Path file, int maxLines) throws IOException {
@@ -506,6 +515,80 @@ public final class Config {
         }
         return v.trim();
     }
+
+    private static PrintWriter openLogWriter() throws IOException {
+        return new PrintWriter(new FileWriter(LOG_FILE.toFile(), true));
+    }
+
+    private static void maybeTrimLogFile() {
+        try {
+            if (!Files.exists(LOG_FILE)) return;
+            if (Files.size(LOG_FILE) <= LOG_MAX_BYTES) return;
+
+            if (LOG != null) {
+                LOG.flush();
+                LOG.close();
+                LOG = null;
+            }
+            trimFileBySize(LOG_FILE, LOG_MAX_BYTES);
+            LOG = openLogWriter();
+        } catch (IOException e) {
+            System.err.println("Failed to trim _log.txt: " + e.getMessage());
+            if (LOG == null) {
+                try {
+                    LOG = openLogWriter();
+                } catch (IOException ignored) {
+                }
+            }
+        }
+    }
+
+    private static OperatingSystemMXBean getExtendedOsBean() {
+        try {
+            java.lang.management.OperatingSystemMXBean bean =
+                    ManagementFactory.getOperatingSystemMXBean();
+            if (bean instanceof OperatingSystemMXBean extended) {
+                return extended;
+            }
+        } catch (Throwable ignore) {
+        }
+        return null;
+    }
+
+    static long getPhysicalTotalMemoryBytes() {
+        OperatingSystemMXBean bean = getExtendedOsBean();
+        if (bean != null) {
+            long total = bean.getTotalMemorySize();
+            if (total > 0) return total;
+        }
+        return -1L;
+    }
+
+    static long getPhysicalFreeMemoryBytes() {
+        OperatingSystemMXBean bean = getExtendedOsBean();
+        if (bean != null) {
+            long free = bean.getFreeMemorySize();
+            if (free >= 0) return free;
+        }
+        return -1L;
+    }
+
+    static int getSystemLogicalCpuCount() {
+        String env = System.getenv("NUMBER_OF_PROCESSORS");
+        if (env != null) {
+            try {
+                int parsed = Integer.parseInt(env.trim());
+                if (parsed > 0) return parsed;
+            } catch (NumberFormatException ignore) {
+            }
+        }
+        return Runtime.getRuntime().availableProcessors();
+    }
+
+    static String toMbString(long bytes) {
+        if (bytes < 0) return "unknown";
+        return Long.toString(bytes / 1024 / 1024);
+    }
 }
 
 class DebugLogZipper {
@@ -538,6 +621,8 @@ class DebugLogZipper {
 
             // ENV
             Runtime rt = Runtime.getRuntime();
+            long physicalTotalBytes = Config.getPhysicalTotalMemoryBytes();
+            long physicalFreeBytes = Config.getPhysicalFreeMemoryBytes();
             zos.putNextEntry(new java.util.zip.ZipEntry("_env.txt"));
             String env =
                     "version=" + Version.APP_VERSION + "\n" +
@@ -552,10 +637,14 @@ class DebugLogZipper {
                             "java.vm=" + System.getProperty("java.vm.name") + "\n" +
                             "java.arch=" + System.getProperty("os.arch") + "\n" +
                             "\n" +
-                            "cpu.cores=" + rt.availableProcessors() + "\n" +
-                            "mem.maxMB=" + (rt.maxMemory() / 1024 / 1024) + "\n" +
-                            "mem.totalMB=" + (rt.totalMemory() / 1024 / 1024) + "\n" +
-                            "mem.freeMB=" + (rt.freeMemory() / 1024 / 1024) + "\n" +
+                            "cpu.cores=" + Config.getSystemLogicalCpuCount() + "\n" +
+                            "cpu.jvmCores=" + rt.availableProcessors() + "\n" +
+                            "mem.maxMB=" + Config.toMbString(physicalTotalBytes) + "\n" +
+                            "mem.totalMB=" + Config.toMbString(physicalTotalBytes) + "\n" +
+                            "mem.freeMB=" + Config.toMbString(physicalFreeBytes) + "\n" +
+                            "mem.jvmMaxMB=" + (rt.maxMemory() / 1024 / 1024) + "\n" +
+                            "mem.jvmTotalMB=" + (rt.totalMemory() / 1024 / 1024) + "\n" +
+                            "mem.jvmFreeMB=" + (rt.freeMemory() / 1024 / 1024) + "\n" +
                             "\n" +
                             "audio.input=" + MobMateWhisp.prefs.get("audio.device", "") + "\n" +
                             "audio.output=" + MobMateWhisp.prefs.get("audio.output.device", "") + "\n" +

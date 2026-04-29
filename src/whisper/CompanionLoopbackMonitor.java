@@ -26,8 +26,8 @@ final class CompanionLoopbackMonitor {
     private static final AudioFormat LOOPBACK_AUDIO_FORMAT =
             new AudioFormat(LOOPBACK_SAMPLE_RATE, 16, 1, true, false);
     private static final long SEMANTIC_GATE_STREAK_RESET_MS = 3_200L;
-    private static final long SEMANTIC_GATE_MIN_INTERVAL_MS = 5_500L;
-    private static final long SEMANTIC_GATE_STRONG_INTERVAL_MS = 3_000L;
+    private static final long SEMANTIC_GATE_MIN_INTERVAL_MS = 3_200L;
+    private static final long SEMANTIC_GATE_STRONG_INTERVAL_MS = 1_800L;
     private static final int SEMANTIC_GATE_REQUIRED_STREAK = 2;
     private static final long SEMANTIC_GATE_MIN_ACTIVE_MS = 650L;
     private static final long SEMANTIC_GATE_VERY_STRONG_ACTIVE_MS = 420L;

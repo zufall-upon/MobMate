@@ -17,7 +17,9 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
+import java.net.HttpURLConnection;
 import java.net.URI;
+import java.net.URL;
 
 public class MobMateSettingsFrame extends JDialog {
 
@@ -115,6 +117,7 @@ public class MobMateSettingsFrame extends JDialog {
     private JTextArea hearingInitialPromptArea;
     private JTextField voicevoxExeField;
     private JTextField voicevoxApiField;
+    private JButton voicevoxDetectButton;
     private JTextField xttsApiField;
     private JTextField xttsApiChkField;
     private JTextField xttsLanguageField;
@@ -644,6 +647,8 @@ public class MobMateSettingsFrame extends JDialog {
 
         voicevoxExeField = new JTextField();
         voicevoxApiField = new JTextField();
+        voicevoxDetectButton = new JButton(tt("settings.voicevox.detect", "Auto detect"));
+        voicevoxDetectButton.addActionListener(e -> detectVoiceVoxSettings());
         xttsApiField = new JTextField();
         xttsApiChkField = new JTextField();
         xttsLanguageField = new JTextField();
@@ -668,7 +673,11 @@ public class MobMateSettingsFrame extends JDialog {
                 new JScrollPane(hearingInitialPromptArea), true);
 
         form.add(sectionLabel(tt("settings.section.voicevox", "VOICEVOX connection")), sectionGbc(row++));
-        addRow(form, row++, tt("settings.label.voicevoxExe", "VOICEVOX executable"), voicevoxExeField);
+        JPanel voicevoxExePanel = new JPanel(new BorderLayout(8, 0));
+        voicevoxExePanel.setOpaque(false);
+        voicevoxExePanel.add(voicevoxExeField, BorderLayout.CENTER);
+        voicevoxExePanel.add(voicevoxDetectButton, BorderLayout.EAST);
+        addRow(form, row++, tt("settings.label.voicevoxExe", "VOICEVOX executable"), voicevoxExePanel);
         addRow(form, row++, tt("settings.label.voicevoxApi", "VOICEVOX API URL"), voicevoxApiField);
 
         form.add(sectionLabel(tt("settings.section.xtts", "XTTS connection")), sectionGbc(row++));
@@ -907,6 +916,7 @@ public class MobMateSettingsFrame extends JDialog {
     public void refreshLinkedSelections() {
         SwingUtilities.invokeLater(() -> {
             refreshAudioSelections();
+            refreshRecognitionSelections();
             refreshVoiceSelections();
             refreshPendingSelections();
             refreshRadioSelections();
@@ -969,6 +979,18 @@ public class MobMateSettingsFrame extends JDialog {
         updateTtsPrimaryVoiceChoices();
         updatePiperPlusSelectionDetails();
         updateTtsUiState();
+    }
+
+    private void refreshRecognitionSelections() {
+        if (speakerEnabledCheck != null) {
+            speakerEnabledCheck.setSelected(MobMateWhisp.prefs.getBoolean("speaker.enabled", false));
+        }
+        if (speakerEnrollCombo != null) {
+            selectChoice(speakerEnrollCombo, MobMateWhisp.prefs.getInt("speaker.enroll_samples", MobMateWhisp.DEFAULT_SPEAKER_ENROLL_SAMPLES));
+        }
+        if (speakerThresholdCombo != null) {
+            selectChoice(speakerThresholdCombo, MobMateWhisp.prefs.getFloat("speaker.threshold_initial", MobMateWhisp.DEFAULT_SPEAKER_THRESHOLD));
+        }
     }
 
     private void refreshPendingSelections() {
@@ -1097,8 +1119,8 @@ public class MobMateSettingsFrame extends JDialog {
         altLaughCheck.setSelected(MobMateWhisp.prefs.getBoolean("silence.alternate", false));
 
         speakerEnabledCheck.setSelected(MobMateWhisp.prefs.getBoolean("speaker.enabled", false));
-        selectChoice(speakerEnrollCombo, MobMateWhisp.prefs.getInt("speaker.enroll_samples", 5));
-        selectChoice(speakerThresholdCombo, MobMateWhisp.prefs.getFloat("speaker.threshold_initial", 0.55f));
+        selectChoice(speakerEnrollCombo, MobMateWhisp.prefs.getInt("speaker.enroll_samples", MobMateWhisp.DEFAULT_SPEAKER_ENROLL_SAMPLES));
+        selectChoice(speakerThresholdCombo, MobMateWhisp.prefs.getFloat("speaker.threshold_initial", MobMateWhisp.DEFAULT_SPEAKER_THRESHOLD));
 
         updateRecognitionUiState(); 
 
@@ -1455,13 +1477,13 @@ public class MobMateSettingsFrame extends JDialog {
         MobMateWhisp.prefs.remove("whisper.translate_to_en");
 
         MobMateWhisp.prefs.putBoolean("speaker.enabled", speakerEnabledCheck.isSelected());
-        Integer oldEnroll = MobMateWhisp.prefs.getInt("speaker.enroll_samples", 5);
+        Integer oldEnroll = MobMateWhisp.prefs.getInt("speaker.enroll_samples", MobMateWhisp.DEFAULT_SPEAKER_ENROLL_SAMPLES);
         Integer enroll = selectedValue(speakerEnrollCombo);
         if (enroll != null) {
             MobMateWhisp.prefs.putInt("speaker.enroll_samples", enroll);
             if (!Objects.equals(oldEnroll, enroll)) needSoftRestart = true;
         }
-        Float oldSpkTh = MobMateWhisp.prefs.getFloat("speaker.threshold_initial", 0.60f);
+        Float oldSpkTh = MobMateWhisp.prefs.getFloat("speaker.threshold_initial", MobMateWhisp.DEFAULT_SPEAKER_THRESHOLD);
         Float spkTh = selectedValue(speakerThresholdCombo);
         if (spkTh != null) {
             MobMateWhisp.prefs.putFloat("speaker.threshold_initial", spkTh);
@@ -1640,6 +1662,8 @@ public class MobMateSettingsFrame extends JDialog {
         try {
             app.saveSelectedPresetSnapshotIfAny();
         } catch (Exception ignore) {}
+
+        app.refreshLinkedUiSelectionsForUi();
 
         if (needSoftRestart) {
             app.requestSoftRestartForSettings();
@@ -2102,6 +2126,148 @@ public class MobMateSettingsFrame extends JDialog {
     private String oneLine(String s) {
         if (s == null) return "";
         return s.replace("\r", " ").replace("\n", " ").trim();
+    }
+
+    private void detectVoiceVoxSettings() {
+        String defaultApi = "http://127.0.0.1:50021";
+        String api = voicevoxApiField != null ? voicevoxApiField.getText().trim() : "";
+        if (api.isBlank()) api = defaultApi;
+
+        Optional<File> exe = findVoiceVoxExecutable();
+        if (exe.isPresent()) {
+            if (voicevoxExeField != null) {
+                voicevoxExeField.setText(exe.get().getAbsolutePath());
+            }
+            if (voicevoxApiField != null && voicevoxApiField.getText().trim().isBlank()) {
+                voicevoxApiField.setText(defaultApi);
+            }
+            JOptionPane.showMessageDialog(
+                    this,
+                    tt("settings.voicevox.detect.success", "VOICEVOX was found. Press Apply or OK to save."),
+                    tt("settings.voicevox.detect.title", "VOICEVOX auto detect"),
+                    JOptionPane.INFORMATION_MESSAGE
+            );
+            return;
+        }
+
+        if (voiceVoxApiLooksAlive(api)) {
+            if (voicevoxApiField != null) voicevoxApiField.setText(api);
+            JOptionPane.showMessageDialog(
+                    this,
+                    tt("settings.voicevox.detect.apiOnly", "VOICEVOX API is responding, but the executable was not found. The API URL was set."),
+                    tt("settings.voicevox.detect.title", "VOICEVOX auto detect"),
+                    JOptionPane.INFORMATION_MESSAGE
+            );
+            return;
+        }
+
+        if (voicevoxApiField != null && voicevoxApiField.getText().trim().isBlank()) {
+            voicevoxApiField.setText(defaultApi);
+        }
+        JOptionPane.showMessageDialog(
+                this,
+                tt("settings.voicevox.detect.notFound", "VOICEVOX was not found. Install it, then try auto detect again or enter the executable manually."),
+                tt("settings.voicevox.detect.title", "VOICEVOX auto detect"),
+                JOptionPane.WARNING_MESSAGE
+        );
+    }
+
+    private Optional<File> findVoiceVoxExecutable() {
+        LinkedHashSet<Path> candidates = new LinkedHashSet<>();
+        addVoiceVoxCandidate(candidates, voicevoxExeField != null ? voicevoxExeField.getText() : "");
+        addVoiceVoxCandidate(candidates, Config.getString("voicevox.exe", ""));
+
+        addVoiceVoxCandidate(candidates, pathJoin(System.getenv("LOCALAPPDATA"), "Programs", "VOICEVOX", "VOICEVOX.exe"));
+        addVoiceVoxCandidate(candidates, pathJoin(System.getenv("LOCALAPPDATA"), "VOICEVOX", "VOICEVOX.exe"));
+        addVoiceVoxCandidate(candidates, pathJoin(System.getenv("PROGRAMFILES"), "VOICEVOX", "VOICEVOX.exe"));
+        addVoiceVoxCandidate(candidates, pathJoin(System.getenv("ProgramFiles(x86)"), "VOICEVOX", "VOICEVOX.exe"));
+        addVoiceVoxCandidate(candidates, "M:\\@HyperV\\VOICEVOX\\VOICEVOX.exe");
+        addVoiceVoxCandidate(candidates, "M:\\VOICEVOX\\VOICEVOX.exe");
+
+        for (Path candidate : candidates) {
+            File f = candidate.toFile();
+            if (isVoiceVoxExecutable(f)) return Optional.of(f);
+        }
+
+        Optional<File> found = findVoiceVoxUnder(pathJoin(System.getenv("LOCALAPPDATA"), "Programs"), 4);
+        if (found.isPresent()) return found;
+        found = findVoiceVoxUnder(pathJoin(System.getenv("PROGRAMFILES")), 4);
+        if (found.isPresent()) return found;
+        return findVoiceVoxUnder(pathJoin(System.getenv("ProgramFiles(x86)")), 4);
+    }
+
+    private void addVoiceVoxCandidate(Set<Path> candidates, String rawPath) {
+        if (rawPath == null || rawPath.isBlank()) return;
+        try {
+            candidates.add(Path.of(unquote(rawPath.trim())).toAbsolutePath().normalize());
+        } catch (Exception ignore) {}
+    }
+
+    private String pathJoin(String first, String... rest) {
+        if (first == null || first.isBlank()) return "";
+        try {
+            return Path.of(first, rest).toString();
+        } catch (Exception ignore) {
+            return "";
+        }
+    }
+
+    private String unquote(String text) {
+        if (text == null) return "";
+        String s = text.trim();
+        if (s.length() >= 2 && ((s.startsWith("\"") && s.endsWith("\"")) || (s.startsWith("'") && s.endsWith("'")))) {
+            return s.substring(1, s.length() - 1).trim();
+        }
+        return s;
+    }
+
+    private Optional<File> findVoiceVoxUnder(String rootPath, int maxDepth) {
+        if (rootPath == null || rootPath.isBlank()) return Optional.empty();
+        Path root;
+        try {
+            root = Path.of(rootPath);
+        } catch (Exception ignore) {
+            return Optional.empty();
+        }
+        if (!Files.isDirectory(root)) return Optional.empty();
+        try (var paths = Files.find(root, maxDepth, (path, attrs) -> {
+            String name = path.getFileName() == null ? "" : path.getFileName().toString();
+            String full = path.toString().toLowerCase(Locale.ROOT);
+            return attrs.isRegularFile()
+                    && "VOICEVOX.exe".equalsIgnoreCase(name)
+                    && full.contains("voicevox");
+        })) {
+            return paths.map(Path::toFile)
+                    .filter(this::isVoiceVoxExecutable)
+                    .findFirst();
+        } catch (Exception ignore) {
+            return Optional.empty();
+        }
+    }
+
+    private boolean isVoiceVoxExecutable(File file) {
+        if (file == null || !file.isFile()) return false;
+        String name = file.getName();
+        return "VOICEVOX.exe".equalsIgnoreCase(name);
+    }
+
+    private boolean voiceVoxApiLooksAlive(String base) {
+        if (base == null || base.isBlank()) return false;
+        String normalized = base.trim();
+        while (normalized.endsWith("/")) normalized = normalized.substring(0, normalized.length() - 1);
+        try {
+            HttpURLConnection conn = (HttpURLConnection) new URL(normalized + "/speakers").openConnection();
+            conn.setConnectTimeout(500);
+            conn.setReadTimeout(900);
+            conn.connect();
+            try {
+                return conn.getResponseCode() == 200;
+            } finally {
+                conn.disconnect();
+            }
+        } catch (Exception ignore) {
+            return false;
+        }
     }
 
     private String tt(String key, String fallback) {

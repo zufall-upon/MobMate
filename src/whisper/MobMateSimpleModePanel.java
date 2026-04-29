@@ -32,6 +32,7 @@ final class MobMateSimpleModePanel extends JPanel {
     private long guidanceLastRotatedAt = 0L;
     private int guidancePassiveIndex = 0;
     private String guidancePassiveSignature = "";
+    private String currentGuidanceKey = "";
 
     private FadingHistoryTextLabel liveHelperLabel;
     private JLabel statusChip;
@@ -68,6 +69,7 @@ final class MobMateSimpleModePanel extends JPanel {
     private JComboBox<String> outputCombo;
     private JComboBox<String> monitorVolumeCombo;
     private JCheckBox aiAssistToggle;
+    private JCheckBox speakerFilterAutoToggle;
 
     private JComboBox<String> languageCombo;
     private JComboBox<String> recognitionEngineCombo;
@@ -116,6 +118,15 @@ final class MobMateSimpleModePanel extends JPanel {
         refreshFromSnapshot();
         refreshTimer = new Timer(500, e -> refreshFromSnapshot());
         refreshTimer.start();
+    }
+
+    public void refreshLinkedSelections() {
+        SwingUtilities.invokeLater(() -> {
+            loadCurrentPrefs();
+            refreshFromSnapshot();
+            revalidate();
+            repaint();
+        });
     }
 
     void shutdown() {
@@ -214,6 +225,10 @@ final class MobMateSimpleModePanel extends JPanel {
         settingsButton.setToolTipText(tr("top.settings"));
         settingsButton.addActionListener(e -> app.openSettingsCenter());
 
+        JButton deltaButton = createHeaderTextButton(UiText.t("ui.main.prefs"));
+        deltaButton.setToolTipText(UiText.t("ui.main.prefs.tip"));
+        deltaButton.addActionListener(e -> app.showDeltaQuickMenu(deltaButton));
+
         JButton discordButton = createHeaderTextButton("Discord");
         discordButton.setToolTipText(tr("top.discord_support"));
         discordButton.addActionListener(this::openDiscordSupport);
@@ -231,6 +246,7 @@ final class MobMateSimpleModePanel extends JPanel {
         right.setOpaque(false);
         right.add(discordButton);
         right.add(settingsButton);
+        right.add(deltaButton);
         right.add(closeButton);
 
         headerPanel.add(left, BorderLayout.CENTER);
@@ -518,6 +534,8 @@ final class MobMateSimpleModePanel extends JPanel {
         monitorVolumeCombo = new JComboBox<>(new String[]{"0%", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%"});
         aiAssistToggle = new JCheckBox(tr("audio.ai_assist"));
         aiAssistToggle.setOpaque(false);
+        speakerFilterAutoToggle = new JCheckBox(tr("audio.speaker_filter_auto"));
+        speakerFilterAutoToggle.setOpaque(false);
 
         for (String item : app.getInputsMixerNames()) inputCombo.addItem(item);
         for (String item : app.getOutputMixerNames()) outputCombo.addItem(item);
@@ -550,11 +568,15 @@ final class MobMateSimpleModePanel extends JPanel {
             if (updatingControls) return;
             app.setAiAssistEnabledFromUi(aiAssistToggle.isSelected());
         });
+        speakerFilterAutoToggle.addActionListener(e -> {
+            if (updatingControls) return;
+            app.setSpeakerFilterEnabledFromUi(speakerFilterAutoToggle.isSelected());
+        });
 
         addExpandedFormRow(body, tr("audio.mic"), inputCombo);
         addExpandedFormRow(body, tr("audio.speaker"), outputCombo);
         addFormRow(body, tr("audio.monitor_volume"), monitorVolumeCombo);
-        addFormRow(body, tr("audio.mic_boost"), aiAssistToggle);
+        addDualCheckFormRow(body, tr("audio.mic_boost"), aiAssistToggle, speakerFilterAutoToggle);
         // Keep the AI assist helper directly above the Discord routing guide.
         // This avoids the guide visually swallowing the context text.
         addHelperTextRow(body, tr("audio.ai_assist.helper"));
@@ -715,6 +737,7 @@ final class MobMateSimpleModePanel extends JPanel {
             outputCombo.setSelectedItem(app.getSelectedOutputDeviceForUi());
             monitorVolumeCombo.setSelectedItem(app.getTtsMonitorVolumePercentForUi() + "%");
             aiAssistToggle.setSelected(app.isAiAssistEnabledForUi());
+            speakerFilterAutoToggle.setSelected(app.isSpeakerFilterEnabledForUi());
 
             refreshTalkControlSelections();
             recognitionEngineCombo.setSelectedItem(app.getSelectedRecognitionEngineForUi());
@@ -765,12 +788,39 @@ final class MobMateSimpleModePanel extends JPanel {
         List<String> recent = snapshot.recentLines();
         String partialPreview = MobMateWhisp.getLastPartial();
         boolean showPartial = snapshot.transcribing() && partialPreview != null && !partialPreview.isBlank();
-        historyBlock1.setFullText(showPartial
-                ? partialPreview.trim()
-                : toDisplayLine(snapshot.latestText(), tr("history.empty_latest")));
-        applyPrimaryHistoryBlockStyle(showPartial);
-        for (int i = 0; i < historyTailBlocks.size(); i++) {
-            historyTailBlocks.get(i).setFullText(safeRecentLine(recent, i));
+        if (snapshot.speakerEnrolling()) {
+            historyBlock1.setFullText(toDisplayLine(snapshot.speakerSamplingStateText(), tr("speaker.sampling.state.waiting")));
+            applyPrimaryHistoryBlockStyle(false);
+            if (historyTailBlocks.size() > 0) {
+                String promptText = snapshot.speakerSamplingPromptText();
+                historyTailBlocks.get(0).setFullText(
+                        (promptText == null || promptText.isBlank())
+                                ? tr("speaker.sampling.helper.usual_voice")
+                                : UiText.t("speaker.sampling.prompt_display").formatted(promptText)
+                );
+            }
+            if (historyTailBlocks.size() > 1) {
+                String progressText = snapshot.speakerSamplingProgressText();
+                historyTailBlocks.get(1).setFullText(
+                        (progressText == null || progressText.isBlank())
+                                ? tr("speaker.sampling.helper.pause")
+                                : progressText
+                );
+            }
+            if (historyTailBlocks.size() > 2) {
+                historyTailBlocks.get(2).setFullText(tr("speaker.sampling.helper.usual_voice"));
+            }
+            if (historyTailBlocks.size() > 3) {
+                historyTailBlocks.get(3).setFullText(tr("speaker.sampling.helper.pause"));
+            }
+        } else {
+            historyBlock1.setFullText(showPartial
+                    ? partialPreview.trim()
+                    : toDisplayLine(snapshot.latestText(), tr("history.empty_latest")));
+            applyPrimaryHistoryBlockStyle(showPartial);
+            for (int i = 0; i < historyTailBlocks.size(); i++) {
+                historyTailBlocks.get(i).setFullText(safeRecentLine(recent, i));
+            }
         }
 
         styleModeButton(instantButton, !snapshot.pendingMode());
@@ -841,6 +891,7 @@ final class MobMateSimpleModePanel extends JPanel {
                 snapshot.speakerEnrolling(),
                 snapshot.speakerEnrollCount(),
                 snapshot.speakerEnrollRequired(),
+                snapshot.speakerSamplingPromptText(),
                 snapshot.inputLevel(),
                 snapshot.pendingMode(),
                 snapshot.pendingRemainingSec(),
@@ -850,15 +901,20 @@ final class MobMateSimpleModePanel extends JPanel {
                 snapshot.translateEnabled(),
                 snapshot.translateTarget(),
                 snapshot.radioConfigured(),
+                snapshot.voiceVoxRecommended(),
                 snapshot.featureAnnouncement()
         );
         SimpleGuidanceEvaluator.Result result = guidanceEvaluator.evaluate(context);
         SimpleGuidanceEvaluator.GuidanceMessage selected = pickGuidanceMessage(result);
         if (selected == null) {
+            currentGuidanceKey = "";
             liveHelperLabel.setAnimatedText("", mutedForeground());
+            updateLiveGuidanceAffordance();
             return;
         }
+        currentGuidanceKey = selected.key();
         liveHelperLabel.setAnimatedText(formatGuidanceMessage(selected), colorForGuidance(selected.severity()));
+        updateLiveGuidanceAffordance();
     }
 
     private SimpleGuidanceEvaluator.GuidanceMessage pickGuidanceMessage(SimpleGuidanceEvaluator.Result result) {
@@ -1065,6 +1121,41 @@ final class MobMateSimpleModePanel extends JPanel {
         body.add(Box.createVerticalStrut(6));
     }
 
+    private void addDualCheckFormRow(JPanel body, String label, JCheckBox left, JCheckBox right) {
+        JLabel l = new JLabel(label);
+        l.setForeground(labelForeground());
+        l.setPreferredSize(new Dimension(92, 24));
+
+        JPanel fields = new JPanel(new GridBagLayout());
+        fields.setOpaque(false);
+        fields.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        GridBagConstraints gc = new GridBagConstraints();
+        gc.gridy = 0;
+        gc.fill = GridBagConstraints.HORIZONTAL;
+        gc.weighty = 1.0;
+
+        gc.gridx = 0;
+        gc.weightx = 0.5;
+        gc.insets = new Insets(0, 0, 0, 12);
+        fields.add(left, gc);
+
+        gc.gridx = 1;
+        gc.weightx = 0.5;
+        gc.insets = new Insets(0, 0, 0, 0);
+        fields.add(right, gc);
+
+        int rowHeight = Math.max(26, Math.max(l.getPreferredSize().height, fields.getPreferredSize().height));
+        JPanel row = new JPanel(new BorderLayout(10, 0));
+        row.setOpaque(false);
+        row.setAlignmentX(Component.LEFT_ALIGNMENT);
+        row.setMaximumSize(new Dimension(Integer.MAX_VALUE, rowHeight));
+        row.add(l, BorderLayout.WEST);
+        row.add(fields, BorderLayout.CENTER);
+        body.add(row);
+        body.add(Box.createVerticalStrut(6));
+    }
+
     private void addDualComboFormRow(JPanel body, String label, JComboBox<?> left, JComboBox<?> right, int minEachWidth) {
         JLabel l = new JLabel(label);
         l.setForeground(labelForeground());
@@ -1216,7 +1307,28 @@ final class MobMateSimpleModePanel extends JPanel {
         label.setIcon(null);
         label.setBorder(BorderFactory.createEmptyBorder());
         label.setMaximumSize(new Dimension(Integer.MAX_VALUE, Math.max(20, label.getPreferredSize().height)));
+        label.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseClicked(MouseEvent e) {
+                if (!SwingUtilities.isLeftMouseButton(e)) return;
+                if ("voicevox_recommend".equals(currentGuidanceKey)) {
+                    markGuidanceInteraction();
+                    app.openVoiceVoxSetupFromSimpleUi();
+                }
+            }
+        });
         return label;
+    }
+
+    private void updateLiveGuidanceAffordance() {
+        if (liveHelperLabel == null) return;
+        boolean clickable = "voicevox_recommend".equals(currentGuidanceKey);
+        liveHelperLabel.setCursor(Cursor.getPredefinedCursor(clickable ? Cursor.HAND_CURSOR : Cursor.DEFAULT_CURSOR));
+        if (clickable) {
+            liveHelperLabel.setToolTipText(tr("guidance.voicevox.tooltip"));
+        } else {
+            liveHelperLabel.setToolTipText(null);
+        }
     }
 
     private JButton createPendingDecisionButton(String text, boolean approve) {

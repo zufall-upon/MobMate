@@ -50,7 +50,7 @@ public class SpeakerProfile {
     private transient boolean staleSessionBypass;
     private transient int sessionRejectCount;
     private static final int STALE_SESSION_REJECT_THRESHOLD = 6;
-    private static final double STALE_SESSION_MAX_SCORE = 0.22;
+    private static final double STALE_SESSION_MIN_SCORE = 0.42;
     private static final double STALE_SESSION_MIN_VOICED_MS = 700.0;
 
     private final List<double[]> enrolledFeatures = new ArrayList<>();
@@ -59,6 +59,10 @@ public class SpeakerProfile {
     private static final double SOFT_MIN_RMS_FOR_SPEAKER_PASS = MIN_RMS_FOR_SPEAKER_CHECK * 0.90;
     private static final double HARD_MIN_RMS_FOR_SPEAKER_PASS = MIN_RMS_FOR_SPEAKER_CHECK * 0.75;
     private static final double SHORT_PHRASE_MIN_RMS_FOR_SPEAKER_PASS = MIN_RMS_FOR_SPEAKER_CHECK * 0.65;
+    private static final double RELAXED_THRESHOLD_FOR_LOW_VOLUME_PASS = 0.15;
+    private static final double RELAXED_MIN_RMS_FOR_SPEAKER_PASS = MIN_RMS_FOR_SPEAKER_CHECK * 0.42;
+    private static final double RELAXED_MIN_VOICED_MS_FOR_SPEAKER_PASS = 1500.0;
+    private static final double RELAXED_MIN_SCORE_FOR_SPEAKER_PASS = 0.45;
     private static final double LOW_ENERGY_SCORE_MARGIN = 0.12;
     private static final double SHORT_PHRASE_SCORE_MARGIN = 0.22;
 
@@ -600,6 +604,7 @@ public class SpeakerProfile {
         double effectiveThreshold = getThreshold();
         if (effectiveRms < MIN_RMS_FOR_SPEAKER_CHECK) {
             boolean lowEnergyPass = false;
+            boolean relaxedLowVolumePass = false;
             if (effectiveRms >= SOFT_MIN_RMS_FOR_SPEAKER_PASS
                     && voicedMs >= 700.0
                     && score >= (effectiveThreshold + 0.05)) {
@@ -612,6 +617,12 @@ public class SpeakerProfile {
                     && voicedMs >= 1200.0
                     && score >= (effectiveThreshold + SHORT_PHRASE_SCORE_MARGIN)) {
                 lowEnergyPass = true;
+            } else if (effectiveThreshold <= RELAXED_THRESHOLD_FOR_LOW_VOLUME_PASS
+                    && effectiveRms >= RELAXED_MIN_RMS_FOR_SPEAKER_PASS
+                    && voicedMs >= RELAXED_MIN_VOICED_MS_FOR_SPEAKER_PASS
+                    && score >= RELAXED_MIN_SCORE_FOR_SPEAKER_PASS) {
+                lowEnergyPass = true;
+                relaxedLowVolumePass = true;
             }
             if (!lowEnergyPass) {
                 Config.logDebug(String.format("★Speaker: ENERGY_REJECT score=%.3f thr=%.3f rms=%.1f window=%.1f voicedMs=%.0f < %.1f",
@@ -621,7 +632,8 @@ public class SpeakerProfile {
                 return false;
             }
             consecutiveRejects = 0;
-            Config.logDebug(String.format("★Speaker: LOW_ENERGY_PASS score=%.3f thr=%.3f rms=%.1f window=%.1f voicedMs=%.0f",
+            Config.logDebug(String.format("★Speaker: %s score=%.3f thr=%.3f rms=%.1f window=%.1f voicedMs=%.0f",
+                    relaxedLowVolumePass ? "RELAXED_LOW_ENERGY_PASS" : "LOW_ENERGY_PASS",
                     score, effectiveThreshold, rms, windowRms, voicedMs));
         }
         boolean match = score >= effectiveThreshold;
@@ -653,7 +665,12 @@ public class SpeakerProfile {
                 && sessionRejectCount >= STALE_SESSION_REJECT_THRESHOLD
                 && effectiveRms >= MIN_RMS_FOR_SPEAKER_CHECK
                 && voicedMs >= STALE_SESSION_MIN_VOICED_MS
-                && score <= STALE_SESSION_MAX_SCORE) {
+                && score >= STALE_SESSION_MIN_SCORE
+                && !AudioPrefilter.analyzeLowFrequencyPeriodicNoise(
+                        pcm16le,
+                        pcm16le == null ? 0 : pcm16le.length,
+                        Math.round(SAMPLE_RATE)
+                ).likelyMechanicalNoise()) {
             staleSessionBypass = true;
             consecutiveRejects = 0;
             sessionRejectCount = 0;

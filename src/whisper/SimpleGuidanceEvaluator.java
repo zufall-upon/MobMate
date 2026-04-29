@@ -19,6 +19,7 @@ final class SimpleGuidanceEvaluator {
             boolean speakerSampling,
             int speakerSampleCount,
             int speakerSampleRequired,
+            String speakerSamplePrompt,
             int inputLevel,
             boolean pendingMode,
             int pendingRemainingSec,
@@ -28,6 +29,7 @@ final class SimpleGuidanceEvaluator {
             boolean translateEnabled,
             String translateTarget,
             boolean radioConfigured,
+            boolean voiceVoxRecommended,
             String featureAnnouncement
     ) {}
 
@@ -73,6 +75,9 @@ final class SimpleGuidanceEvaluator {
 
     private List<GuidanceMessage> buildPassive(Context ctx) {
         List<GuidanceMessage> list = new ArrayList<>();
+        if (ctx.voiceVoxRecommended()) {
+            list.add(msg("voicevox_recommend", Severity.TIP, tr(ctx, "voicevox_recommend"), false));
+        }
         if (ctx.translateEnabled()) {
             list.add(msg("translate_on", Severity.TIP, tr(ctx, "translate_on"), false));
         } else {
@@ -94,6 +99,13 @@ final class SimpleGuidanceEvaluator {
 
     private String tr(Context ctx, String key) {
         String resourceKey = "simple.guidance." + key;
+        if ("speaker_sampling".equals(key)
+                && ctx.speakerSampleRequired() > 0
+                && ctx.speakerSamplePrompt() != null
+                && !ctx.speakerSamplePrompt().isBlank()) {
+            return UiText.t("simple.guidance.speaker_sampling_prompt")
+                    .formatted(ctx.speakerSamplePrompt(), Math.max(0, ctx.speakerSampleCount()), ctx.speakerSampleRequired());
+        }
         if ("speaker_sampling".equals(key) && ctx.speakerSampleRequired() > 0) {
             return UiText.t("simple.guidance.speaker_sampling_progress")
                     .formatted(Math.max(0, ctx.speakerSampleCount()), ctx.speakerSampleRequired());
