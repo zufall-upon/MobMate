@@ -206,7 +206,7 @@ public final class MoonshineBenchmarkCli {
                 new Preset("ja_talk_clean_v1", "ja", "talk_clean", 0.15, 20000, 0.30, 13.0, AudioPrefilter.Profile.NORMAL, 260, 120, 0, 0, 0, 0, -22.8, 1.00, 300, 300, 2, 35, false),
                 new Preset("ja_talk_noisy_v1", "ja", "talk_noisy", 0.15, 26000, 0.34, 13.0, AudioPrefilter.Profile.STRONG, 320, 160, 0, 0, 0, 0, -22.3, 1.00, 320, 420, 3, 45, true),
                 new Preset("ja_talk_low_voice_v1", "ja", "talk_low_voice", 0.12, 32000, 0.24, 13.0, AudioPrefilter.Profile.NORMAL, 180, 180, 0, 0, 0, 0, -24.0, 1.00, 360, 480, 3, 45, true),
-                new Preset("ja_short_command_v1", "ja", "short_command", 0.10, 32000, 0.26, 13.0, AudioPrefilter.Profile.NORMAL, 180, 220, 0, 0, 0, 0, -23.4, 1.08, 420, 520, 3, 45, true),
+                new Preset("ja_short_command_v1", "ja", "short_command", 0.10, 32000, 0.26, 13.0, AudioPrefilter.Profile.OFF, 180, 220, 0, 0, 0, 0, -23.4, 1.08, 420, 520, 3, 45, true),
                 new Preset("ja_desktop_hearing_v1", "ja", "desktop_hearing", 0.18, 22000, 0.32, 13.0, AudioPrefilter.Profile.STRONG, 260, 180, 0, 0, 0, 0, -22.6, 1.00, 300, 450, 3, 45, true)
         );
         List<Preset> out = new ArrayList<>(ja);
@@ -217,11 +217,11 @@ public final class MoonshineBenchmarkCli {
                 new Preset("en_short_command_v1", "en", "short_command", 0.10, 32000, 0.26, 6.5, AudioPrefilter.Profile.NORMAL, 180, 220, 0, 0, 0, 0, -23.4, 1.08, 420, 520, 3, 45, true),
                 new Preset("en_desktop_hearing_v1", "en", "desktop_hearing", 0.18, 22000, 0.32, 6.5, AudioPrefilter.Profile.STRONG, 260, 180, 0, 0, 0, 0, -22.6, 1.00, 300, 450, 3, 45, true),
 
-                new Preset("zh_talk_clean_v1", "zh", "talk_clean", 0.16, 24000, 0.27, 13.0, AudioPrefilter.Profile.NORMAL, 140, 220, 0, 0, 0, 0, -24.0, 1.08, 420, 620, 4, 55, true),
-                new Preset("zh_talk_noisy_v1", "zh", "talk_noisy", 0.16, 30000, 0.31, 13.0, AudioPrefilter.Profile.NORMAL, 120, 260, 0, 0, 0, 0, -25.2, 1.18, 620, 900, 4, 65, true),
-                new Preset("zh_talk_low_voice_v1", "zh", "talk_low_voice", 0.14, 34000, 0.23, 13.0, AudioPrefilter.Profile.OFF, 90, 300, 0, 0, 0, 0, -24.8, 1.12, 520, 820, 4, 65, true),
-                new Preset("zh_short_command_v1", "zh", "short_command", 0.12, 36000, 0.24, 13.0, AudioPrefilter.Profile.NORMAL, 120, 240, 0, 0, 0, 0, -24.8, 1.00, 460, 760, 4, 70, true),
-                new Preset("zh_desktop_hearing_v1", "zh", "desktop_hearing", 0.18, 28000, 0.29, 13.0, AudioPrefilter.Profile.NORMAL, 140, 260, 0, 0, 0, 0, -23.8, 1.08, 460, 760, 4, 65, true),
+                new Preset("zh_talk_clean_v1", "zh", "talk_clean", 0.16, 24000, 0.27, 16.0, AudioPrefilter.Profile.NORMAL, 140, 220, 0, 0, 0, 0, -24.0, 1.08, 420, 620, 4, 55, true),
+                new Preset("zh_talk_noisy_v1", "zh", "talk_noisy", 0.16, 30000, 0.31, 16.0, AudioPrefilter.Profile.NORMAL, 120, 260, 0, 0, 0, 0, -25.2, 1.18, 620, 900, 4, 65, true),
+                new Preset("zh_talk_low_voice_v1", "zh", "talk_low_voice", 0.14, 34000, 0.23, 16.0, AudioPrefilter.Profile.OFF, 90, 300, 0, 0, 0, 0, -24.8, 1.12, 520, 820, 4, 65, true),
+                new Preset("zh_short_command_v1", "zh", "short_command", 0.12, 36000, 0.24, 16.0, AudioPrefilter.Profile.NORMAL, 120, 240, 0, 0, 0, 0, -24.8, 1.00, 460, 760, 4, 70, true),
+                new Preset("zh_desktop_hearing_v1", "zh", "desktop_hearing", 0.18, 28000, 0.29, 16.0, AudioPrefilter.Profile.NORMAL, 140, 260, 0, 0, 0, 0, -23.8, 1.08, 460, 760, 4, 65, true),
 
                 new Preset("ko_talk_clean_v1", "ko", "talk_clean", 0.16, 26000, 0.27, 13.0, AudioPrefilter.Profile.NORMAL, 120, 240, 0, 0, 0, 0, -24.2, 1.12, 480, 760, 4, 60, true),
                 new Preset("ko_talk_noisy_v1", "ko", "talk_noisy", 0.16, 32000, 0.31, 13.0, AudioPrefilter.Profile.NORMAL, 160, 280, 0, 0, 0, 0, -23.8, 1.10, 500, 840, 4, 65, true),
@@ -538,7 +538,12 @@ public final class MoonshineBenchmarkCli {
                 {"小", "ちい"}, {"今", "いま"}, {"左", "ひだり"}, {"移動", "いどう"},
                 {"画面", "がめん"}, {"確認", "かくにん"}, {"下さい", "ください"},
                 {"下さい", "ください"}, {"この", "この"}, {"テスト", "てすと"},
-                {"周り", "まわり"}, {"うるさい", "うるさい"}, {"まだ", "まだ"}
+                {"周り", "まわり"}, {"うるさい", "うるさい"}, {"まだ", "まだ"},
+                {"１", "いち"}, {"1", "いち"}, {"一", "いち"}, {"秒", "びょう"},
+                {"止", "と"}, {"次", "つぎ"}, {"早", "はや"}, {"開", "ひら"},
+                {"切", "き"}, {"替", "か"}, {"雑音", "ざつおん"}, {"背景", "はいけい"},
+                {"部屋", "へや"}, {"音", "おと"}, {"文", "ぶん"}, {"拾", "ひろ"},
+                {"人", "ひと"}
         };
         for (String[] pair : replacements) {
             s = s.replace(pair[0], pair[1]);
@@ -565,7 +570,7 @@ public final class MoonshineBenchmarkCli {
 
     private static String metricNormalizerName(String language) {
         String lang = language == null ? "" : language.toLowerCase(Locale.ROOT);
-        return "ja".equals(lang) ? "common+japanese_kana_v1" : "common_v1";
+        return "ja".equals(lang) ? "common+japanese_kana_v2" : "common_v1";
     }
 
     private static int levenshteinByCodePoint(String a, String b) {

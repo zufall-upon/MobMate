@@ -115,6 +115,41 @@ public final class AudioPrefilter {
         }
     }
 
+    public static final class RealtimeNoiseGateState {
+        private boolean open = false;
+        private double envelopeRms = 0.0;
+        private int releaseSamplesRemaining = 0;
+
+        public void reset() {
+            open = false;
+            envelopeRms = 0.0;
+            releaseSamplesRemaining = 0;
+        }
+    }
+
+    public static final class RealtimeNoiseGateCalibration {
+        public final double openRms;
+        public final double closeRms;
+        public final int openPeak;
+        public final int closePeak;
+        public final int releaseMs;
+        public final String source;
+
+        public RealtimeNoiseGateCalibration(double openRms,
+                                            double closeRms,
+                                            int openPeak,
+                                            int closePeak,
+                                            int releaseMs,
+                                            String source) {
+            this.openRms = openRms;
+            this.closeRms = closeRms;
+            this.openPeak = openPeak;
+            this.closePeak = closePeak;
+            this.releaseMs = releaseMs;
+            this.source = source == null ? "" : source;
+        }
+    }
+
     private static final double DEFAULT_HP_CUTOFF_HZ = 80.0;
     private static final double DEFAULT_LP_CUTOFF_HZ = 6500.0;
     private static final double STRONG_HP_CUTOFF_HZ = 75.0;
@@ -139,6 +174,71 @@ public final class AudioPrefilter {
     private static final double STRONG_STREAMING_AGC_MAX_GAIN = 3.4;
 
     private AudioPrefilter() {}
+
+    public static byte[] applyRealtimeNoiseGateForVad(byte[] pcm16le,
+                                                       int bytes,
+                                                       int sampleRateHz,
+                                                       boolean lowGainMic,
+                                                       RealtimeNoiseGateState state) {
+        return applyRealtimeNoiseGateForVad(pcm16le, bytes, sampleRateHz, lowGainMic, state, null);
+    }
+
+    public static byte[] applyRealtimeNoiseGateForVad(byte[] pcm16le,
+                                                       int bytes,
+                                                       int sampleRateHz,
+                                                       boolean lowGainMic,
+                                                       RealtimeNoiseGateState state,
+                                                       RealtimeNoiseGateCalibration calibration) {
+        if (pcm16le == null || bytes <= 0 || state == null) return pcm16le;
+        if (bytes < 4 || sampleRateHz <= 0) return pcm16le;
+
+        int samples = bytes / 2;
+        long sumSq = 0L;
+        int peak = 0;
+        for (int i = 0; i + 1 < bytes; i += 2) {
+            short s = readPcm16le(pcm16le, i);
+            int abs = Math.abs((int) s);
+            if (abs > peak) peak = abs;
+            sumSq += (long) s * (long) s;
+        }
+        if (samples <= 0) return pcm16le;
+
+        double rms = Math.sqrt((double) sumSq / (double) samples);
+        double attack = 0.72;
+        double release = 0.10;
+        if (rms >= state.envelopeRms) {
+            state.envelopeRms = (state.envelopeRms * (1.0 - attack)) + (rms * attack);
+        } else {
+            state.envelopeRms = (state.envelopeRms * (1.0 - release)) + (rms * release);
+        }
+
+        double openRms = calibration == null ? (lowGainMic ? 70.0 : 90.0) : calibration.openRms;
+        double closeRms = calibration == null ? (lowGainMic ? 42.0 : 55.0) : calibration.closeRms;
+        int openPeak = calibration == null ? (lowGainMic ? 220 : 300) : calibration.openPeak;
+        int closePeak = calibration == null ? (lowGainMic ? 140 : 190) : calibration.closePeak;
+        int releaseMs = calibration == null ? (lowGainMic ? 160 : 120) : calibration.releaseMs;
+        int releaseSamples = Math.max(1, (int) Math.round(sampleRateHz * (Math.max(40, releaseMs) / 1000.0)));
+
+        boolean aboveOpen = state.envelopeRms >= openRms || peak >= openPeak;
+        boolean aboveClose = state.envelopeRms >= closeRms || peak >= closePeak;
+        if (aboveOpen) {
+            state.open = true;
+            state.releaseSamplesRemaining = releaseSamples;
+        } else if (state.open) {
+            if (aboveClose) {
+                state.releaseSamplesRemaining = releaseSamples;
+            } else {
+                state.releaseSamplesRemaining -= samples;
+                if (state.releaseSamplesRemaining <= 0) {
+                    state.open = false;
+                    state.releaseSamplesRemaining = 0;
+                }
+            }
+        }
+
+        if (state.open) return pcm16le;
+        return new byte[bytes];
+    }
 
     public static byte[] processForAsr(byte[] pcm16le,
                                        int bytes,

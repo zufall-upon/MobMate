@@ -396,11 +396,14 @@ public final class Config {
     }
     public static void trimFileBySize(Path file, long maxBytes) throws IOException {
         if (!Files.exists(file)) return;
-        if (Files.size(file) <= maxBytes) return;
+        if (maxBytes <= 0) return;
+        long size = Files.size(file);
+        if (size <= maxBytes) return;
 
         byte[] all = Files.readAllBytes(file);
+        int keepBytes = (int) Math.min((long) all.length, Math.min(maxBytes, (long) Integer.MAX_VALUE));
         byte[] tail = Arrays.copyOfRange(
-                all, all.length - (int)maxBytes, all.length
+                all, all.length - keepBytes, all.length
         );
         Files.write(file, tail);
     }

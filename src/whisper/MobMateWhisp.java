@@ -745,6 +745,7 @@ public class MobMateWhisp implements NativeKeyListener {
     private static final int MOONSHINE_VERIFY_TIMEOUT_MS = 850;
     private static final int MOONSHINE_ACCURACY_TIMEOUT_MS = 1500;
     private static final long MOONSHINE_ACCURACY_FINAL_HOLD_MS = 250L;
+    private static final long SHORT_FINAL_COALESCE_WINDOW_MS = 1000L;
     private static final long MOONSHINE_FORCE_FINALIZE_STALE_MS = 1_100L;
     private static final long MOONSHINE_FORCE_FINALIZE_MIN_SILENCE_MS = 420L;
     private static final long MOONSHINE_FORCE_FINALIZE_MAX_WAIT_MS = 3_000L;
@@ -1098,6 +1099,10 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile boolean pendingLaughAppend = false;
     private final AudioPrefilter.State talkRealtimePrefilterState = new AudioPrefilter.State();
     private final AudioPrefilter.State talkVadPrefilterState = new AudioPrefilter.State();
+    private final AudioPrefilter.RealtimeNoiseGateState talkPreGateNoiseGateState =
+            new AudioPrefilter.RealtimeNoiseGateState();
+    private final AudioPrefilter.RealtimeNoiseGateState talkVadNoiseGateState =
+            new AudioPrefilter.RealtimeNoiseGateState();
 
     private final Object psLock = new Object();
     private volatile boolean psStarting = false;
@@ -1142,7 +1147,8 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile long ttsStartedMs = 0L;
     private volatile long ttsEndedMs = 0L;
     private volatile long ttsVadSuppressUntilMs = 0L;
-    private static final long TTS_VAD_SUPPRESS_MS = 250L;
+    private static final long TTS_VAD_SUPPRESS_MS = 1400L;
+    private static final long TTS_VAD_ENDED_COOLDOWN_MS = 700L;
     private volatile boolean moonshineLastGateOk = true;
     /** Moonshine連続無出力カウント（Partial/COMPLETEが来たら0リセット） */
     private volatile int moonshineNoOutputCount = 0;
@@ -1158,6 +1164,20 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile long talkSpeechGateLastAtMs = 0L;
     private volatile long talkSpeechGateLastLogAtMs = 0L;
     private volatile String talkSpeechGateLastReason = "";
+    private final Object asrRealtimeMetricsWriteLock = new Object();
+    private final java.util.concurrent.ConcurrentHashMap<Long, RealtimeAsrMetricState> asrRealtimeMetricByUtterance =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private volatile int talkPreGateRejectBurstFrames = 0;
+    private volatile String talkPreGateRejectBurstReason = "";
+    private volatile int talkPreGateRejectBurstMaxPeak = 0;
+    private volatile int talkPreGateRejectBurstMaxAvg = 0;
+    private volatile double talkPreGateRejectBurstMaxRms = 0.0d;
+    private volatile int moonshineBlankUtteranceStreak = 0;
+    private volatile long moonshineBlankGateTightenUntilMs = 0L;
+    private volatile double moonshineBlankGateTightenFactor = 0.0d;
+    private volatile long moonshineBlankAbortSuppressUntilMs = 0L;
+    private final Set<Long> moonshinePromotedBlankFinalUtterances =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final long MOONSHINE_NO_OUTPUT_FALLBACK_WAIT_MS = 650L;
     private static final long COMPANION_SEMANTIC_WHISPER_FALLBACK_COOLDOWN_MS = 15_000L;
     private static final long MOONSHINE_CARRY_JOIN_WINDOW_MS = 1800L;
@@ -1223,6 +1243,86 @@ public class MobMateWhisp implements NativeKeyListener {
     // Action
     enum Action {
         COPY_TO_CLIPBOARD_AND_PASTE, TYPE_STRING, NOTHING, NOTHING_NO_SPEAK, TRANSLATE,TRANSLATE_AND_SPEAK
+    }
+
+    private static final class TalkVadRuntimePreset {
+        final String id;
+        final int minSpeechMs;
+        final int minSilenceMs;
+        final int speechPadMs;
+        final long forceFinalMs;
+
+        TalkVadRuntimePreset(String id, int minSpeechMs, int minSilenceMs, int speechPadMs, long forceFinalMs) {
+            this.id = id;
+            this.minSpeechMs = minSpeechMs;
+            this.minSilenceMs = minSilenceMs;
+            this.speechPadMs = speechPadMs;
+            this.forceFinalMs = forceFinalMs;
+        }
+    }
+
+    private static final class PendingShortFinal {
+        final long utteranceSeq;
+        final String text;
+        final Action action;
+        final boolean rescue;
+        final FinalCommitConfidence confidence;
+        final long createdAtMs;
+
+        PendingShortFinal(long utteranceSeq,
+                          String text,
+                          Action action,
+                          boolean rescue,
+                          FinalCommitConfidence confidence,
+                          long createdAtMs) {
+            this.utteranceSeq = utteranceSeq;
+            this.text = text;
+            this.action = action;
+            this.rescue = rescue;
+            this.confidence = confidence;
+            this.createdAtMs = createdAtMs;
+        }
+    }
+
+    private static final class RealtimeAsrMetricState {
+        final long utteranceSeq;
+        final long startedAtMs;
+        final String language;
+        final String vadPresetId;
+        int preGateRejectFrames;
+        String preGateLastReason = "";
+        int preGateMaxPeak;
+        int preGateMaxAvg;
+        double preGateMaxRms;
+        int vadMaxPeak;
+        int vadMaxAvg;
+        int vadFrameCount;
+        int vadSpeechFrames;
+        boolean lowGainMic;
+        double gateOpenRms;
+        double gateCloseRms;
+        int gateOpenPeak;
+        int gateClosePeak;
+        int gateReleaseMs;
+        String gateSource = "";
+        long speechMs;
+        int silenceFrames;
+        int effectiveSilenceFrames;
+        int finalBytes;
+        int rawBytes;
+        int speakerBytes;
+        String finalPrefilter = "";
+        String cachedComplete = "";
+        long firstTextAtMs;
+        String firstText = "";
+        boolean blankAbort;
+
+        RealtimeAsrMetricState(long utteranceSeq, String language, String vadPresetId) {
+            this.utteranceSeq = utteranceSeq;
+            this.startedAtMs = System.currentTimeMillis();
+            this.language = language == null ? "" : language;
+            this.vadPresetId = vadPresetId == null ? "" : vadPresetId;
+        }
     }
 
     public static boolean isSilenceAlternate() {
@@ -2887,7 +2987,7 @@ public class MobMateWhisp implements NativeKeyListener {
             vadThreshold = 0.27;
         } else if ("zh".equals(normalized)) {
             // Chinese benefits moderately from a more conservative Moonshine VAD preset.
-            maxTokensPerSecond = 13.0;
+            maxTokensPerSecond = 16.0;
             vadWindowSec = 0.16;
             vadLookBehindSamples = 30000;
             vadThreshold = 0.29;
@@ -2902,6 +3002,28 @@ public class MobMateWhisp implements NativeKeyListener {
                 + " vad_window=" + vadWindowSec
                 + " vad_lookbehind=" + vadLookBehindSamples
                 + " vad_threshold=" + vadThreshold);
+    }
+
+    private TalkVadRuntimePreset resolveTalkVadRuntimePreset(String lang, boolean lowGainMic, String prefilterMode) {
+        String normalized = normalizeMoonshinePresetLang(lang);
+        String profile = normalizeAudioPrefilterMode(prefilterMode);
+        boolean noisy = isStrongAudioPrefilterMode(profile);
+        if (lowGainMic) {
+            return new TalkVadRuntimePreset("moonshine_" + normalized + "_talk_low_voice", 220, 650, 220, 7000L);
+        }
+        if (noisy) {
+            return new TalkVadRuntimePreset("moonshine_" + normalized + "_talk_noisy", 300, 650, 180, 6500L);
+        }
+        return new TalkVadRuntimePreset("moonshine_" + normalized + "_talk_clean", 250, 520, 150, 6500L);
+    }
+
+    private int audioFramesForMs(long ms, AudioFormat format, int chunkBytes) {
+        if (format == null || ms <= 0L) return 1;
+        double sampleRate = Math.max(8000.0d, format.getSampleRate());
+        int frameSize = Math.max(1, format.getFrameSize());
+        int bytes = Math.max(frameSize, chunkBytes);
+        double chunkMs = ((double) bytes * 1000.0d) / (sampleRate * (double) frameSize);
+        return Math.max(1, (int) Math.ceil((double) ms / Math.max(1.0d, chunkMs)));
     }
 
     private LocalMoonshineSTT loadHearingMoonshineModel(String path, String langForLog) {
@@ -3650,6 +3772,7 @@ public class MobMateWhisp implements NativeKeyListener {
             String bestPartial = choosePreferredUtteranceText(MobMateWhisp.getLastPartial(), clamped);
             MobMateWhisp.setLastPartial(bestPartial);
             rememberMoonshinePeakPartial(currentUtteranceSeq, bestPartial);
+            noteRealtimeAsrTextSeen(currentUtteranceSeq, bestPartial);
             lastPartialUpdateMs = nowMs;
             setTranscribing(true);  // ★ADD: partial到達時にtranscribing開始（全フレームではなく）
             if (!bestPartial.equals(clamped)) {
@@ -3707,6 +3830,7 @@ public class MobMateWhisp implements NativeKeyListener {
                     MobMateWhisp.setLastPartial(best);
                     updateTalkPartialPreview(best);
                 }
+                noteRealtimeAsrTextSeen(currentUtteranceSeq, best);
 
                 if (containsLaughTokenByConfig(best)) {
                     laughPartialCount = 0;
@@ -4787,6 +4911,380 @@ public class MobMateWhisp implements NativeKeyListener {
                 " lowGain=" + sharedNoiseProfile.isLowGainMic +
                 " peakTh=" + sharedNoiseProfile.getPeakThreshold() +
                 " avgTh=" + sharedNoiseProfile.getAvgThreshold());
+        appendTalkNoiseAnalysis(key, got, need, sharedNoiseProfile);
+    }
+
+    private int percentileInt(List<Integer> values, double percentile) {
+        if (values == null || values.isEmpty()) return 0;
+        List<Integer> sorted = new ArrayList<>(values);
+        Collections.sort(sorted);
+        int index = (int) Math.ceil((Math.max(0.0d, Math.min(1.0d, percentile)) * sorted.size())) - 1;
+        index = Math.max(0, Math.min(sorted.size() - 1, index));
+        return sorted.get(index);
+    }
+
+    private AudioPrefilter.RealtimeNoiseGateCalibration resolveTalkNoiseGateCalibration(AdaptiveNoiseProfile profile,
+                                                                                        boolean lowGainMic) {
+        if (!Config.getBool("talk.vad.noise_gate.auto.enabled", true)) return null;
+        if (profile == null || profile.rawPeaks == null || profile.rawPeaks.size() < 8) return null;
+        int rawPeakP95 = percentileInt(profile.rawPeaks, 0.95d);
+        int defaultOpenPeak = lowGainMic ? 220 : 300;
+        int defaultClosePeak = lowGainMic ? 140 : 190;
+        double defaultOpenRms = lowGainMic ? 70.0d : 90.0d;
+        double defaultCloseRms = lowGainMic ? 42.0d : 55.0d;
+
+        int peakMargin = Math.max(80, (int) Math.round(profile.getNoiseStdDev() * 2.0d));
+        int peakCap = lowGainMic ? 1800 : 4200;
+        int openPeak = Math.max(defaultOpenPeak, Math.min(peakCap, rawPeakP95 + peakMargin));
+        int closePeak = Math.max(defaultClosePeak, Math.min(openPeak - 20, (int) Math.round(openPeak * 0.65d)));
+        double noiseRmsHint = (profile.getNoiseFloor() * 0.28d) + (profile.getNoiseStdDev() * 0.35d);
+        double rmsCap = lowGainMic ? 240.0d : 520.0d;
+        double openRms = Math.max(defaultOpenRms, Math.min(rmsCap, noiseRmsHint));
+        if (System.currentTimeMillis() < moonshineBlankGateTightenUntilMs) {
+            double factor = Math.max(0.0d, Math.min(0.75d, moonshineBlankGateTightenFactor));
+            openPeak = Math.min(peakCap, (int) Math.round(openPeak * (1.0d + factor)));
+            openRms = Math.min(rmsCap, openRms * (1.0d + factor));
+        }
+        double closeRms = Math.max(defaultCloseRms, Math.min(openRms - 4.0d, openRms * 0.62d));
+        int releaseMs = lowGainMic ? 170 : 135;
+        return new AudioPrefilter.RealtimeNoiseGateCalibration(
+                openRms,
+                closeRms,
+                openPeak,
+                closePeak,
+                releaseMs,
+                "adaptive_noise_profile");
+    }
+
+    private void appendTalkNoiseAnalysis(String deviceKey, int got, int need, AdaptiveNoiseProfile profile) {
+        if (profile == null) return;
+        try {
+            int rawPeakP50 = percentileInt(profile.rawPeaks, 0.50d);
+            int rawPeakP95 = percentileInt(profile.rawPeaks, 0.95d);
+            int rawAvgP50 = percentileInt(profile.rawAvgs, 0.50d);
+            int rawAvgP95 = percentileInt(profile.rawAvgs, 0.95d);
+            AudioPrefilter.RealtimeNoiseGateCalibration gateCalibration =
+                    resolveTalkNoiseGateCalibration(profile, profile.isLowGainMic);
+            JSONObject row = new JSONObject();
+            row.put("ts", LocalDateTime.now().toString());
+            row.put("type", "talk_noise_analysis");
+            row.put("device", deviceKey == null ? "" : deviceKey);
+            row.put("engine", isEngineMoonshine() ? "moonshine" : "whisper");
+            row.put("language", normalizeMoonshinePresetLang(getTalkLanguage()));
+            row.put("samples", got);
+            row.put("target_samples", need);
+            row.put("low_gain", profile.isLowGainMic);
+            row.put("noise_floor", profile.getNoiseFloor());
+            row.put("noise_stddev", profile.getNoiseStdDev());
+            row.put("peak_threshold", profile.getPeakThreshold());
+            row.put("avg_threshold", profile.getAvgThreshold());
+            row.put("raw_peak_p50", rawPeakP50);
+            row.put("raw_peak_p95", rawPeakP95);
+            row.put("raw_avg_p50", rawAvgP50);
+            row.put("raw_avg_p95", rawAvgP95);
+            row.put("suggested_gate_peak", Math.max(220, rawPeakP95 + (profile.getNoiseStdDev() * 2)));
+            row.put("suggested_gate_avg", Math.max(35, rawAvgP95 + Math.max(8, profile.getNoiseStdDev() / 3)));
+            if (gateCalibration != null) {
+                row.put("auto_gate_source", gateCalibration.source);
+                row.put("auto_gate_open_peak", gateCalibration.openPeak);
+                row.put("auto_gate_close_peak", gateCalibration.closePeak);
+                row.put("auto_gate_open_rms", gateCalibration.openRms);
+                row.put("auto_gate_close_rms", gateCalibration.closeRms);
+                row.put("auto_gate_release_ms", gateCalibration.releaseMs);
+            }
+            Files.writeString(
+                    Paths.get("asr_noise_analysis.jsonl"),
+                    row.toString() + System.lineSeparator(),
+                    StandardCharsets.UTF_8,
+                    StandardOpenOption.CREATE,
+                    StandardOpenOption.APPEND
+            );
+        } catch (Throwable t) {
+            Config.logDebug("★Noise analysis append failed: " + t);
+        }
+    }
+
+    private boolean isRealtimeAsrMetricsEnabled() {
+        return Config.getBool("asr.realtime_metrics.enabled", true);
+    }
+
+    private void noteTalkPreGateReject(TalkSpeechGateDecision decision) {
+        if (decision == null) return;
+        talkPreGateRejectBurstFrames++;
+        talkPreGateRejectBurstReason = decision.reason;
+        talkPreGateRejectBurstMaxPeak = Math.max(talkPreGateRejectBurstMaxPeak, decision.rawPeak);
+        talkPreGateRejectBurstMaxAvg = Math.max(talkPreGateRejectBurstMaxAvg, decision.rawAvg);
+        if (decision.metrics != null) {
+            talkPreGateRejectBurstMaxRms = Math.max(talkPreGateRejectBurstMaxRms, decision.metrics.rms);
+        }
+    }
+
+    private void startRealtimeAsrMetric(long utteranceSeq,
+                                        TalkVadRuntimePreset vadPreset,
+                                        AdaptiveNoiseProfile profile,
+                                        AudioPrefilter.RealtimeNoiseGateCalibration gateCalibration) {
+        if (utteranceSeq <= 0L || !isRealtimeAsrMetricsEnabled()) return;
+        RealtimeAsrMetricState state = new RealtimeAsrMetricState(
+                utteranceSeq,
+                normalizeMoonshinePresetLang(getTalkLanguage()),
+                vadPreset == null ? "" : vadPreset.id
+        );
+        state.preGateRejectFrames = talkPreGateRejectBurstFrames;
+        state.preGateLastReason = talkPreGateRejectBurstReason == null ? "" : talkPreGateRejectBurstReason;
+        state.preGateMaxPeak = talkPreGateRejectBurstMaxPeak;
+        state.preGateMaxAvg = talkPreGateRejectBurstMaxAvg;
+        state.preGateMaxRms = talkPreGateRejectBurstMaxRms;
+        applyRealtimeMetricNoiseGateState(state, profile, gateCalibration);
+        talkPreGateRejectBurstFrames = 0;
+        talkPreGateRejectBurstReason = "";
+        talkPreGateRejectBurstMaxPeak = 0;
+        talkPreGateRejectBurstMaxAvg = 0;
+        talkPreGateRejectBurstMaxRms = 0.0d;
+        asrRealtimeMetricByUtterance.put(utteranceSeq, state);
+        trimRealtimeAsrMetrics(utteranceSeq);
+        appendRealtimeAsrMetricEvent(utteranceSeq, "utterance_start", "", null, false, null, "");
+    }
+
+    private void noteRealtimeAsrVadFrame(long utteranceSeq,
+                                         boolean speech,
+                                         int peak,
+                                         int avg,
+                                         AdaptiveNoiseProfile profile,
+                                         AudioPrefilter.RealtimeNoiseGateCalibration gateCalibration) {
+        if (utteranceSeq <= 0L || !isRealtimeAsrMetricsEnabled()) return;
+        RealtimeAsrMetricState state = asrRealtimeMetricByUtterance.get(utteranceSeq);
+        if (state == null) return;
+        state.vadFrameCount++;
+        if (speech) state.vadSpeechFrames++;
+        state.vadMaxPeak = Math.max(state.vadMaxPeak, peak);
+        state.vadMaxAvg = Math.max(state.vadMaxAvg, avg);
+        applyRealtimeMetricNoiseGateState(state, profile, gateCalibration);
+    }
+
+    private void noteRealtimeAsrTextSeen(long utteranceSeq, String text) {
+        if (utteranceSeq <= 0L || text == null || text.isBlank() || !isRealtimeAsrMetricsEnabled()) return;
+        RealtimeAsrMetricState state = asrRealtimeMetricByUtterance.get(utteranceSeq);
+        if (state == null || state.firstTextAtMs > 0L) return;
+        state.firstTextAtMs = System.currentTimeMillis();
+        state.firstText = text.trim();
+    }
+
+    private void noteRealtimeAsrFinalSnapshot(long utteranceSeq,
+                                              long speechMs,
+                                              int silenceFrames,
+                                              int effectiveSilenceFrames,
+                                              int finalBytes,
+                                              int rawBytes,
+                                              int speakerBytes,
+                                              String finalPrefilter,
+                                              String cachedComplete) {
+        if (utteranceSeq <= 0L || !isRealtimeAsrMetricsEnabled()) return;
+        RealtimeAsrMetricState state = asrRealtimeMetricByUtterance.get(utteranceSeq);
+        if (state == null) return;
+        state.speechMs = Math.max(0L, speechMs);
+        state.silenceFrames = silenceFrames;
+        state.effectiveSilenceFrames = effectiveSilenceFrames;
+        state.finalBytes = Math.max(0, finalBytes);
+        state.rawBytes = Math.max(0, rawBytes);
+        state.speakerBytes = Math.max(0, speakerBytes);
+        state.finalPrefilter = finalPrefilter == null ? "" : finalPrefilter;
+        state.cachedComplete = cachedComplete == null ? "" : cachedComplete;
+    }
+
+    private void noteMoonshineBlankUtterance(long utteranceSeq,
+                                             String reason,
+                                             long speechMs,
+                                             int peak,
+                                             int avg) {
+        if (!isEngineMoonshine()) return;
+        moonshineBlankUtteranceStreak = Math.min(8, moonshineBlankUtteranceStreak + 1);
+        long nowMs = System.currentTimeMillis();
+        moonshineBlankGateTightenUntilMs = nowMs + Config.getInt("talk.vad.blank_gate_tighten_ms", 20_000);
+        moonshineBlankGateTightenFactor = Math.min(0.75d, 0.30d * moonshineBlankUtteranceStreak);
+        int suppressMs = moonshineBlankUtteranceStreak >= 2
+                ? Config.getInt("talk.vad.blank_abort_suppress_long_ms", 1600)
+                : Config.getInt("talk.vad.blank_abort_suppress_ms", 900);
+        moonshineBlankAbortSuppressUntilMs = Math.max(
+                moonshineBlankAbortSuppressUntilMs,
+                nowMs + Math.max(0, suppressMs));
+        Config.logDebug("[ASR][Blank] streak=" + moonshineBlankUtteranceStreak
+                + " reason=" + reason
+                + " utt=" + utteranceSeq
+                + " speechMs=" + speechMs
+                + " peak=" + peak
+                + " avg=" + avg
+                + " gateTightenFactor=" + String.format(Locale.ROOT, "%.2f", moonshineBlankGateTightenFactor)
+                + " suppressMs=" + suppressMs);
+    }
+
+    private void noteMoonshineTextCommit() {
+        long nowMs = System.currentTimeMillis();
+        int previousStreak = moonshineBlankUtteranceStreak;
+        if (moonshineBlankUtteranceStreak == 0
+                && moonshineBlankGateTightenUntilMs <= nowMs
+                && moonshineBlankGateTightenFactor == 0.0d
+                && moonshineBlankAbortSuppressUntilMs <= nowMs) {
+            return;
+        }
+        if (previousStreak >= 2) {
+            moonshineBlankUtteranceStreak = Math.max(2, Math.min(previousStreak, 3));
+            moonshineBlankGateTightenUntilMs = nowMs
+                    + Config.getInt("talk.vad.blank_gate_recovery_ms", 15_000);
+            moonshineBlankGateTightenFactor = Math.max(
+                    0.30d,
+                    Math.min(0.45d, moonshineBlankGateTightenFactor * 0.55d));
+            moonshineBlankAbortSuppressUntilMs = Math.max(moonshineBlankAbortSuppressUntilMs, nowMs + 250L);
+            Config.logDebug("[ASR][Blank] decay after text commit previousStreak=" + previousStreak
+                    + " gateTightenFactor=" + String.format(Locale.ROOT, "%.2f", moonshineBlankGateTightenFactor));
+            return;
+        }
+        moonshineBlankUtteranceStreak = 0;
+        moonshineBlankGateTightenUntilMs = 0L;
+        moonshineBlankGateTightenFactor = 0.0d;
+        moonshineBlankAbortSuppressUntilMs = 0L;
+        Config.logDebug("[ASR][Blank] reset after text commit");
+    }
+
+    private boolean shouldAbortBlankMoonshineUtterance(long utteranceSeq,
+                                                       long speechStartMs,
+                                                       long nowMs,
+                                                       String latestText) {
+        if (!isEngineMoonshine() || utteranceSeq <= 0L || speechStartMs <= 0L) return false;
+        if (latestText != null && !latestText.trim().isEmpty()) return false;
+        if (hasMoonshineOutputForUtterance(utteranceSeq)) return false;
+        if (lastPartialUpdateMs > speechStartMs) return false;
+        int baseAbortMs = Config.getInt("talk.vad.blank_abort_ms", 3400);
+        int tightenedAbortMs = Config.getInt("talk.vad.blank_abort_tight_ms", 2300);
+        int stormAbortMs = Config.getInt("talk.vad.blank_abort_storm_ms", 5400);
+        int abortMs;
+        if (moonshineBlankUtteranceStreak >= 2) {
+            abortMs = Math.max(baseAbortMs, stormAbortMs);
+        } else {
+            abortMs = moonshineBlankUtteranceStreak > 0 ? Math.min(baseAbortMs, tightenedAbortMs) : baseAbortMs;
+        }
+        return (nowMs - speechStartMs) >= Math.max(1200, abortMs);
+    }
+
+    private boolean shouldPromoteBlankMoonshineUtteranceToFinal(long speechMs,
+                                                                int peak,
+                                                                int avg,
+                                                                int bufferedBytes) {
+        if (!Config.getBool("talk.vad.blank_promote_final.enabled", true)) return false;
+        int minMs = Config.getInt("talk.vad.blank_promote_final_min_ms", 1800);
+        int minBytes = Config.getInt("talk.vad.blank_promote_final_min_bytes", 16000);
+        int peakMin = Config.getInt("talk.vad.blank_promote_final_peak", 6500);
+        int avgMin = Config.getInt("talk.vad.blank_promote_final_avg", 1600);
+        if (speechMs < minMs || bufferedBytes < minBytes) return false;
+        return peak >= peakMin || avg >= avgMin;
+    }
+
+    private void markRealtimeAsrBlankAbort(long utteranceSeq) {
+        RealtimeAsrMetricState state = utteranceSeq > 0L ? asrRealtimeMetricByUtterance.get(utteranceSeq) : null;
+        if (state != null) state.blankAbort = true;
+    }
+
+    private void applyRealtimeMetricNoiseGateState(RealtimeAsrMetricState state,
+                                                   AdaptiveNoiseProfile profile,
+                                                   AudioPrefilter.RealtimeNoiseGateCalibration gateCalibration) {
+        if (state == null) return;
+        state.lowGainMic = profile != null && profile.isLowGainMic;
+        if (gateCalibration != null) {
+            state.gateOpenRms = gateCalibration.openRms;
+            state.gateCloseRms = gateCalibration.closeRms;
+            state.gateOpenPeak = gateCalibration.openPeak;
+            state.gateClosePeak = gateCalibration.closePeak;
+            state.gateReleaseMs = gateCalibration.releaseMs;
+            state.gateSource = gateCalibration.source == null ? "" : gateCalibration.source;
+        }
+    }
+
+    private void appendRealtimeAsrMetricEvent(long utteranceSeq,
+                                              String event,
+                                              String text,
+                                              Action action,
+                                              boolean rescue,
+                                              FinalCommitConfidence confidence,
+                                              String reason) {
+        if (!isRealtimeAsrMetricsEnabled()) return;
+        try {
+            if (("commit".equals(event) || "coalesce_commit".equals(event))
+                    && text != null && !text.isBlank()) {
+                noteRealtimeAsrTextSeen(utteranceSeq, text);
+                noteMoonshineTextCommit();
+            }
+            RealtimeAsrMetricState state = utteranceSeq > 0L ? asrRealtimeMetricByUtterance.get(utteranceSeq) : null;
+            JSONObject row = new JSONObject();
+            row.put("ts", LocalDateTime.now().toString());
+            row.put("type", "asr_realtime_metric");
+            row.put("event", event == null ? "" : event);
+            row.put("utterance_seq", utteranceSeq);
+            row.put("engine", isEngineMoonshine() ? "moonshine" : "whisper");
+            row.put("language", state == null ? normalizeMoonshinePresetLang(getTalkLanguage()) : state.language);
+            row.put("vad_preset", state == null ? "" : state.vadPresetId);
+            row.put("action", action == null ? "" : action.name());
+            row.put("rescue", rescue);
+            row.put("text", text == null ? "" : text);
+            row.put("reason", reason == null ? "" : reason);
+            row.put("pre_gate_reject_frames", state == null ? 0 : state.preGateRejectFrames);
+            row.put("pre_gate_last_reason", state == null ? "" : state.preGateLastReason);
+            row.put("pre_gate_max_peak", state == null ? 0 : state.preGateMaxPeak);
+            row.put("pre_gate_max_avg", state == null ? 0 : state.preGateMaxAvg);
+            row.put("pre_gate_max_rms", state == null ? 0.0d : state.preGateMaxRms);
+            row.put("vad_max_peak", state == null ? 0 : state.vadMaxPeak);
+            row.put("vad_max_avg", state == null ? 0 : state.vadMaxAvg);
+            row.put("vad_frames", state == null ? 0 : state.vadFrameCount);
+            row.put("vad_speech_frames", state == null ? 0 : state.vadSpeechFrames);
+            row.put("speech_ratio", state == null || state.vadFrameCount <= 0
+                    ? 0.0d
+                    : state.vadSpeechFrames / (double) state.vadFrameCount);
+            row.put("text_seen_ms", state == null || state.firstTextAtMs <= 0L
+                    ? JSONObject.NULL
+                    : Math.max(0L, state.firstTextAtMs - state.startedAtMs));
+            row.put("blank_duration_ms", state == null || state.firstTextAtMs > 0L
+                    ? 0L
+                    : Math.max(0L, System.currentTimeMillis() - (state == null ? System.currentTimeMillis() : state.startedAtMs)));
+            row.put("first_text", state == null ? "" : state.firstText);
+            row.put("blank_abort", state != null && state.blankAbort);
+            row.put("low_gain_mic", state != null && state.lowGainMic);
+            row.put("gate_source", state == null ? "" : state.gateSource);
+            row.put("gate_open_peak", state == null ? 0 : state.gateOpenPeak);
+            row.put("gate_close_peak", state == null ? 0 : state.gateClosePeak);
+            row.put("gate_open_rms", state == null ? 0.0d : state.gateOpenRms);
+            row.put("gate_close_rms", state == null ? 0.0d : state.gateCloseRms);
+            row.put("gate_release_ms", state == null ? 0 : state.gateReleaseMs);
+            row.put("speech_ms", state == null ? 0L : state.speechMs);
+            row.put("silence_frames", state == null ? 0 : state.silenceFrames);
+            row.put("effective_silence_frames", state == null ? 0 : state.effectiveSilenceFrames);
+            row.put("final_bytes", state == null ? 0 : state.finalBytes);
+            row.put("raw_bytes", state == null ? 0 : state.rawBytes);
+            row.put("speaker_bytes", state == null ? 0 : state.speakerBytes);
+            row.put("final_prefilter", state == null ? "" : state.finalPrefilter);
+            row.put("cached_complete", state == null ? "" : state.cachedComplete);
+            if (confidence != null) {
+                row.put("confidence_score", confidence.score);
+                row.put("confidence_decision", confidence.decision == null ? "" : confidence.decision.name());
+                row.put("confidence_reason", confidence.reason);
+                row.put("confidence_calibration", confidence.calibrationAffinity);
+                row.put("confidence_tail", confidence.tailConfidence);
+                row.put("confidence_lexical", confidence.lexicalConfidence);
+                row.put("confidence_speaker", confidence.speakerConfidence);
+            }
+            synchronized (asrRealtimeMetricsWriteLock) {
+                Files.write(
+                        Paths.get("asr_realtime_metrics.jsonl"),
+                        (row.toString() + System.lineSeparator()).getBytes(StandardCharsets.UTF_8),
+                        StandardOpenOption.CREATE,
+                        StandardOpenOption.APPEND
+                );
+            }
+        } catch (Throwable t) {
+            Config.logDebug("[ASR][RealtimeMetrics] write failed: " + t);
+        }
+    }
+
+    private void trimRealtimeAsrMetrics(long keepUtteranceSeq) {
+        long minKeep = Math.max(0L, keepUtteranceSeq - 48L);
+        asrRealtimeMetricByUtterance.keySet().removeIf(key -> key != null && key < minKeep);
     }
 
 
@@ -6445,6 +6943,8 @@ public class MobMateWhisp implements NativeKeyListener {
             this.audioService.execute(() -> {
                 talkRealtimePrefilterState.reset();
                 talkVadPrefilterState.reset();
+                talkPreGateNoiseGateState.reset();
+                talkVadNoiseGateState.reset();
                 preloadIgnoreForTalkStartIfNeeded();
                 final ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
                 final ByteArrayOutputStream laughBuffer = new ByteArrayOutputStream();
@@ -6706,6 +7206,12 @@ public class MobMateWhisp implements NativeKeyListener {
                             ByteArrayOutputStream speakerPreRoll = new ByteArrayOutputStream();
                             int silenceFrames = 0;
                             int SILENCE_FRAMES_FOR_FINAL = 2;
+                            String initialTalkPrefilterMode = getEffectiveTalkAudioPrefilterMode();
+                            final TalkVadRuntimePreset talkVadPreset = resolveTalkVadRuntimePreset(
+                                    getTalkLanguage(),
+                                    vad.getNoiseProfile().isLowGainMic,
+                                    initialTalkPrefilterMode
+                            );
 
                             if (vad instanceof ImprovedVAD) {
                                 SILENCE_FRAMES_FOR_FINAL =
@@ -6719,7 +7225,16 @@ public class MobMateWhisp implements NativeKeyListener {
                             if (isEngineMoonshine()) {
                                 SILENCE_FRAMES_FOR_FINAL = Math.max(6, SILENCE_FRAMES_FOR_FINAL);
                             }
-                            Config.logDebug("★調整後 SILENCE_FRAMES_FOR_FINAL: " + SILENCE_FRAMES_FOR_FINAL);
+                            SILENCE_FRAMES_FOR_FINAL = Math.max(
+                                    SILENCE_FRAMES_FOR_FINAL,
+                                    audioFramesForMs(talkVadPreset.minSilenceMs, audioFormat, data.length)
+                            );
+                            Config.logDebug("★調整後 SILENCE_FRAMES_FOR_FINAL: " + SILENCE_FRAMES_FOR_FINAL
+                                    + " preset=" + talkVadPreset.id
+                                    + " minSpeechMs=" + talkVadPreset.minSpeechMs
+                                    + " minSilenceMs=" + talkVadPreset.minSilenceMs
+                                    + " speechPadMs=" + talkVadPreset.speechPadMs
+                                    + " forceFinalMs=" + talkVadPreset.forceFinalMs);
 
                             boolean firstPartialSent = false;
                             // 16kHz / 16bit / mono = 1秒あたり 32000 bytes
@@ -6727,7 +7242,7 @@ public class MobMateWhisp implements NativeKeyListener {
                             final int MIN_AUDIO_DATA_LENGTH = 16000;
                             long lastFinalMs = 0;
                             final long FINAL_COOLDOWN_MS = 200;
-                            final long FORCE_FINAL_MS = isEngineMoonshine() ? 5000L : 2500L;
+                            final long FORCE_FINAL_MS = isEngineMoonshine() ? talkVadPreset.forceFinalMs : 2500L;
                             long lastPartialMs = 0;
                             isSpeaking = false;
                             speechStartTime = 0;
@@ -6761,13 +7276,30 @@ public class MobMateWhisp implements NativeKeyListener {
                                 }
                                 ImprovedVAD improvedVAD = (vad instanceof ImprovedVAD) ? (ImprovedVAD) vad : null;
                                 AdaptiveNoiseProfile talkNoiseProfile = improvedVAD == null ? null : improvedVAD.getNoiseProfile();
+                                boolean lowGainForTalkGate = talkNoiseProfile != null && talkNoiseProfile.isLowGainMic;
+                                boolean talkNoiseGateEnabled = Config.getBool("talk.vad.noise_gate.enabled", true);
+                                AudioPrefilter.RealtimeNoiseGateCalibration talkNoiseGateCalibration =
+                                        resolveTalkNoiseGateCalibration(talkNoiseProfile, lowGainForTalkGate);
                                 int preGatePeak = 0;
                                 int preGateAvg = 0;
                                 if (!isPriming && !isSpeaking && improvedVAD != null) {
-                                    preGatePeak = vad.getPeak(pcm, n);
-                                    preGateAvg = vad.getAvg(pcm, n);
+                                    boolean blankStormPreGate = isEngineMoonshine()
+                                            && moonshineBlankUtteranceStreak >= 2
+                                            && System.currentTimeMillis() < moonshineBlankGateTightenUntilMs;
+                                    byte[] preGateSourcePcm = blankStormPreGate ? data : pcm;
+                                    byte[] pcmForPreGate = talkNoiseGateEnabled
+                                            ? AudioPrefilter.applyRealtimeNoiseGateForVad(
+                                                    preGateSourcePcm,
+                                                    n,
+                                                    (int) audioFormat.getSampleRate(),
+                                                    lowGainForTalkGate,
+                                                    talkPreGateNoiseGateState,
+                                                    talkNoiseGateCalibration)
+                                            : preGateSourcePcm;
+                                    preGatePeak = vad.getPeak(pcmForPreGate, n);
+                                    preGateAvg = vad.getAvg(pcmForPreGate, n);
                                     TalkSpeechGateDecision talkGate = evaluateTalkSpeechGate(
-                                            pcm,
+                                            pcmForPreGate,
                                             n,
                                             audioFormat,
                                             talkNoiseProfile,
@@ -6776,6 +7308,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                             System.currentTimeMillis()
                                     );
                                     if (!talkGate.isAllowed()) {
+                                        noteTalkPreGateReject(talkGate);
                                         preRoll.write(pcm, 0, n);
                                         if (preRoll.size() > PREROLL_BYTES) {
                                             byte[] pr = preRoll.toByteArray();
@@ -6859,6 +7392,15 @@ public class MobMateWhisp implements NativeKeyListener {
                                     }
                                 } else {
                                     talkVadPrefilterState.reset();
+                                }
+                                if (talkNoiseGateEnabled) {
+                                    pcmForVad = AudioPrefilter.applyRealtimeNoiseGateForVad(
+                                            pcmForVad,
+                                            n,
+                                            (int) audioFormat.getSampleRate(),
+                                            lowGainForTalkGate,
+                                            talkVadNoiseGateState,
+                                            talkNoiseGateCalibration);
                                 }
                                 preRoll.write(pcmForAsr, 0, n);
                                 if (preRoll.size() > PREROLL_BYTES) {
@@ -6995,31 +7537,41 @@ public class MobMateWhisp implements NativeKeyListener {
                                         : vad.isSpeech(pcmForVad, n);
 
                                 // ★ADD: TTS再生中はVADをマスク（ループバック防止）
-                                if (isTtsSpeaking && speech && System.currentTimeMillis() < ttsVadSuppressUntilMs) {
-                                    int suppressPeakFloor = 520;
-                                    int suppressAvgFloor = 120;
+                                long nowForTtsGuard = System.currentTimeMillis();
+                                boolean ttsGuardActive = isTtsSpeaking
+                                        || nowForTtsGuard < ttsVadSuppressUntilMs
+                                        || (ttsEndedMs > 0L && (nowForTtsGuard - ttsEndedMs) < TTS_VAD_ENDED_COOLDOWN_MS);
+                                boolean ttsGuardBlocksVad = false;
+                                if (ttsGuardActive && speech) {
+                                    int suppressPeakFloor = 9000;
+                                    int suppressAvgFloor = 2200;
                                     if (vad instanceof ImprovedVAD) {
                                         AdaptiveNoiseProfile profile = ((ImprovedVAD) vad).getNoiseProfile();
-                                        suppressPeakFloor = Math.max(suppressPeakFloor, Math.max(260, (int) (profile.getPeakThreshold() * 0.42)));
-                                        suppressAvgFloor = Math.max(suppressAvgFloor, Math.max(110, (int) (profile.getAvgThreshold() * 0.38)));
+                                        suppressPeakFloor = Math.max(suppressPeakFloor, Math.max(1800, (int) (profile.getPeakThreshold() * 2.6)));
+                                        suppressAvgFloor = Math.max(suppressAvgFloor, Math.max(650, (int) (profile.getAvgThreshold() * 4.8)));
                                     }
-                                    boolean likelyUserBargeIn = isSpeaking
-                                            || buffer.size() >= 3200
-                                            || peak >= suppressPeakFloor
-                                            || avg >= suppressAvgFloor;
-                                    if (likelyUserBargeIn) {
+                                    boolean likelyUserBargeIn = !isSpeaking
+                                            && peak >= suppressPeakFloor
+                                            && avg >= suppressAvgFloor;
+                                    boolean allowBargeIn = Config.getBool("talk.vad.tts_barge_in.enabled", false);
+                                    if (allowBargeIn && likelyUserBargeIn) {
                                         Config.logDebug("★VAD suppress bypass (possible user barge-in): peak=" + peak
                                                 + " avg=" + avg
-                                                + " buf=" + buffer.size());
+                                                + " buf=" + buffer.size()
+                                                + " peakFloor=" + suppressPeakFloor
+                                                + " avgFloor=" + suppressAvgFloor);
                                     } else {
                                         Config.logDebug("★VAD suppressed (TTS playing)");
                                         speech = false;
+                                        ttsGuardBlocksVad = true;
                                     }
+                                } else if (ttsGuardActive) {
+                                    ttsGuardBlocksVad = true;
                                 }
                                 // ===== 話者照合はfinalChunkレベルで実施（フレーム単位は精度不足）=====
 
                                 // ===== [ADD] strong signal but speech=false guard =====
-                                if (vad instanceof ImprovedVAD) {
+                                if (vad instanceof ImprovedVAD && !ttsGuardBlocksVad) {
                                     AdaptiveNoiseProfile np = ((ImprovedVAD) vad).getNoiseProfile();
                                     int peakTh = np.getPeakThreshold();
                                     int avgTh  = np.getAvgThreshold();
@@ -7051,6 +7603,7 @@ public class MobMateWhisp implements NativeKeyListener {
 
                                     if (!speech
                                             && !isSpeaking
+                                            && !ttsGuardBlocksVad
                                             && strongInput
                                             && isEngineMoonshine()
                                             && moonshine != null
@@ -7065,11 +7618,11 @@ public class MobMateWhisp implements NativeKeyListener {
                                                 + " peak=" + peak + " avg=" + avg);
                                     }
 
-                                    if (strongNoSpeechFrames >= 2) {
+                                    if (!ttsGuardBlocksVad && strongNoSpeechFrames >= 2) {
                                         speech = true;
                                         Config.logDebug("★VAD override: strongNoSpeechFrames>=2 -> speech=true");
                                         strongNoSpeechFrames = 0;
-                                    } else if (!speech && !isSpeaking && reactionInput) {
+                                    } else if (!ttsGuardBlocksVad && !speech && !isSpeaking && reactionInput) {
                                         speech = true;
                                         Config.logDebug("★VAD reaction rescue: peak=" + peak + " avg=" + avg
                                                 + " peakTh=" + peakTh + " avgTh=" + avgTh);
@@ -7078,6 +7631,9 @@ public class MobMateWhisp implements NativeKeyListener {
                                     if (speech || !strongInput) {
                                         preSpeechMoonFeedFrames = 0;
                                     }
+                                } else if (ttsGuardBlocksVad) {
+                                    strongNoSpeechFrames = 0;
+                                    preSpeechMoonFeedFrames = 0;
                                 }
 
                                 // VAD結果を保持（メーターの「無音で0へ戻る」に使う）
@@ -7089,13 +7645,44 @@ public class MobMateWhisp implements NativeKeyListener {
                                 }
 
                                 if (vad.getNoiseProfile().isLowGainMic) {
-                                    if (peak > vad.getNoiseProfile().getPeakThreshold() * 0.6) {
+                                    if (!ttsGuardBlocksVad && peak > vad.getNoiseProfile().getPeakThreshold() * 0.6) {
                                         speech = true;
                                     }
                                 }
                                 if (!vad.getNoiseProfile().isLowGainMic && vad.looksLikeBGM(peak, avg)) {
                                     speech = false;
                                     Config.logDebug("VAD: BGM-like stable sound suppressed");
+                                }
+                                if (ttsGuardBlocksVad) {
+                                    speech = false;
+                                    strongNoSpeechFrames = 0;
+                                    preSpeechMoonFeedFrames = 0;
+                                    if (!isSpeaking) {
+                                        preRoll.reset();
+                                        rawPreRoll.reset();
+                                        speakerPreRoll.reset();
+                                        partialBuf.reset();
+                                        if (vad instanceof ImprovedVAD) {
+                                            ((ImprovedVAD) vad).reset();
+                                        }
+                                    }
+                                }
+                                long blankAbortCooldownRemainingMs = moonshineBlankAbortSuppressUntilMs - System.currentTimeMillis();
+                                if (!isSpeaking && isEngineMoonshine() && blankAbortCooldownRemainingMs > 0L) {
+                                    if (speech) {
+                                        Config.logDebug("★VAD suppressed (blank abort cooldown): remainMs="
+                                                + blankAbortCooldownRemainingMs
+                                                + " peak=" + peak
+                                                + " avg=" + avg);
+                                    }
+                                    speech = false;
+                                    lastVadSpeech = false;
+                                    strongNoSpeechFrames = 0;
+                                    preSpeechMoonFeedFrames = 0;
+                                    preRoll.reset();
+                                    rawPreRoll.reset();
+                                    speakerPreRoll.reset();
+                                    partialBuf.reset();
                                 }
                                 // ★強制Final直後のfinal-only COMPLETE回収待ち
                                 if (moonResetDeferredUntilMs != 0L) {
@@ -7188,6 +7775,11 @@ public class MobMateWhisp implements NativeKeyListener {
                                         firstPartialSent = false;
                                         forceFinalizePending = false;
                                         currentUtteranceSeq = ++utteranceSeqGen;
+                                        startRealtimeAsrMetric(
+                                                currentUtteranceSeq,
+                                                talkVadPreset,
+                                                talkNoiseProfile,
+                                                talkNoiseGateCalibration);
                                         resetActiveTalkProsodyTail(currentUtteranceSeq);
                                         MobMateWhisp.setLastPartial("");
                                         // Keep prior utterance COMPLETE candidates alive until their own final worker consumes them.
@@ -7223,6 +7815,13 @@ public class MobMateWhisp implements NativeKeyListener {
                                     utteranceMaxAvg = Math.max(utteranceMaxAvg, avg);
                                     currentUtteranceObservedPeak = utteranceMaxPeak;
                                     currentUtteranceObservedAvg = utteranceMaxAvg;
+                                    noteRealtimeAsrVadFrame(
+                                            currentUtteranceSeq,
+                                            true,
+                                            peak,
+                                            avg,
+                                            talkNoiseProfile,
+                                            talkNoiseGateCalibration);
                                     appendActiveTalkProsodyTail(currentUtteranceSeq, pcm, n, now);
                                     partialBuf.write(pcmForAsr, 0, n);
                                     lastSpeechEndTime = now;
@@ -7307,6 +7906,13 @@ public class MobMateWhisp implements NativeKeyListener {
                                         }
                                     }
                                 } else if (isSpeaking) {
+                                    noteRealtimeAsrVadFrame(
+                                            currentUtteranceSeq,
+                                            false,
+                                            peak,
+                                            avg,
+                                            talkNoiseProfile,
+                                            talkNoiseGateCalibration);
                                     buffer.write(data, 0, n);
                                     // ★FIX: Moonshineにも無音フレームを送り続けてpollThreadを維持
                                     // （speech→falseで addAudio が止まると hasNewAudio=false → poll停止
@@ -7314,6 +7920,86 @@ public class MobMateWhisp implements NativeKeyListener {
                                     if (isEngineMoonshine() && moonshine != null && moonshine.isLoaded()) {
                                         final float[] fpcm = pcm16leToFloat(pcmForAsr, n);
                                         moonshine.addAudio(fpcm, 16000);
+                                    }
+                                }
+
+                                if (isSpeaking && shouldAbortBlankMoonshineUtterance(
+                                        currentUtteranceSeq,
+                                        speechStartTime,
+                                        now,
+                                        lastPartialResult.get())) {
+                                    long blankSpeechMs = Math.max(0L, now - speechStartTime);
+                                    if (shouldPromoteBlankMoonshineUtteranceToFinal(
+                                            blankSpeechMs,
+                                            utteranceMaxPeak,
+                                            utteranceMaxAvg,
+                                            buffer.size())) {
+                                        forceFinalizePending = true;
+                                        silenceFrames = Math.max(silenceFrames, effectiveSilenceFramesForFinal);
+                                        incompleteHoldUntilMs = 0L;
+                                        accuracyHoldUntilMs = 0L;
+                                        moonshinePromotedBlankFinalUtterances.add(currentUtteranceSeq);
+                                        Config.logDebug("★Moon blank utterance promoted to final: utt=" + currentUtteranceSeq
+                                                + " speechMs=" + blankSpeechMs
+                                                + " peak=" + utteranceMaxPeak
+                                                + " avg=" + utteranceMaxAvg
+                                                + " bytes=" + buffer.size());
+                                    } else {
+                                    markRealtimeAsrBlankAbort(currentUtteranceSeq);
+                                    noteRealtimeAsrFinalSnapshot(
+                                            currentUtteranceSeq,
+                                            blankSpeechMs,
+                                            silenceFrames,
+                                            effectiveSilenceFramesForFinal,
+                                            buffer.size(),
+                                            rawSpeechBuffer.size(),
+                                            speakerSpeechBuffer.size(),
+                                            "",
+                                            "");
+                                    appendRealtimeAsrMetricEvent(
+                                            currentUtteranceSeq,
+                                            "blank_abort",
+                                            "",
+                                            action,
+                                            false,
+                                            null,
+                                            "no_text_seen");
+                                    noteMoonshineBlankUtterance(
+                                            currentUtteranceSeq,
+                                            "early_abort",
+                                            blankSpeechMs,
+                                            utteranceMaxPeak,
+                                            utteranceMaxAvg);
+                                    Config.logDebug("★Moon blank utterance early abort: utt=" + currentUtteranceSeq
+                                            + " speechMs=" + blankSpeechMs
+                                            + " peak=" + utteranceMaxPeak
+                                            + " avg=" + utteranceMaxAvg
+                                            + " gateTightenFactor=" + String.format(Locale.ROOT, "%.2f", moonshineBlankGateTightenFactor));
+                                    clearMoonshineCompleteCandidate(currentUtteranceSeq);
+                                    MobMateWhisp.setLastPartial("");
+                                    updateTalkPartialPreview("");
+                                    buffer.reset();
+                                    rawSpeechBuffer.reset();
+                                    speakerSpeechBuffer.reset();
+                                    partialBuf.reset();
+                                    preRoll.reset();
+                                    rawPreRoll.reset();
+                                    speakerPreRoll.reset();
+                                    isSpeaking = false;
+                                    silenceFrames = 0;
+                                    forceFinalizePending = false;
+                                    firstPartialSent = false;
+                                    speechStartTime = 0;
+                                    lastSpeechEndTime = 0;
+                                    incompleteHoldUntilMs = 0L;
+                                    accuracyHoldUntilMs = 0L;
+                                    currentUtteranceObservedPeak = 0;
+                                    currentUtteranceObservedAvg = 0;
+                                    strongNoSpeechFrames = 0;
+                                    preSpeechMoonFeedFrames = 0;
+                                    vad.reset();
+                                    tryDrainAndResetMoonshine();
+                                    continue;
                                     }
                                 }
 
@@ -7443,6 +8129,15 @@ public class MobMateWhisp implements NativeKeyListener {
                                     }
 
                                     boolean shouldSendFinal = meetsMinBytes || doRescueFromPartial || hasPendingMoonshineComplete;
+                                    long speechDurationForFinalMs = speechStartTime > 0L
+                                            ? Math.max(0L, nowMs - speechStartTime)
+                                            : 0L;
+                                    if (shouldSendFinal
+                                            && !forceFinalizePending
+                                            && !hasPendingMoonshineComplete
+                                            && speechDurationForFinalMs < talkVadPreset.minSpeechMs) {
+                                        continue;
+                                    }
 
                                     if (shouldSendFinal && nowMs - lastFinalMs >= FINAL_COOLDOWN_MS) {
                                         if (hasPendingMoonshineComplete && !meetsMinBytes && !doRescueFromPartial) {
@@ -7499,7 +8194,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                         try {
                                             // absThr: 260〜420くらいが無難。まず300。
                                             // padMs: 前後少し残す（発声の立ち上がり欠け防止）まず120ms。
-                                            procChunk = trimPcmSilence16le(finalRawChunk, audioFormat, 300, 120);
+                                            procChunk = trimPcmSilence16le(finalRawChunk, audioFormat, 300, talkVadPreset.speechPadMs);
                                         } catch (Exception ignore) {
                                             // 万一でも落とさない
                                             //noinspection AssignmentToMethodParameter
@@ -7593,6 +8288,24 @@ public class MobMateWhisp implements NativeKeyListener {
                                                 + " current=" + currentUtteranceSeq
                                                 + " rescue=" + useRescueText
                                                 + " cachedComplete=" + cachedMoonshineCompleteSnapshot);
+                                        noteRealtimeAsrFinalSnapshot(
+                                                finalizedUtteranceSeq,
+                                                nowMs - speechStartTime,
+                                                silenceFrames,
+                                                effectiveSilenceFramesForFinal,
+                                                finalProcChunk.length,
+                                                finalRawChunk.length,
+                                                finalSpeakerChunk.length,
+                                                finalSelectedFinalPrefilterMode,
+                                                cachedMoonshineCompleteSnapshot);
+                                        appendRealtimeAsrMetricEvent(
+                                                finalizedUtteranceSeq,
+                                                "final_snapshot",
+                                                useRescueText ? rescueText : cachedMoonshineCompleteSnapshot,
+                                                action,
+                                                useRescueText,
+                                                null,
+                                                forceFinalizePending ? "force_finalize" : "");
                                         final CompanionObservation companionObservation = buildCompanionObservation(
                                                 finalizedUtteranceSeq,
                                                 nowMs - speechStartTime,
@@ -7688,6 +8401,8 @@ public class MobMateWhisp implements NativeKeyListener {
                                                             } else {
                                                                 discardMoonshineCompleteCandidateText(uttSeq);
                                                             }
+                                                            boolean promotedBlankFinal =
+                                                                    moonshinePromotedBlankFinalUtterances.remove(uttSeq);
                                                             if (cachedComplete != null && !cachedComplete.isBlank()) {
                                                                 String candidate = removeCjkSpaces(cachedComplete).trim();
                                                                 AudioPrefilter.VoiceMetrics cachedMetrics =
@@ -7734,9 +8449,33 @@ public class MobMateWhisp implements NativeKeyListener {
                                                                             + " / score=" + String.format(Locale.ROOT, "%.2f", commitConfidence.score)
                                                                             + " reason=" + commitConfidence.reason);
                                                                 }
+                                                            } else if (promotedBlankFinal) {
+                                                                String promotedText = transcribePromotedBlankMoonshineFinal(
+                                                                        finalProcChunk,
+                                                                        finalVerifyChunk,
+                                                                        finalStrongVerifyChunk,
+                                                                        finalSpeakerChunk,
+                                                                        uttSeq);
+                                                                if (!promotedText.isBlank()) {
+                                                                    Config.log("[Moonshine][TalkFinal] promoted blank one-shot utt="
+                                                                            + uttSeq + " text=" + promotedText);
+                                                                    handleFinalTextWithUtteranceSeq(uttSeq, promotedText, action, false);
+                                                                    MobMateWhisp.setLastPartial("");
+                                                                    clearMoonshineUtteranceAcoustics(uttSeq);
+                                                                    return;
+                                                                }
+                                                                Config.logDebug("★Moon promoted blank one-shot returned blank: utt=" + uttSeq);
                                                             }
                                                         }
 
+                                                        appendRealtimeAsrMetricEvent(
+                                                                uttSeq,
+                                                                "final_send",
+                                                                "",
+                                                                action,
+                                                                false,
+                                                                null,
+                                                                "transcribe");
                                                         Config.logDebug("★Final send");
                                                         transcribe(finalProcChunk, action, true, uttSeq);
 
@@ -7780,6 +8519,14 @@ public class MobMateWhisp implements NativeKeyListener {
                                                         if (isEngineMoonshine()) {
                                                             clearMoonshineCompleteCandidate(uttSeq);
                                                         }
+                                                        appendRealtimeAsrMetricEvent(
+                                                                uttSeq,
+                                                                "speaker_blocked",
+                                                                "",
+                                                                action,
+                                                                false,
+                                                                null,
+                                                                "speaker_gate");
                                                         Config.logDebug("★Speaker gate: utterance blocked (not matching speaker)");
                                                         SwingUtilities.invokeLater(() ->
                                                                 window.setTitle(UiText.t("ui.title.rec")));
@@ -12015,6 +12762,142 @@ public class MobMateWhisp implements NativeKeyListener {
 
         return true;
     }
+    private PendingShortFinal chooseBetterPendingShortFinal(PendingShortFinal a, PendingShortFinal b) {
+        if (a == null) return b;
+        if (b == null) return a;
+        String at = removeCjkSpaces(a.text).trim();
+        String bt = removeCjkSpaces(b.text).trim();
+        int acp = at.isBlank() ? 0 : at.codePointCount(0, at.length());
+        int bcp = bt.isBlank() ? 0 : bt.codePointCount(0, bt.length());
+        if (b.confidence.score > a.confidence.score + 0.04d) return b;
+        if (bcp > acp && b.confidence.score >= a.confidence.score - 0.05d) return b;
+        return a;
+    }
+
+    private boolean shouldCommitPendingShortFinal(PendingShortFinal hold) {
+        if (hold == null || hold.text == null || hold.text.isBlank()) return false;
+        if (isTtsSpeaking || System.currentTimeMillis() < ttsVadSuppressUntilMs) return false;
+        String normalized = removeCjkSpaces(hold.text).trim();
+        String shortNormalized = trimShortTokenTrailingPunctuation(normalized);
+        int cp = shortNormalized.isBlank() ? 0 : shortNormalized.codePointCount(0, shortNormalized.length());
+        if (cp <= 2) return false;
+        if (LocalWhisperCPP.isIgnoredStatic(shortNormalized)) return false;
+        if (isShortPhoneticToken(shortNormalized) || looksSuspiciousShortComplete(shortNormalized)) return false;
+        return hold.confidence != null && hold.confidence.score >= 0.54d;
+    }
+
+    private void cancelPendingShortFinalTaskLocked() {
+        ScheduledFuture<?> task = pendingShortFinalTask;
+        pendingShortFinalTask = null;
+        if (task != null) {
+            task.cancel(false);
+        }
+    }
+
+    private void clearPendingShortFinalForCommit(long utteranceSeq, String committedText) {
+        synchronized (shortFinalCoalescerLock) {
+            PendingShortFinal hold = pendingShortFinal;
+            if (hold == null) return;
+            boolean sameUtterance = utteranceSeq > 0 && hold.utteranceSeq == utteranceSeq;
+            boolean near = areUtteranceVariants(hold.text, committedText)
+                    || similarityRatio(normForNearDup(hold.text), normForNearDup(committedText)) >= 0.62d;
+            boolean fresh = (System.currentTimeMillis() - hold.createdAtMs) <= (SHORT_FINAL_COALESCE_WINDOW_MS + 900L);
+            if (sameUtterance || near || fresh) {
+                Config.logDebug("[TalkFinal][Coalesce] pending short replaced by commit: pending="
+                        + hold.text + " commit=" + committedText + " utt=" + utteranceSeq);
+                pendingShortFinal = null;
+                cancelPendingShortFinalTaskLocked();
+            }
+        }
+    }
+
+    private void holdShortFinalForCoalescing(long utteranceSeq,
+                                             String text,
+                                             Action action,
+                                             boolean rescue,
+                                             FinalCommitConfidence confidence) {
+        if (text == null || text.isBlank()) return;
+        long now = System.currentTimeMillis();
+        PendingShortFinal next = new PendingShortFinal(utteranceSeq, text.trim(), action, rescue, confidence, now);
+        synchronized (shortFinalCoalescerLock) {
+            PendingShortFinal current = pendingShortFinal;
+            if (current != null) {
+                boolean sameUtterance = current.utteranceSeq > 0 && current.utteranceSeq == utteranceSeq;
+                boolean related = sameUtterance || areUtteranceVariants(current.text, next.text)
+                        || similarityRatio(normForNearDup(current.text), normForNearDup(next.text)) >= 0.62d;
+                if (related) {
+                    next = chooseBetterPendingShortFinal(current, next);
+                    Config.logDebug("[TalkFinal][Coalesce] pending short updated: text=" + next.text
+                            + " utt=" + next.utteranceSeq);
+                } else {
+                    Config.logDebug("[TalkFinal][Coalesce] pending short dropped by newer unrelated hold: "
+                            + current.text + " -> " + next.text);
+                    if (current.utteranceSeq > 0) {
+                        clearMoonshineCompleteCandidate(current.utteranceSeq);
+                    }
+                }
+            }
+            pendingShortFinal = next;
+            cancelPendingShortFinalTaskLocked();
+            final long token = next.createdAtMs;
+            pendingShortFinalTask = clipExecutor.schedule(
+                    () -> flushPendingShortFinal(token),
+                    SHORT_FINAL_COALESCE_WINDOW_MS,
+                    TimeUnit.MILLISECONDS
+            );
+        }
+        Config.logDebug("[TalkFinal][Coalesce] hold short final: utt=" + utteranceSeq
+                + " score=" + String.format(Locale.ROOT, "%.2f", confidence == null ? 0.0d : confidence.score)
+                + " text=" + text);
+    }
+
+    private void flushPendingShortFinal(long token) {
+        PendingShortFinal hold;
+        synchronized (shortFinalCoalescerLock) {
+            hold = pendingShortFinal;
+            if (hold == null || hold.createdAtMs != token) return;
+            pendingShortFinal = null;
+            pendingShortFinalTask = null;
+        }
+        if (shouldCommitPendingShortFinal(hold)) {
+            Config.logDebug("[TalkFinal][Coalesce] commit held short final: utt=" + hold.utteranceSeq
+                    + " text=" + hold.text);
+            appendRealtimeAsrMetricEvent(
+                    hold.utteranceSeq,
+                    "coalesce_commit",
+                    hold.text,
+                    hold.action,
+                    hold.rescue,
+                    hold.confidence,
+                    "held_short_final");
+            maybeUpdateUserSpeechCalibration(hold.utteranceSeq, hold.text, hold.rescue, hold.confidence);
+            if (hold.utteranceSeq > 0) {
+                TL_FINAL_UTTERANCE_SEQ.set(hold.utteranceSeq);
+            } else {
+                TL_FINAL_UTTERANCE_SEQ.remove();
+            }
+            try {
+                handleFinalText(hold.text, hold.action, hold.rescue);
+            } finally {
+                TL_FINAL_UTTERANCE_SEQ.remove();
+            }
+        } else {
+            Config.logDebug("[TalkFinal][Coalesce] drop held short final: utt=" + hold.utteranceSeq
+                    + " text=" + hold.text);
+            appendRealtimeAsrMetricEvent(
+                    hold.utteranceSeq,
+                    "coalesce_drop",
+                    hold.text,
+                    hold.action,
+                    hold.rescue,
+                    hold.confidence,
+                    "held_short_final");
+            if (hold.utteranceSeq > 0) {
+                clearMoonshineCompleteCandidate(hold.utteranceSeq);
+            }
+        }
+    }
+
     private void handleFinalTextWithUtteranceSeq(long utteranceSeq, String finalStr, Action action, boolean flgRescue) {
         String logText = finalStr == null ? "" : finalStr.trim();
         if (!logText.isBlank() && logText.codePointCount(0, logText.length()) <= 12) {
@@ -12031,6 +12914,31 @@ public class MobMateWhisp implements NativeKeyListener {
                     + " decision=" + confidence.decision
                     + " reason=" + confidence.reason);
         }
+        if (confidence.decision == FinalCommitDecision.HOLD_FOR_VERIFY) {
+            appendRealtimeAsrMetricEvent(
+                    utteranceSeq,
+                    "hold_for_verify",
+                    logText,
+                    action,
+                    flgRescue,
+                    confidence,
+                    confidence.reason);
+            Config.logDebug("[TalkFinal] held without commit: utt=" + utteranceSeq
+                    + " reason=" + confidence.reason
+                    + " text=" + logText);
+            MobMateWhisp.setLastPartial("");
+            holdShortFinalForCoalescing(utteranceSeq, logText, action, flgRescue, confidence);
+            return;
+        }
+        appendRealtimeAsrMetricEvent(
+                utteranceSeq,
+                "commit",
+                logText,
+                action,
+                flgRescue,
+                confidence,
+                confidence.reason);
+        clearPendingShortFinalForCommit(utteranceSeq, logText);
         maybeUpdateUserSpeechCalibration(utteranceSeq, logText, flgRescue, confidence);
         if (utteranceSeq > 0) {
             TL_FINAL_UTTERANCE_SEQ.set(utteranceSeq);
@@ -12052,6 +12960,9 @@ public class MobMateWhisp implements NativeKeyListener {
     private volatile long lastMoonshineCompleteUtteranceSeq = -1L;
     private volatile String lastMoonshineCompleteNorm = "";
     private volatile long lastMoonshineCompleteAtMs = 0L;
+    private final Object shortFinalCoalescerLock = new Object();
+    private volatile PendingShortFinal pendingShortFinal = null;
+    private volatile ScheduledFuture<?> pendingShortFinalTask = null;
     private static final int TTS_PROSODY_ACTIVE_TAIL_MAX_BYTES = 16000 * 2 * 8;
     private static final long TTS_PROSODY_ACTIVE_TAIL_MAX_AGE_MS = 3000L;
     private final Object talkTtsProsodyTailLock = new Object();
@@ -12796,6 +13707,34 @@ public class MobMateWhisp implements NativeKeyListener {
             return normalized;
         }
         return refined;
+    }
+    private String transcribePromotedBlankMoonshineFinal(byte[] normalizedPcm,
+                                                         byte[] verifyPcm,
+                                                         byte[] strongVerifyPcm,
+                                                         byte[] analysisPcm,
+                                                         long uttSeq) {
+        LocalMoonshineSTT hm = getOrCreateTalkMoonshineAccuracy();
+        if (hm == null) return "";
+        Future<String> future = moonshineVerifyExecutor.submit(() -> {
+            String text = transcribeMoonshineOneShotBest(hm, normalizedPcm, "TalkPromote");
+            if (!removeCjkSpaces(text).trim().isBlank()) return text;
+            text = transcribeMoonshineOneShotBest(hm, verifyPcm, "TalkPromoteVerify");
+            if (!removeCjkSpaces(text).trim().isBlank()) return text;
+            text = transcribeMoonshineOneShotBest(hm, strongVerifyPcm, "TalkPromoteStrong");
+            if (!removeCjkSpaces(text).trim().isBlank()) return text;
+            return transcribeMoonshineOneShotBest(hm, analysisPcm, "TalkPromoteRaw");
+        });
+        try {
+            return removeCjkSpaces(future.get(Math.max(400L, MOONSHINE_ACCURACY_TIMEOUT_MS), TimeUnit.MILLISECONDS)).trim();
+        } catch (TimeoutException te) {
+            future.cancel(true);
+            Config.logDebug("★Moon promoted blank one-shot timeout: utt=" + uttSeq
+                    + " timeoutMs=" + MOONSHINE_ACCURACY_TIMEOUT_MS);
+            return "";
+        } catch (Exception ex) {
+            Config.logDebug("★Moon promoted blank one-shot failed: utt=" + uttSeq + " " + ex.getMessage());
+            return "";
+        }
     }
     private String refineMoonshineFinalCandidateWithMoonshine(String normalized,
                                                               byte[] analysisPcm,
@@ -17141,6 +18080,21 @@ public class MobMateWhisp implements NativeKeyListener {
             return TalkSpeechGateDecision.reject("low_energy", metrics, activeMs, rawPeak, rawAvg,
                     peakMin, avgMin, rmsMin, failPeak, failAvg, failRms);
         }
+        boolean quickAccept = activeMs >= (lowGainMic ? 90L : 95L)
+                && rawPeak >= (lowGainMic ? Math.max(360, peakMin + 120) : Math.max(1100, peakMin + 260))
+                && metrics.rms >= (lowGainMic ? Math.max(135.0d, rmsMin * 1.02d) : Math.max(210.0d, rmsMin * 1.05d))
+                && metrics.voiceBandRatio >= (lowGainMic ? 0.30d : 0.33d);
+        boolean strong = activeMs >= TALK_SPEECH_GATE_STRONG_ACTIVE_MS
+                && rawPeak >= (lowGainMic ? Math.max(500, peakMin + 240) : Math.max(1500, peakMin + 700))
+                && metrics.rms >= (lowGainMic ? Math.max(150.0d, rmsMin * 1.10d) : Math.max(240.0d, rmsMin * 1.15d))
+                && metrics.voiceBandRatio >= (lowGainMic ? 0.34d : 0.38d);
+        // Strong voice candidates should survive a low-frequency periodic hit; otherwise
+        // low male voices can look like mechanical noise before ASR ever sees them.
+        if (strong || quickAccept) {
+            talkSpeechGatePeriodicNoiseStreak = 0;
+            return TalkSpeechGateDecision.allow(metrics, activeMs, rawPeak, rawAvg,
+                    peakMin, avgMin, rmsMin);
+        }
         if (periodic.likelyMechanicalNoise()) {
             talkSpeechGateStreak = 0;
             talkSpeechGatePeriodicNoiseStreak++;
@@ -17163,20 +18117,6 @@ public class MobMateWhisp implements NativeKeyListener {
             );
         } else {
             talkSpeechGatePeriodicNoiseStreak = 0;
-        }
-        boolean quickAccept = activeMs >= (lowGainMic ? 90L : 95L)
-                && rawPeak >= (lowGainMic ? Math.max(360, peakMin + 120) : Math.max(1100, peakMin + 260))
-                && metrics.rms >= (lowGainMic ? Math.max(135.0d, rmsMin * 1.02d) : Math.max(210.0d, rmsMin * 1.05d))
-                && metrics.voiceBandRatio >= (lowGainMic ? 0.30d : 0.33d);
-        boolean strong = activeMs >= TALK_SPEECH_GATE_STRONG_ACTIVE_MS
-                && rawPeak >= (lowGainMic ? Math.max(500, peakMin + 240) : Math.max(1500, peakMin + 700))
-                && metrics.rms >= (lowGainMic ? Math.max(150.0d, rmsMin * 1.10d) : Math.max(240.0d, rmsMin * 1.15d))
-                && metrics.voiceBandRatio >= (lowGainMic ? 0.34d : 0.38d);
-        // High-confidence voiced speech should not be discarded only because ZCR is outside
-        // the narrow warmup band. This helps clipped or strongly voiced utterances reach ASR.
-        if (strong || quickAccept) {
-            return TalkSpeechGateDecision.allow(metrics, activeMs, rawPeak, rawAvg,
-                    peakMin, avgMin, rmsMin);
         }
         if (metrics.zcr < zcrMin || metrics.zcr > zcrMax) {
             talkSpeechGateStreak = 0;
@@ -21503,6 +22443,10 @@ public class MobMateWhisp implements NativeKeyListener {
                     || recognitionAssistSpeakerRejectCount >= Math.max(10, recognitionAssistSpeakerPassCount + 10));
             boolean gainBackoffGuard = speakerRiskHigh
                     && (recentCollapse || shortWeakDominant || recognitionAssistSpeakerRejectCount >= 6);
+            boolean blankStormGainRisk = isEngineMoonshine()
+                    && moonshineBlankUtteranceStreak >= 2
+                    && nowMs < moonshineBlankGateTightenUntilMs;
+            float blankStormGainCap = Math.max(1.0f, Config.getFloat("talk.vad.blank_storm_gain_cap", 4.2f));
 
             if ("strong".equals(currentPrefilter) && recognitionAssistCollapsedFinalCount >= 1) {
                 targetPrefilter = "normal";
@@ -21528,7 +22472,10 @@ public class MobMateWhisp implements NativeKeyListener {
                 reason = "persistent_noise";
             }
 
-            if (gainBackoffGuard
+            if (blankStormGainRisk && currentGain > (blankStormGainCap + 0.05f)) {
+                targetGain = Math.max(1.0f, Math.min(blankStormGainCap, previousRecognitionAssistGain(currentGain)));
+                reason = reason.isBlank() ? "blank_storm_gain_backoff" : (reason + "+blank_storm_gain_backoff");
+            } else if (gainBackoffGuard
                     && currentGain > (recognitionAssistBaseInputGain + 0.05f)) {
                 targetGain = Math.max(recognitionAssistBaseInputGain, previousRecognitionAssistGain(currentGain));
                 reason = reason.isBlank() ? "speaker_risk_backoff" : (reason + "+speaker_risk_backoff");
@@ -21543,7 +22490,8 @@ public class MobMateWhisp implements NativeKeyListener {
             } else if (clippedCount >= 2 && currentGain > 1.0f) {
                 targetGain = previousRecognitionAssistGain(currentGain);
                 reason = reason.isBlank() ? "clipping" : (reason + "+clipping");
-            } else if (!(speakerRiskHigh && recentCollapse)
+            } else if (!blankStormGainRisk
+                    && !(speakerRiskHigh && recentCollapse)
                     && !speakerRiskHigh
                     && (lowGainMic || weakCount >= 2 || rescueCount >= 2 || avgRawRms < 900.0d || avgPeak < 3200.0d)
                     && avgRawRms < 1800.0d

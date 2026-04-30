@@ -1030,6 +1030,8 @@ class AdaptiveNoiseProfile {
     }
 
     public int getManualPeakThreshold() { return manualPeak; }
+    public synchronized int getNoiseFloor() { return noiseFloor; }
+    public synchronized int getNoiseStdDev() { return noiseStdDev; }
 
     public synchronized void resetForNewDevice() {
         noiseSamples.clear();
