@@ -1103,6 +1103,8 @@ public class MobMateWhisp implements NativeKeyListener {
             new AudioPrefilter.RealtimeNoiseGateState();
     private final AudioPrefilter.RealtimeNoiseGateState talkVadNoiseGateState =
             new AudioPrefilter.RealtimeNoiseGateState();
+    private final SileroVadOnnx talkSileroVad = new SileroVadOnnx();
+    private volatile long talkSileroVadLastShadowLogAtMs = 0L;
 
     private final Object psLock = new Object();
     private volatile boolean psStarting = false;
@@ -1284,6 +1286,49 @@ public class MobMateWhisp implements NativeKeyListener {
         }
     }
 
+    public static final class MoonshineTalkFinalAudio {
+        final byte[] trimmedRawChunk;
+        final byte[] procChunk;
+        final byte[] speakerChunk;
+        final byte[] verifyChunk;
+        final byte[] slowVerifyChunk;
+        final byte[] strongVerifyChunk;
+        final String selectedPrefilterMode;
+        final AudioPrefilter.FinalAsrTuning tuning;
+
+        MoonshineTalkFinalAudio(byte[] trimmedRawChunk,
+                                byte[] procChunk,
+                                byte[] speakerChunk,
+                                byte[] verifyChunk,
+                                byte[] slowVerifyChunk,
+                                byte[] strongVerifyChunk,
+                                String selectedPrefilterMode,
+                                AudioPrefilter.FinalAsrTuning tuning) {
+            this.trimmedRawChunk = trimmedRawChunk;
+            this.procChunk = procChunk;
+            this.speakerChunk = speakerChunk;
+            this.verifyChunk = verifyChunk;
+            this.slowVerifyChunk = slowVerifyChunk;
+            this.strongVerifyChunk = strongVerifyChunk;
+            this.selectedPrefilterMode = selectedPrefilterMode == null ? "normal" : selectedPrefilterMode;
+            this.tuning = tuning;
+        }
+    }
+
+    public static final class MoonshineBenchmarkFinalResult {
+        public final String text;
+        public final MoonshineTalkFinalAudio audio;
+        public final AudioPrefilter.VoiceMetrics metrics;
+
+        MoonshineBenchmarkFinalResult(String text,
+                                      MoonshineTalkFinalAudio audio,
+                                      AudioPrefilter.VoiceMetrics metrics) {
+            this.text = text == null ? "" : text;
+            this.audio = audio;
+            this.metrics = metrics;
+        }
+    }
+
     private static final class RealtimeAsrMetricState {
         final long utteranceSeq;
         final long startedAtMs;
@@ -1459,7 +1504,11 @@ public class MobMateWhisp implements NativeKeyListener {
         Config.syncAllFromCloud();
         Config.log("JVM: " + System.getProperty("java.vm.name"));
         Config.log("JVM vendor: " + System.getProperty("java.vm.vendor"));
-        loadWhisperNative();
+        if (!headlessCliMode) {
+            loadWhisperNative();
+        } else {
+            Config.logDebug("[MoonshineBenchmark] headless route: skip Whisper native load");
+        }
         this.button = new JButton(UiText.t("ui.main.start"));
         Config.logDebug("Locale=" + java.util.Locale.getDefault() + " / user.language=" + System.getProperty("user.language"));
 
@@ -4434,7 +4483,11 @@ public class MobMateWhisp implements NativeKeyListener {
         if (mode == null) return "normal";
         return switch (mode.trim().toLowerCase(Locale.ROOT)) {
             case "off", "disabled", "none" -> "off";
+            case "auto", "dynamic", "adaptive" -> "auto";
             case "strong", "aggressive" -> "strong";
+            case "presence", "presence_light", "presence-light", "light_presence", "light-presence" -> "presence_light";
+            case "presence_mid", "presence-mid", "mid_presence", "mid-presence" -> "presence_mid";
+            case "presence_strong", "presence-strong", "strong_presence", "strong-presence" -> "presence_strong";
             default -> "normal";
         };
     }
@@ -4475,6 +4528,9 @@ public class MobMateWhisp implements NativeKeyListener {
     }
     private static boolean isStrongAudioPrefilterMode(String mode) {
         return "strong".equalsIgnoreCase(normalizeAudioPrefilterMode(mode));
+    }
+    private static boolean isAdaptiveAudioPrefilterMode(String mode) {
+        return "auto".equalsIgnoreCase(normalizeAudioPrefilterMode(mode));
     }
 
     private boolean isRecognitionAssistEnabled() {
@@ -7300,6 +7356,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                     preGateAvg = vad.getAvg(pcmForPreGate, n);
                                     TalkSpeechGateDecision talkGate = evaluateTalkSpeechGate(
                                             pcmForPreGate,
+                                            preGateSourcePcm,
                                             n,
                                             audioFormat,
                                             talkNoiseProfile,
@@ -7366,6 +7423,7 @@ public class MobMateWhisp implements NativeKeyListener {
                                 }
                                 String audioPrefilterModeNow = getEffectiveTalkAudioPrefilterMode();
                                 String realtimeAudioPrefilterMode = isStrongAudioPrefilterMode(audioPrefilterModeNow)
+                                        || isAdaptiveAudioPrefilterMode(audioPrefilterModeNow)
                                         ? "normal"
                                         : audioPrefilterModeNow;
                                 byte[] pcmForAsr;
@@ -8187,99 +8245,19 @@ public class MobMateWhisp implements NativeKeyListener {
                                         final byte[] finalRawSpeakerChunk = speakerSpeechBuffer.toByteArray();
 
                                         // ★FIX: silence-trimmed chunk for speaker gate + transcribe (helps short laugh after long silence)
-                                        byte[] procChunk;
-                                        byte[] verifyChunk;
-                                        byte[] strongVerifyChunk;
-                                        String selectedFinalPrefilterMode = normalizeAudioPrefilterMode(audioPrefilterModeNow);
-                                        try {
-                                            // absThr: 260〜420くらいが無難。まず300。
-                                            // padMs: 前後少し残す（発声の立ち上がり欠け防止）まず120ms。
-                                            procChunk = trimPcmSilence16le(finalRawChunk, audioFormat, 300, talkVadPreset.speechPadMs);
-                                        } catch (Exception ignore) {
-                                            // 万一でも落とさない
-                                            //noinspection AssignmentToMethodParameter
-                                            procChunk = finalRawChunk;
-                                        }
-                                        final byte[] trimmedRawChunk = procChunk;
-                                        selectedFinalPrefilterMode = chooseAdaptiveTalkFinalPrefilterMode(
-                                                trimmedRawChunk,
-                                                selectedFinalPrefilterMode,
-                                                (int) audioFormat.getSampleRate()
-                                        );
-                                        try {
-                                            procChunk = AudioPrefilter.processForAsr(
-                                                    procChunk,
-                                                    procChunk.length,
-                                                    (int) audioFormat.getSampleRate(),
-                                                    AudioPrefilter.Mode.TALK,
-                                                    selectedFinalPrefilterMode,
-                                                    new AudioPrefilter.State()
-                                            );
-                                            if (isStrongAudioPrefilterMode(selectedFinalPrefilterMode)
-                                                    && shouldFallbackStrongFinal(
-                                                    trimmedRawChunk,
-                                                    procChunk,
-                                                    (int) audioFormat.getSampleRate())) {
-                                                AudioPrefilter.VoiceMetrics rawMetrics =
-                                                        AudioPrefilter.analyzeVoiceLike(
-                                                                trimmedRawChunk,
-                                                                trimmedRawChunk.length,
-                                                                (int) audioFormat.getSampleRate());
-                                                AudioPrefilter.VoiceMetrics filteredMetrics =
-                                                        AudioPrefilter.analyzeVoiceLike(
-                                                                procChunk,
-                                                                procChunk.length,
-                                                                (int) audioFormat.getSampleRate());
-                                                Config.log("[AudioPrefilter][Talk] strong collapsed final -> fallback normal"
-                                                        + " rawRms=" + String.format(java.util.Locale.ROOT, "%.1f", rawMetrics.rms)
-                                                        + " filteredRms=" + String.format(java.util.Locale.ROOT, "%.1f", filteredMetrics.rms)
-                                                        + " rawPeak=" + rawMetrics.peak
-                                                        + " filteredPeak=" + filteredMetrics.peak);
-                                                noteRecognitionAssistCollapsedFinal(rawMetrics, filteredMetrics);
-                                                procChunk = AudioPrefilter.processForAsr(
-                                                        trimmedRawChunk,
-                                                        trimmedRawChunk.length,
-                                                        (int) audioFormat.getSampleRate(),
-                                                        AudioPrefilter.Mode.TALK,
-                                                        AudioPrefilter.Profile.NORMAL,
-                                                        new AudioPrefilter.State()
-                                                );
-                                                selectedFinalPrefilterMode = "normal";
-                                            }
-                                        } catch (Exception ex) {
-                                            Config.logDebug("[AudioPrefilter][Talk] final profile failed -> keep trimmed raw: " + ex);
-                                        }
-                                        try {
-                                            procChunk = AudioPrefilter.normalizeFinalChunkForAsr(
-                                                    procChunk,
-                                                    procChunk.length,
-                                                    chooseAdaptiveFinalNormalizeTargetDbfs(
-                                                            trimmedRawChunk,
-                                                            selectedFinalPrefilterMode,
-                                                            (int) audioFormat.getSampleRate()
-                                                    )
-                                            );
-                                        } catch (Exception ignore) {
-                                            // normalize は補助輪なので、失敗しても元chunkで続行するっす。
-                                        }
-                                          verifyChunk = buildMoonshineVerifyChunk(trimmedRawChunk, (int) audioFormat.getSampleRate());
-                                          byte[] slowVerifyChunk = buildMoonshineSlowVerifyChunk(trimmedRawChunk, (int) audioFormat.getSampleRate());
-                                          strongVerifyChunk = buildMoonshineStrongVerifyChunk(trimmedRawChunk, (int) audioFormat.getSampleRate());
-                                        byte[] speakerChunk;
-                                        try {
-                                            speakerChunk = trimPcmSilence16le(finalRawSpeakerChunk, audioFormat, 300, 120);
-                                        } catch (Exception ignore) {
-                                            speakerChunk = finalRawSpeakerChunk;
-                                        }
-                                        if (speakerChunk == null || speakerChunk.length == 0) {
-                                            speakerChunk = trimmedRawChunk;
-                                        }
-                                          final byte[] finalProcChunk = procChunk;
-                                          final byte[] finalSpeakerChunk = speakerChunk;
-                                          final byte[] finalVerifyChunk = verifyChunk;
-                                          final byte[] finalSlowVerifyChunk = slowVerifyChunk;
-                                          final byte[] finalStrongVerifyChunk = strongVerifyChunk;
-                                          final String finalSelectedFinalPrefilterMode = selectedFinalPrefilterMode;
+                                        // 本体Talk final ASR routeをAPI化して、ベンチも同じ入口を使うデス。
+                                        MoonshineTalkFinalAudio talkFinalAudio = prepareMoonshineTalkFinalAudio(
+                                                finalRawChunk,
+                                                finalRawSpeakerChunk,
+                                                audioPrefilterModeNow,
+                                                talkVadPreset.speechPadMs);
+                                        final byte[] trimmedRawChunk = talkFinalAudio.trimmedRawChunk;
+                                        final byte[] finalProcChunk = talkFinalAudio.procChunk;
+                                        final byte[] finalSpeakerChunk = talkFinalAudio.speakerChunk;
+                                        final byte[] finalVerifyChunk = talkFinalAudio.verifyChunk;
+                                        final byte[] finalSlowVerifyChunk = talkFinalAudio.slowVerifyChunk;
+                                        final byte[] finalStrongVerifyChunk = talkFinalAudio.strongVerifyChunk;
+                                        final String finalSelectedFinalPrefilterMode = talkFinalAudio.selectedPrefilterMode;
                                         final long finalizedUtteranceSeq = currentUtteranceSeq;
                                         final String cachedMoonshineCompleteSnapshot = isEngineMoonshine()
                                                 ? peekMoonshineCompleteCandidate(finalizedUtteranceSeq)
@@ -12726,7 +12704,12 @@ public class MobMateWhisp implements NativeKeyListener {
         try {
 //            Pattern p = Pattern.compile("(.{2,20})\\1{2,}");
             Pattern p = Pattern.compile("(.{7,20})\\1{1,}"); // x2
-            return p.matcher(text).find();
+            if (p.matcher(text).find()) return true;
+            String compact = text.replaceAll("[\\p{Punct}\\p{IsPunctuation}\\s]+", "");
+            Pattern shortCjk = Pattern.compile("([\\p{IsHan}\\p{IsHiragana}\\p{IsKatakana}\\p{IsHangul}]{2,6})\\1{2,}");
+            if (shortCjk.matcher(compact).find()) return true;
+            Pattern mediumCjkTwice = Pattern.compile("([\\p{IsHan}\\p{IsHiragana}\\p{IsKatakana}\\p{IsHangul}]{4,10})\\1");
+            return mediumCjkTwice.matcher(compact).find();
         } catch (Exception e) {
             return false;
         }
@@ -13482,6 +13465,18 @@ public class MobMateWhisp implements NativeKeyListener {
                                                         String requestedMode,
                                                         int sampleRateHz) {
         String normalized = normalizeAudioPrefilterMode(requestedMode);
+        if ("auto".equals(normalized)) {
+            if (trimmedRawChunk == null || trimmedRawChunk.length < 4) return "normal";
+            AudioPrefilter.Profile selected = AudioPrefilter.selectAdaptiveProfile(
+                    trimmedRawChunk,
+                    trimmedRawChunk.length,
+                    sampleRateHz,
+                    AudioPrefilter.Mode.TALK
+            );
+            String selectedKey = selected.name().toLowerCase(Locale.ROOT);
+            Config.logDebug("[AudioPrefilter][Talk] auto final selected=" + selectedKey);
+            return selectedKey;
+        }
         if (!"strong".equals(normalized) || trimmedRawChunk == null || trimmedRawChunk.length < 4) {
             return normalized;
         }
@@ -13546,17 +13541,148 @@ public class MobMateWhisp implements NativeKeyListener {
     private double chooseAdaptiveFinalNormalizeTargetDbfs(byte[] trimmedRawChunk,
                                                           String selectedPrefilterMode,
                                                           int sampleRateHz) {
-        AudioPrefilter.VoiceMetrics metrics = (trimmedRawChunk == null || trimmedRawChunk.length < 4)
-                ? null
-                : AudioPrefilter.analyzeVoiceLike(trimmedRawChunk, trimmedRawChunk.length, sampleRateHz);
-        boolean weakVoice = metrics == null || metrics.rms < 700.0d || metrics.peak < 2200;
-        boolean shortUtterance = trimmedRawChunk != null && trimmedRawChunk.length <= (16000 * 2 * 2);
-        if (weakVoice) return -24.0d;
+        AudioPrefilter.FinalAsrTuning tuning = AudioPrefilter.selectFinalAsrTuning(
+                trimmedRawChunk,
+                trimmedRawChunk == null ? 0 : trimmedRawChunk.length,
+                sampleRateHz,
+                AudioPrefilter.Mode.TALK);
+        if (!"default".equals(tuning.id)) {
+            return tuning.normalizeDbfs;
+        }
+        boolean shortUtterance = trimmedRawChunk != null
+                && trimmedRawChunk.length <= (Math.max(8000, sampleRateHz) * 2 * 2);
         if (!"strong".equals(normalizeAudioPrefilterMode(selectedPrefilterMode)) || shortUtterance) {
-            return -22.8d;
+            return tuning.normalizeDbfs;
         }
         return -21.6d;
     }
+
+    private MoonshineTalkFinalAudio prepareMoonshineTalkFinalAudio(byte[] finalRawChunk,
+                                                                   byte[] finalRawSpeakerChunk,
+                                                                   String requestedPrefilterMode,
+                                                                   int speechPadMs) {
+        int sampleRateHz = (int) audioFormat.getSampleRate();
+        byte[] procChunk;
+        String selectedFinalPrefilterMode = normalizeAudioPrefilterMode(requestedPrefilterMode);
+        AudioPrefilter.FinalAsrTuning finalAsrTuning =
+                AudioPrefilter.selectFinalAsrTuning(
+                        finalRawChunk,
+                        finalRawChunk == null ? 0 : finalRawChunk.length,
+                        sampleRateHz,
+                        AudioPrefilter.Mode.TALK);
+        try {
+            int finalTrimPadMs = Math.max(speechPadMs, finalAsrTuning.trimPadMs);
+            procChunk = trimPcmSilence16le(
+                    finalRawChunk,
+                    audioFormat,
+                    finalAsrTuning.trimAbsThreshold,
+                    finalTrimPadMs);
+            Config.logDebug("[AudioPrefilter][Talk] final tuning="
+                    + finalAsrTuning.id
+                    + " trimAbs=" + finalAsrTuning.trimAbsThreshold
+                    + " trimPadMs=" + finalTrimPadMs
+                    + " normalizeDbfs=" + finalAsrTuning.normalizeDbfs);
+        } catch (Exception ignore) {
+            procChunk = finalRawChunk;
+        }
+        final byte[] trimmedRawChunk = procChunk;
+        selectedFinalPrefilterMode = chooseAdaptiveTalkFinalPrefilterMode(
+                trimmedRawChunk,
+                selectedFinalPrefilterMode,
+                sampleRateHz
+        );
+        try {
+            procChunk = AudioPrefilter.processForAsr(
+                    procChunk,
+                    procChunk.length,
+                    sampleRateHz,
+                    AudioPrefilter.Mode.TALK,
+                    selectedFinalPrefilterMode,
+                    new AudioPrefilter.State()
+            );
+            if (isStrongAudioPrefilterMode(selectedFinalPrefilterMode)
+                    && shouldFallbackStrongFinal(trimmedRawChunk, procChunk, sampleRateHz)) {
+                AudioPrefilter.VoiceMetrics rawMetrics =
+                        AudioPrefilter.analyzeVoiceLike(trimmedRawChunk, trimmedRawChunk.length, sampleRateHz);
+                AudioPrefilter.VoiceMetrics filteredMetrics =
+                        AudioPrefilter.analyzeVoiceLike(procChunk, procChunk.length, sampleRateHz);
+                Config.log("[AudioPrefilter][Talk] strong collapsed final -> fallback normal"
+                        + " rawRms=" + String.format(java.util.Locale.ROOT, "%.1f", rawMetrics.rms)
+                        + " filteredRms=" + String.format(java.util.Locale.ROOT, "%.1f", filteredMetrics.rms)
+                        + " rawPeak=" + rawMetrics.peak
+                        + " filteredPeak=" + filteredMetrics.peak);
+                noteRecognitionAssistCollapsedFinal(rawMetrics, filteredMetrics);
+                procChunk = AudioPrefilter.processForAsr(
+                        trimmedRawChunk,
+                        trimmedRawChunk.length,
+                        sampleRateHz,
+                        AudioPrefilter.Mode.TALK,
+                        AudioPrefilter.Profile.NORMAL,
+                        new AudioPrefilter.State()
+                );
+                selectedFinalPrefilterMode = "normal";
+            }
+        } catch (Exception ex) {
+            Config.logDebug("[AudioPrefilter][Talk] final profile failed -> keep trimmed raw: " + ex);
+        }
+        try {
+            procChunk = AudioPrefilter.normalizeFinalChunkForAsr(
+                    procChunk,
+                    procChunk.length,
+                    chooseAdaptiveFinalNormalizeTargetDbfs(
+                            trimmedRawChunk,
+                            selectedFinalPrefilterMode,
+                            sampleRateHz
+                    )
+            );
+        } catch (Exception ignore) {
+            // normalize は補助輪なので、失敗しても元chunkで続行するっす。
+        }
+        byte[] verifyChunk = buildMoonshineVerifyChunk(trimmedRawChunk, sampleRateHz);
+        byte[] slowVerifyChunk = buildMoonshineSlowVerifyChunk(trimmedRawChunk, sampleRateHz);
+        byte[] strongVerifyChunk = buildMoonshineStrongVerifyChunk(trimmedRawChunk, sampleRateHz);
+        byte[] speakerChunk;
+        try {
+            speakerChunk = trimPcmSilence16le(finalRawSpeakerChunk, audioFormat, 300, 120);
+        } catch (Exception ignore) {
+            speakerChunk = finalRawSpeakerChunk;
+        }
+        if (speakerChunk == null || speakerChunk.length == 0) {
+            speakerChunk = trimmedRawChunk;
+        }
+        return new MoonshineTalkFinalAudio(
+                trimmedRawChunk,
+                procChunk,
+                speakerChunk,
+                verifyChunk,
+                slowVerifyChunk,
+                strongVerifyChunk,
+                selectedFinalPrefilterMode,
+                finalAsrTuning);
+    }
+
+    public MoonshineBenchmarkFinalResult transcribeMoonshineBenchmarkTalkFinal(LocalMoonshineSTT hm,
+                                                                              byte[] pcm16k16mono,
+                                                                              String requestedPrefilterMode,
+                                                                              int speechPadMs,
+                                                                              String routeTag) {
+        MoonshineTalkFinalAudio prepared = prepareMoonshineTalkFinalAudio(
+                pcm16k16mono,
+                pcm16k16mono,
+                requestedPrefilterMode,
+                speechPadMs);
+        String tag = (routeTag == null || routeTag.isBlank()) ? "BenchTalkFinal" : routeTag;
+        String text = transcribeMoonshineOneShotBest(
+                hm,
+                prepared.procChunk,
+                tag);
+        AudioPrefilter.VoiceMetrics metrics = AudioPrefilter.analyzeVoiceLike(
+                prepared.procChunk,
+                prepared.procChunk == null ? 0 : prepared.procChunk.length,
+                (int) audioFormat.getSampleRate());
+        return new MoonshineBenchmarkFinalResult(text, prepared, metrics);
+    }
+
     private byte[] buildMoonshineVerifyChunk(byte[] trimmedRawChunk, int sampleRateHz) {
         return buildMoonshineAccuracyChunk(trimmedRawChunk, sampleRateHz, AudioPrefilter.Profile.NORMAL, -23.2d);
     }
@@ -17526,11 +17652,18 @@ public class MobMateWhisp implements NativeKeyListener {
                 MoonshineOneShotDecision retryDecision = decideMoonshineOneShotResult(retryResults);
                 logMoonshineOneShotDecision(retryDecision, routeTag, true);
                 if (!retryDecision.chosenText.isBlank()) {
-                    return retryDecision.chosenText;
+                    if (isRepeatingSpam(retryDecision.chosenText)
+                            && !decision.chosenText.isBlank()
+                            && !isRepeatingSpam(decision.chosenText)) {
+                        Config.logDebug("[Moonshine][" + routeTag + "] oneShot rescue ignored spam retry: "
+                                + retryDecision.chosenText);
+                        return trimBrokenMoonshineTailAfterSentence(decision.chosenText, routeTag);
+                    }
+                    return trimBrokenMoonshineTailAfterSentence(retryDecision.chosenText, routeTag);
                 }
             }
         }
-        return decision.chosenText;
+        return trimBrokenMoonshineTailAfterSentence(decision.chosenText, routeTag);
     }
     private ArrayList<MoonshineOneShotResult> collectMoonshineOneShotResults(LocalMoonshineSTT hm,
                                                                               List<byte[]> candidates,
@@ -17599,10 +17732,16 @@ public class MobMateWhisp implements NativeKeyListener {
             int score = left.baseScore
                     + (supportCount * 18)
                     + (int) Math.round(supportStrength * 8.0d);
+            int cp = left.normalized.codePointCount(0, left.normalized.length());
             if (results.size() >= 3 && supportCount == 0) score -= 24;
+            if (results.size() >= 3 && supportCount == 0
+                    && containsJapaneseScript(left.normalized)
+                    && cp >= 22) {
+                score -= Math.min(80, 18 + ((cp - 21) * 7));
+            }
             if (results.size() >= 2 && supportCount == 0
                     && !containsJapaneseScript(left.normalized)
-                    && left.normalized.codePointCount(0, left.normalized.length()) <= 18) {
+                    && cp <= 18) {
                 score -= 12;
             }
             left.finalScore = score;
@@ -17617,6 +17756,24 @@ public class MobMateWhisp implements NativeKeyListener {
         if (best == null) {
             return new MoonshineOneShotDecision(null, "", false, false, false, secondBestScore, 0, "");
         }
+        MoonshineOneShotResult merged = buildMoonshinePrefixSuffixMergedResult(results, best);
+        if (merged != null && merged.finalScore >= best.finalScore + 24) {
+            secondBestScore = Math.max(secondBestScore, best.finalScore);
+            best = merged;
+        }
+        if (isRepeatingSpam(best.normalized)) {
+            MoonshineOneShotResult nonSpam = null;
+            for (MoonshineOneShotResult result : results) {
+                if (result == best || isRepeatingSpam(result.normalized)) continue;
+                if (nonSpam == null || result.finalScore > nonSpam.finalScore) {
+                    nonSpam = result;
+                }
+            }
+            if (nonSpam != null && nonSpam.finalScore >= best.finalScore - 100) {
+                secondBestScore = Math.max(secondBestScore, best.finalScore);
+                best = nonSpam;
+            }
+        }
         for (MoonshineOneShotResult result : results) {
             if (result.normalized.codePointCount(0, result.normalized.length()) >= 8) {
                 conflictingLongAlternatives++;
@@ -17627,22 +17784,32 @@ public class MobMateWhisp implements NativeKeyListener {
                 && best.supportCount == 0
                 && conflictingLongAlternatives >= 2
                 && !containsJapaneseScript(best.normalized);
+        boolean reliableUnsupportedBest =
+                isReliableUnsupportedMoonshineOneShotBest(best, secondBestScore);
+        if (holdForNoAgreement && reliableUnsupportedBest) {
+            holdForNoAgreement = false;
+        }
         boolean narrowMargin = secondBestScore != Integer.MIN_VALUE
                 && (best.finalScore - secondBestScore) <= MOONSHINE_ONE_SHOT_RESCUE_MARGIN;
         boolean lowConfidence = best.hasConfidence()
                 && best.wordCount >= 2
                 && best.confidence < MOONSHINE_ONE_SHOT_RESCUE_CONFIDENCE;
+        boolean weakLowScoreAgreement = best.supportCount <= 1
+                && narrowMargin
+                && best.finalScore < 180
+                && conflictingLongAlternatives >= 2;
         boolean shouldRetryAccurate = results.size() >= 2
-                && best.supportCount == 0
-                && (holdForNoAgreement || narrowMargin || lowConfidence);
+                && (best.supportCount == 0 || weakLowScoreAgreement)
+                && (holdForNoAgreement || narrowMargin || lowConfidence || weakLowScoreAgreement);
         boolean confidenceFallback = best.hasConfidence()
                 && best.wordCount >= 2
                 && best.supportCount == 0
                 && best.confidence < MOONSHINE_ONE_SHOT_FALLBACK_CONFIDENCE
                 && !containsJapaneseScript(best.normalized);
         String retryReason = holdForNoAgreement ? "no crop agreement"
+                : (weakLowScoreAgreement ? "weak low-score agreement"
                 : (narrowMargin ? "narrow score margin"
-                : (lowConfidence ? "low confidence" : ""));
+                : (lowConfidence ? "low confidence" : "")));
         return new MoonshineOneShotDecision(
                 best,
                 (holdForNoAgreement || confidenceFallback) ? "" : best.text,
@@ -17653,6 +17820,107 @@ public class MobMateWhisp implements NativeKeyListener {
                 conflictingLongAlternatives,
                 retryReason
         );
+    }
+    private MoonshineOneShotResult buildMoonshinePrefixSuffixMergedResult(List<MoonshineOneShotResult> results,
+                                                                          MoonshineOneShotResult best) {
+        if (results == null || results.size() < 2 || best == null) return null;
+        if (best.index < 3) return null;
+        String suffixNorm = normForNearDup(best.normalized);
+        int suffixCp = best.normalized.codePointCount(0, best.normalized.length());
+        if (suffixCp < 8 || suffixNorm.isEmpty() || isRepeatingSpam(best.normalized)) return null;
+        if (best.normalized.indexOf('\uFFFD') >= 0 || best.normalized.contains("??")) return null;
+
+        MoonshineOneShotResult prefix = null;
+        for (MoonshineOneShotResult candidate : results) {
+            if (candidate == null || candidate == best) continue;
+            if (candidate.index < 0 || candidate.index >= best.index) continue;
+            if (candidate.finalScore < best.finalScore - 90) continue;
+            String prefixNorm = normForNearDup(candidate.normalized);
+            int prefixCp = candidate.normalized.codePointCount(0, candidate.normalized.length());
+            if (prefixCp < 8 || prefixNorm.isEmpty()) continue;
+            if (isRepeatingSpam(candidate.normalized)) continue;
+            if (candidate.normalized.indexOf('\uFFFD') >= 0 || candidate.normalized.contains("??")) continue;
+            if (prefixNorm.contains(suffixNorm) || suffixNorm.contains(prefixNorm)) continue;
+            if (similarityRatio(prefixNorm, suffixNorm) >= 0.58d) continue;
+            if (prefix == null || candidate.finalScore > prefix.finalScore) {
+                prefix = candidate;
+            }
+        }
+        if (prefix == null) return null;
+
+        String mergedText = mergeMoonshinePrefixSuffixText(prefix.text, best.text);
+        String mergedNorm = removeCjkSpaces(mergedText).trim();
+        if (mergedNorm.isBlank() || isRepeatingSpam(mergedNorm)) return null;
+        if (mergedNorm.indexOf('\uFFFD') >= 0 || mergedNorm.contains("??")) return null;
+        int mergedCp = mergedNorm.codePointCount(0, mergedNorm.length());
+        int prefixCp = prefix.normalized.codePointCount(0, prefix.normalized.length());
+        if (mergedCp < Math.max(prefixCp, suffixCp) + 6) return null;
+        if (mergedCp > 180) return null;
+
+        MoonshineOneShotResult merged = new MoonshineOneShotResult(
+                -30,
+                mergedText,
+                mergedNorm,
+                scoreMoonshineOneShotResult(mergedNorm) + 18,
+                Float.NaN,
+                0);
+        merged.supportCount = Math.max(prefix.supportCount, best.supportCount);
+        merged.supportStrength = Math.max(prefix.supportStrength, best.supportStrength);
+        merged.finalScore = merged.baseScore
+                + Math.max(0, merged.supportCount * 8)
+                + (int) Math.round(Math.max(0.0d, merged.supportStrength) * 4.0d);
+        Config.logDebug("[Moonshine] oneShot merge prefix#" + prefix.index
+                + " + suffix#" + best.index
+                + " -> " + merged.text);
+        return merged;
+    }
+    private String mergeMoonshinePrefixSuffixText(String prefix, String suffix) {
+        String left = prefix == null ? "" : prefix.trim();
+        String right = suffix == null ? "" : suffix.trim();
+        if (left.isEmpty()) return right;
+        if (right.isEmpty()) return left;
+        String compactLeft = normForNearDup(left);
+        String compactRight = normForNearDup(right);
+        if (compactLeft.endsWith(compactRight)) return left;
+        if (compactRight.startsWith(compactLeft)) return right;
+
+        if (shouldInsertSegmentSpace(left, right)) {
+            String trimmedLeft = left;
+            char firstRight = right.charAt(0);
+            if (Character.isLowerCase(firstRight)) {
+                trimmedLeft = trimmedLeft.replaceAll("[\\p{Punct}\\p{IsPunctuation}]+$", "");
+            }
+            return (trimmedLeft + " " + right).replaceAll("\\s+", " ").trim();
+        }
+        return (left.replaceAll("[\\p{Punct}\\p{IsPunctuation}]+$", "") + right).trim();
+    }
+    private String trimBrokenMoonshineTailAfterSentence(String text, String routeTag) {
+        if (text == null || text.isBlank()) return "";
+        String s = text.trim();
+        int broken = firstBrokenMoonshineMarkerIndex(s);
+        if (broken < 0) return s;
+        int cut = -1;
+        for (int i = 0; i < broken; i++) {
+            char c = s.charAt(i);
+            if (c == '。' || c == '！' || c == '？'
+                    || c == '.' || c == '!' || c == '?') {
+                cut = i + 1;
+            }
+        }
+        if (cut <= 0) return s;
+        String head = s.substring(0, cut).trim();
+        int headCp = head.codePointCount(0, head.length());
+        if (headCp < 8) return s;
+        Config.logDebug("[Moonshine][" + routeTag + "] trim broken tail after sentence: " + s + " -> " + head);
+        return head;
+    }
+    private int firstBrokenMoonshineMarkerIndex(String text) {
+        if (text == null || text.isEmpty()) return -1;
+        int q = text.indexOf("??");
+        int repl = text.indexOf('\uFFFD');
+        if (q < 0) return repl;
+        if (repl < 0) return q;
+        return Math.min(q, repl);
     }
     private void logMoonshineOneShotDecision(MoonshineOneShotDecision decision, String routeTag, boolean accurate) {
         if (decision == null || decision.best == null) return;
@@ -17680,6 +17948,18 @@ public class MobMateWhisp implements NativeKeyListener {
                 + " words=" + decision.best.wordCount
                 : "")
                 + " text=" + decision.best.text);
+    }
+    private boolean isReliableUnsupportedMoonshineOneShotBest(MoonshineOneShotResult best,
+                                                              int secondBestScore) {
+        if (best == null || best.supportCount > 0 || best.index != 0) return false;
+        String normalized = removeCjkSpaces(best.normalized).trim();
+        if (normalized.isBlank()) return false;
+        if (isRepeatingSpam(normalized)) return false;
+        if (normalized.indexOf('\uFFFD') >= 0 || normalized.contains("??")) return false;
+        int cp = normalized.codePointCount(0, normalized.length());
+        if (cp < 14) return false;
+        if (best.finalScore < 240) return false;
+        return secondBestScore == Integer.MIN_VALUE || best.finalScore >= secondBestScore + 18;
     }
     private void collectMoonshineOneShotRescueCandidates(List<MoonshineOneShotResult> results,
                                                          List<byte[]> candidates,
@@ -17710,7 +17990,7 @@ public class MobMateWhisp implements NativeKeyListener {
         if (endsWithSentencePunctuation(normalized)) score += 8;
         if (containsJapaneseScript(normalized)) score += 4;
         if (normalized.indexOf('\uFFFD') >= 0 || normalized.contains("??")) score -= 20;
-        if (isRepeatingSpam(normalized)) score -= 40;
+        if (isRepeatingSpam(normalized)) score -= 80;
         if (!normalized.contains(" ") && !containsJapaneseScript(normalized) && cp <= 5) score -= 12;
         if (!Float.isNaN(confidence) && confidence >= 0.0f) {
             score += Math.round((confidence - 0.60f) * 70.0f);
@@ -17724,6 +18004,34 @@ public class MobMateWhisp implements NativeKeyListener {
         addMoonshineOneShotCandidate(out, pcm16k16mono);
         byte[] trimmed = trimPcmSilence16le(pcm16k16mono, MOONSHINE_ONE_SHOT_AUDIO_FORMAT, 220, 120);
         addMoonshineOneShotCandidate(out, trimmed);
+        AudioPrefilter.FinalAsrTuning tuning = AudioPrefilter.selectFinalAsrTuning(
+                pcm16k16mono,
+                pcm16k16mono == null ? 0 : pcm16k16mono.length,
+                (int) MOONSHINE_ONE_SHOT_AUDIO_FORMAT.getSampleRate(),
+                AudioPrefilter.Mode.TALK);
+        if (!"default".equals(tuning.id)) {
+            byte[] tunedTrimmed = trimPcmSilence16le(
+                    pcm16k16mono,
+                    MOONSHINE_ONE_SHOT_AUDIO_FORMAT,
+                    tuning.trimAbsThreshold,
+                    tuning.trimPadMs);
+            addMoonshineOneShotCandidate(out, tunedTrimmed);
+            try {
+                byte[] tunedProcessed = AudioPrefilter.processForAsr(
+                        tunedTrimmed,
+                        tunedTrimmed.length,
+                        (int) MOONSHINE_ONE_SHOT_AUDIO_FORMAT.getSampleRate(),
+                        AudioPrefilter.Mode.TALK,
+                        AudioPrefilter.Profile.NORMAL,
+                        new AudioPrefilter.State());
+                tunedProcessed = AudioPrefilter.normalizeFinalChunkForAsr(
+                        tunedProcessed,
+                        tunedProcessed.length,
+                        tuning.normalizeDbfs);
+                addMoonshineOneShotCandidate(out, tunedProcessed);
+            } catch (Throwable ignore) {
+            }
+        }
         addAdaptiveMoonshineOneShotCrops(out, trimmed);
         return out;
     }
@@ -17977,6 +18285,7 @@ public class MobMateWhisp implements NativeKeyListener {
         talkSpeechGatePeriodicNoiseStreak = 0;
         talkSpeechGateLastAtMs = 0L;
         talkSpeechGateLastReason = "";
+        talkSileroVad.resetStream();
     }
 
     private long estimateTalkSpeechActiveMs(byte[] pcm16le, AudioFormat fmt, int peak, boolean lowGainMic) {
@@ -17989,6 +18298,7 @@ public class MobMateWhisp implements NativeKeyListener {
     }
 
     private TalkSpeechGateDecision evaluateTalkSpeechGate(byte[] pcm16le,
+                                                          byte[] neuralVadPcm16le,
                                                           int bytes,
                                                           AudioFormat fmt,
                                                           AdaptiveNoiseProfile profile,
@@ -18066,6 +18376,10 @@ public class MobMateWhisp implements NativeKeyListener {
         }
 
         if (activeMs < TALK_SPEECH_GATE_MIN_ACTIVE_MS) {
+            TalkSpeechGateDecision sileroRescue = maybeRescueTalkSpeechGateWithSilero(
+                    "short", neuralVadPcm16le, bytes, fmt, metrics, activeMs, rawPeak, rawAvg,
+                    peakMin, avgMin, rmsMin, lowGainMic);
+            if (sileroRescue != null) return sileroRescue;
             talkSpeechGateStreak = 0;
             talkSpeechGatePeriodicNoiseStreak = 0;
             return TalkSpeechGateDecision.reject("short", metrics, activeMs, rawPeak, rawAvg,
@@ -18075,6 +18389,10 @@ public class MobMateWhisp implements NativeKeyListener {
         boolean failAvg = rawAvg < avgMin;
         boolean failRms = metrics.rms < rmsMin;
         if (failPeak || failAvg || failRms) {
+            TalkSpeechGateDecision sileroRescue = maybeRescueTalkSpeechGateWithSilero(
+                    "low_energy", neuralVadPcm16le, bytes, fmt, metrics, activeMs, rawPeak, rawAvg,
+                    peakMin, avgMin, rmsMin, lowGainMic);
+            if (sileroRescue != null) return sileroRescue;
             talkSpeechGateStreak = 0;
             talkSpeechGatePeriodicNoiseStreak = 0;
             return TalkSpeechGateDecision.reject("low_energy", metrics, activeMs, rawPeak, rawAvg,
@@ -18096,6 +18414,10 @@ public class MobMateWhisp implements NativeKeyListener {
                     peakMin, avgMin, rmsMin);
         }
         if (periodic.likelyMechanicalNoise()) {
+            TalkSpeechGateDecision sileroRescue = maybeRescueTalkSpeechGateWithSilero(
+                    "periodic_low_noise", neuralVadPcm16le, bytes, fmt, metrics, activeMs, rawPeak, rawAvg,
+                    peakMin, avgMin, rmsMin, lowGainMic);
+            if (sileroRescue != null) return sileroRescue;
             talkSpeechGateStreak = 0;
             talkSpeechGatePeriodicNoiseStreak++;
             return TalkSpeechGateDecision.reject(
@@ -18119,12 +18441,20 @@ public class MobMateWhisp implements NativeKeyListener {
             talkSpeechGatePeriodicNoiseStreak = 0;
         }
         if (metrics.zcr < zcrMin || metrics.zcr > zcrMax) {
+            TalkSpeechGateDecision sileroRescue = maybeRescueTalkSpeechGateWithSilero(
+                    "zcr", neuralVadPcm16le, bytes, fmt, metrics, activeMs, rawPeak, rawAvg,
+                    peakMin, avgMin, rmsMin, lowGainMic);
+            if (sileroRescue != null) return sileroRescue;
             talkSpeechGateStreak = 0;
             talkSpeechGatePeriodicNoiseStreak = 0;
             return TalkSpeechGateDecision.reject("zcr", metrics, activeMs, rawPeak, rawAvg,
                     peakMin, avgMin, rmsMin, false, false, false);
         }
         if (metrics.voiceBandRatio < vbrMin) {
+            TalkSpeechGateDecision sileroRescue = maybeRescueTalkSpeechGateWithSilero(
+                    "weak_voiceband", neuralVadPcm16le, bytes, fmt, metrics, activeMs, rawPeak, rawAvg,
+                    peakMin, avgMin, rmsMin, lowGainMic);
+            if (sileroRescue != null) return sileroRescue;
             talkSpeechGateStreak = 0;
             talkSpeechGatePeriodicNoiseStreak = 0;
             return TalkSpeechGateDecision.reject("weak_voiceband", metrics, activeMs, rawPeak, rawAvg,
@@ -18139,6 +18469,50 @@ public class MobMateWhisp implements NativeKeyListener {
         }
         return TalkSpeechGateDecision.reject("warmup", metrics, activeMs, rawPeak, rawAvg,
                 peakMin, avgMin, rmsMin, false, false, false);
+    }
+
+    private TalkSpeechGateDecision maybeRescueTalkSpeechGateWithSilero(String reason,
+                                                                       byte[] pcm16le,
+                                                                       int bytes,
+                                                                       AudioFormat fmt,
+                                                                       AudioPrefilter.VoiceMetrics metrics,
+                                                                       long activeMs,
+                                                                       int rawPeak,
+                                                                       int rawAvg,
+                                                                       int peakMin,
+                                                                       int avgMin,
+                                                                       double rmsMin,
+                                                                       boolean lowGainMic) {
+        if (!Config.getBool("talk.vad.silero.enabled", true)) return null;
+        if (fmt == null || Math.round(fmt.getSampleRate()) != SileroVadOnnx.SAMPLE_RATE) return null;
+        if (rawPeak < (lowGainMic ? 120 : 260) && rawAvg < (lowGainMic ? 18 : 32)) return null;
+        double score = talkSileroVad.score(pcm16le, bytes, SileroVadOnnx.SAMPLE_RATE);
+        if (Double.isNaN(score)) return null;
+        double threshold = Config.getFloat(
+                lowGainMic ? "talk.vad.silero.low_threshold" : "talk.vad.silero.threshold",
+                lowGainMic ? 0.42f : 0.58f);
+        if ("short".equals(reason)) threshold = Math.max(threshold, lowGainMic ? 0.50d : 0.66d);
+        if ("low_energy".equals(reason) && rawPeak < (lowGainMic ? 180 : 360)) {
+            threshold = Math.max(threshold, lowGainMic ? 0.58d : 0.72d);
+        }
+        if ("periodic_low_noise".equals(reason)) threshold = Math.max(threshold, lowGainMic ? 0.56d : 0.68d);
+        if (score < threshold) {
+            long now = System.currentTimeMillis();
+            if (score >= threshold - 0.08d || (now - talkSileroVadLastShadowLogAtMs) >= 2_000L) {
+                talkSileroVadLastShadowLogAtMs = now;
+                Config.logDebug(String.format(Locale.ROOT,
+                        "★TalkVAD Silero shadow: reason=%s score=%.3f threshold=%.3f active=%dms peak=%d avg=%d lowGain=%s",
+                        reason, score, threshold, activeMs, rawPeak, rawAvg, lowGainMic));
+            }
+            return null;
+        }
+        talkSpeechGateStreak = TALK_SPEECH_GATE_REQUIRED_STREAK;
+        talkSpeechGatePeriodicNoiseStreak = 0;
+        Config.logDebug(String.format(Locale.ROOT,
+                "★TalkVAD Silero rescue: reason=%s score=%.3f threshold=%.3f active=%dms peak=%d avg=%d lowGain=%s",
+                reason, score, threshold, activeMs, rawPeak, rawAvg, lowGainMic));
+        return TalkSpeechGateDecision.allow("silero_" + reason + "@" + String.format(Locale.ROOT, "%.2f", score),
+                metrics, activeMs, rawPeak, rawAvg, peakMin, avgMin, rmsMin);
     }
 
     private static final class TalkSpeechGateDecision {
@@ -18189,6 +18563,18 @@ public class MobMateWhisp implements NativeKeyListener {
                                             int avgMin,
                                             double rmsMin) {
             return new TalkSpeechGateDecision(true, "allow", metrics, activeMs, rawPeak, rawAvg,
+                    peakMin, avgMin, rmsMin, false, false, false);
+        }
+
+        static TalkSpeechGateDecision allow(String reason,
+                                            AudioPrefilter.VoiceMetrics metrics,
+                                            long activeMs,
+                                            int rawPeak,
+                                            int rawAvg,
+                                            int peakMin,
+                                            int avgMin,
+                                            double rmsMin) {
+            return new TalkSpeechGateDecision(true, reason, metrics, activeMs, rawPeak, rawAvg,
                     peakMin, avgMin, rmsMin, false, false, false);
         }
 

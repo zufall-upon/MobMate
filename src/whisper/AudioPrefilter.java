@@ -70,13 +70,21 @@ public final class AudioPrefilter {
 
     public enum Profile {
         OFF,
+        AUTO,
         NORMAL,
+        PRESENCE_LIGHT,
+        PRESENCE_MID,
+        PRESENCE_STRONG,
         STRONG;
 
         public static Profile fromKey(String key) {
             if (key == null) return NORMAL;
             return switch (key.trim().toLowerCase()) {
                 case "off", "disabled", "none" -> OFF;
+                case "auto", "dynamic", "adaptive" -> AUTO;
+                case "presence", "presence_light", "presence-light", "light_presence", "light-presence" -> PRESENCE_LIGHT;
+                case "presence_mid", "presence-mid", "mid_presence", "mid-presence" -> PRESENCE_MID;
+                case "presence_strong", "presence-strong", "strong_presence", "strong-presence" -> PRESENCE_STRONG;
                 case "strong", "aggressive" -> STRONG;
                 default -> NORMAL;
             };
@@ -112,6 +120,32 @@ public final class AudioPrefilter {
             java.util.Arrays.fill(notchY2, 0.0);
             spectralNoiseFloor = new double[0];
             spectralLateReverb = new double[0];
+        }
+    }
+
+    public static final class FinalAsrTuning {
+        public final String id;
+        public final int trimAbsThreshold;
+        public final int trimPadMs;
+        public final double normalizeDbfs;
+        public final int leadingPaddingMs;
+        public final int tailPaddingMs;
+        public final double slowDownRatio;
+
+        private FinalAsrTuning(String id,
+                               int trimAbsThreshold,
+                               int trimPadMs,
+                               double normalizeDbfs,
+                               int leadingPaddingMs,
+                               int tailPaddingMs,
+                               double slowDownRatio) {
+            this.id = id;
+            this.trimAbsThreshold = trimAbsThreshold;
+            this.trimPadMs = trimPadMs;
+            this.normalizeDbfs = normalizeDbfs;
+            this.leadingPaddingMs = leadingPaddingMs;
+            this.tailPaddingMs = tailPaddingMs;
+            this.slowDownRatio = slowDownRatio;
         }
     }
 
@@ -159,7 +193,18 @@ public final class AudioPrefilter {
     private static final double TALK_NORMAL_NOISY_HP_CUTOFF_HZ = 180.0;
     private static final double TALK_NORMAL_PRE_EMPHASIS_ALPHA = 0.08;
     private static final double TALK_NORMAL_NOISY_PRE_EMPHASIS_ALPHA = 0.18;
+    private static final double PRESENCE_LIGHT_HP_CUTOFF_HZ = 70.0;
+    private static final double PRESENCE_MID_HP_CUTOFF_HZ = 90.0;
+    private static final double PRESENCE_STRONG_HP_CUTOFF_HZ = 105.0;
+    private static final double PRESENCE_LIGHT_LP_CUTOFF_HZ = 6800.0;
+    private static final double PRESENCE_MID_LP_CUTOFF_HZ = 7000.0;
+    private static final double PRESENCE_STRONG_LP_CUTOFF_HZ = 7200.0;
+    private static final double PRESENCE_LIGHT_PRE_EMPHASIS_ALPHA = 0.10;
+    private static final double PRESENCE_MID_PRE_EMPHASIS_ALPHA = 0.16;
+    private static final double PRESENCE_STRONG_PRE_EMPHASIS_ALPHA = 0.24;
     private static final double NORMAL_LIMIT_DRIVE = 0.92;
+    private static final double PRESENCE_MID_LIMIT_DRIVE = 0.90;
+    private static final double PRESENCE_STRONG_LIMIT_DRIVE = 0.88;
     private static final double STRONG_LIMIT_DRIVE = 0.86;
     private static final double TARGET_FINAL_RMS_DBFS = -21.0;
     private static final double PEAK_CEILING_DBFS = -3.0;
@@ -286,7 +331,64 @@ public final class AudioPrefilter {
             System.arraycopy(pcm16le, 0, copy, 0, bytes);
             return copy;
         }
+        if (useProfile == Profile.AUTO) {
+            useProfile = selectAdaptiveProfile(pcm16le, bytes, Math.max(8000, sampleRateHz), mode);
+        }
         return filterVoiceBand(pcm16le, bytes, Math.max(8000, sampleRateHz), mode, useProfile, useState);
+    }
+
+    public static Profile selectAdaptiveProfile(byte[] pcm16le, int bytes, int sampleRateHz, Mode mode) {
+        if (pcm16le == null || bytes < 4 || mode != Mode.TALK) return Profile.NORMAL;
+        VoiceMetrics metrics = analyzeVoiceLike(pcm16le, bytes, Math.max(8000, sampleRateHz));
+        if (metrics == null) return Profile.NORMAL;
+        boolean lowReadableVoice = metrics.rms >= 950.0
+                && metrics.rms <= 2050.0
+                && metrics.peak >= 9000
+                && metrics.voiceBandRatio >= 0.60
+                && metrics.voiceBandRatio <= 0.82;
+        if (lowReadableVoice) return Profile.PRESENCE_STRONG;
+        return Profile.NORMAL;
+    }
+
+    public static FinalAsrTuning selectFinalAsrTuning(byte[] pcm16le, int bytes, int sampleRateHz, Mode mode) {
+        int sampleRate = Math.max(8000, sampleRateHz);
+        long durationMs = (pcm16le == null || bytes < 4)
+                ? 0L
+                : ((long) Math.max(0, bytes / 2) * 1000L) / sampleRate;
+        VoiceMetrics metrics = analyzeVoiceLike(pcm16le, bytes, sampleRate);
+        if (mode != Mode.TALK || metrics == null) {
+            return new FinalAsrTuning("default", 300, 120, -22.8d, 300, 300, 1.00d);
+        }
+        boolean shortCommandLike = durationMs > 0L
+                && durationMs <= 2200L
+                && metrics.peak >= 6000
+                && metrics.rms >= 1200.0d;
+        boolean verySoftVoice = metrics.peak > 0
+                && (metrics.peak <= 3200 || metrics.rms < 320.0d);
+        boolean lowMuffledVoice = durationMs >= 2000L
+                && metrics.rms >= 700.0d
+                && metrics.rms <= 2100.0d
+                && metrics.peak >= 6000
+                && metrics.peak <= 24000
+                && metrics.voiceBandRatio >= 0.55d
+                && metrics.voiceBandRatio <= 0.82d;
+        boolean lowReadableVoice = durationMs >= 1800L
+                && metrics.rms >= 320.0d
+                && metrics.rms < 700.0d
+                && metrics.peak <= 9000
+                && metrics.voiceBandRatio >= 0.55d
+                && metrics.voiceBandRatio <= 0.82d;
+
+        if (verySoftVoice) {
+            return new FinalAsrTuning("weak_voice_guard", 300, 120, -26.0d, 300, 300, 1.00d);
+        }
+        if (lowMuffledVoice || lowReadableVoice) {
+            return new FinalAsrTuning("low_muffled_guard", 90, 300, -26.0d, 520, 820, 1.00d);
+        }
+        if (shortCommandLike) {
+            return new FinalAsrTuning("short_command_guard", 180, 260, -23.4d, 420, 520, 1.00d);
+        }
+        return new FinalAsrTuning("default", 300, 120, -22.8d, 300, 300, 1.00d);
     }
 
     public static byte[] normalizeFinalChunkForAsr(byte[] pcm16le, int bytes) {
@@ -527,9 +629,9 @@ public final class AudioPrefilter {
         int samples = bytes / 2;
         double[] working = new double[samples];
 
-        double hpCutoff = (profile == Profile.STRONG) ? STRONG_HP_CUTOFF_HZ : DEFAULT_HP_CUTOFF_HZ;
-        double lpCutoff = (profile == Profile.STRONG) ? STRONG_LP_CUTOFF_HZ : DEFAULT_LP_CUTOFF_HZ;
-        double preAlpha = (profile == Profile.STRONG) ? STRONG_PRE_EMPHASIS_ALPHA : 0.0;
+        double hpCutoff = hpCutoffFor(profile);
+        double lpCutoff = lpCutoffFor(profile);
+        double preAlpha = preEmphasisFor(profile);
         if (profile == Profile.NORMAL && mode == Mode.TALK) {
             LowFrequencyPeriodicMetrics periodic = analyzeLowFrequencyPeriodicNoise(pcm16le, bytes, sampleRateHz);
             boolean lowDominant = periodic.likelyMechanicalNoise() || periodic.lowToVoiceRatio >= 24.0;
@@ -555,7 +657,7 @@ public final class AudioPrefilter {
             java.util.Arrays.fill(state.notchY1, 0.0);
             java.util.Arrays.fill(state.notchY2, 0.0);
         }
-        double limitDrive = (profile == Profile.STRONG) ? STRONG_LIMIT_DRIVE : NORMAL_LIMIT_DRIVE;
+        double limitDrive = limitDriveFor(profile);
 
         for (int i = 0; i + 1 < bytes; i += 2) {
             double x = readPcm16le(pcm16le, i);
@@ -598,6 +700,45 @@ public final class AudioPrefilter {
         state.prePrevX = prePrevX;
         state.lpPrevY = lpPrevY;
         return out;
+    }
+
+    private static double hpCutoffFor(Profile profile) {
+        return switch (profile) {
+            case STRONG -> STRONG_HP_CUTOFF_HZ;
+            case PRESENCE_LIGHT -> PRESENCE_LIGHT_HP_CUTOFF_HZ;
+            case PRESENCE_MID -> PRESENCE_MID_HP_CUTOFF_HZ;
+            case PRESENCE_STRONG -> PRESENCE_STRONG_HP_CUTOFF_HZ;
+            default -> DEFAULT_HP_CUTOFF_HZ;
+        };
+    }
+
+    private static double lpCutoffFor(Profile profile) {
+        return switch (profile) {
+            case STRONG -> STRONG_LP_CUTOFF_HZ;
+            case PRESENCE_LIGHT -> PRESENCE_LIGHT_LP_CUTOFF_HZ;
+            case PRESENCE_MID -> PRESENCE_MID_LP_CUTOFF_HZ;
+            case PRESENCE_STRONG -> PRESENCE_STRONG_LP_CUTOFF_HZ;
+            default -> DEFAULT_LP_CUTOFF_HZ;
+        };
+    }
+
+    private static double preEmphasisFor(Profile profile) {
+        return switch (profile) {
+            case STRONG -> STRONG_PRE_EMPHASIS_ALPHA;
+            case PRESENCE_LIGHT -> PRESENCE_LIGHT_PRE_EMPHASIS_ALPHA;
+            case PRESENCE_MID -> PRESENCE_MID_PRE_EMPHASIS_ALPHA;
+            case PRESENCE_STRONG -> PRESENCE_STRONG_PRE_EMPHASIS_ALPHA;
+            default -> 0.0;
+        };
+    }
+
+    private static double limitDriveFor(Profile profile) {
+        return switch (profile) {
+            case STRONG -> STRONG_LIMIT_DRIVE;
+            case PRESENCE_MID -> PRESENCE_MID_LIMIT_DRIVE;
+            case PRESENCE_STRONG -> PRESENCE_STRONG_LIMIT_DRIVE;
+            default -> NORMAL_LIMIT_DRIVE;
+        };
     }
 
     private static void applyStreamingAgc(double[] samples, Profile profile, State state) {

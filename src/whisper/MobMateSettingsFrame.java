@@ -340,6 +340,7 @@ public class MobMateSettingsFrame extends JDialog {
         audioPrefilterModeCombo = new JComboBox<>(new Choice[]{
                 new Choice<>(tt("settings.audioPrefilter.off", "Off"), "off"),
                 new Choice<>(tt("settings.audioPrefilter.normal", "Normal filter"), "normal"),
+                new Choice<>(tt("settings.audioPrefilter.auto", "Auto filter"), "auto"),
                 new Choice<>(tt("settings.audioPrefilter.strong", "Strong filter"), "strong")
         });
         inputGainCombo = new JComboBox<>(new Choice[]{

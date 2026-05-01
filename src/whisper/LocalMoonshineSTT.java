@@ -317,6 +317,7 @@ public class LocalMoonshineSTT {
 
             Config.log("[Moonshine] step2 OK! handle=" + transcriberHandle);
             transcriber = transcriberHandle;
+            warmUpAfterLoadIfEnabled();
             return true;
 
         } catch (Error e) {
@@ -329,6 +330,24 @@ public class LocalMoonshineSTT {
             Config.log("[Moonshine] load exception: " + e.getMessage());
             e.printStackTrace();
             return false;
+        }
+    }
+
+    private void warmUpAfterLoadIfEnabled() {
+        if (!Config.getBool("moonshine.warmup.enabled", true)) return;
+        try {
+            long startNs = System.nanoTime();
+            int warmupMs = Math.max(40, Math.min(250, Config.getInt("moonshine.warmup.ms", 80)));
+            float[] silence = new float[Math.max(160, (16000 * warmupMs) / 1000)];
+            OneShotDecodeOptions options = new OneShotDecodeOptions(80, 80, 1, 0, true);
+            OneShotTranscriptResult result = transcribeOneShotInternal(silence, options, "warmup");
+            long elapsedMs = Math.max(0L, (System.nanoTime() - startNs) / 1_000_000L);
+            Config.log("[Moonshine] warmup OK: ms=" + elapsedMs
+                    + " inputMs=" + warmupMs
+                    + " text=" + (result.text.isEmpty() ? "<blank>" : result.text));
+        } catch (Throwable t) {
+            Config.log("[Moonshine] warmup skipped: " + t.getClass().getSimpleName()
+                    + ": " + t.getMessage());
         }
     }
 

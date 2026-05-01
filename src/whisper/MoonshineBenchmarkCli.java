@@ -78,6 +78,9 @@ public final class MoonshineBenchmarkCli {
         Files.createDirectories(out.getParent());
         if (history.getParent() != null) Files.createDirectories(history.getParent());
         String runId = opts.getOrDefault("run-id", defaultRunId());
+        MobMateWhisp mobMateFinalRoute = parseBooleanOpt(opts, "mobmate-final-route", true)
+                ? new MobMateWhisp("", true)
+                : null;
 
         try (var writer = Files.newBufferedWriter(out, StandardCharsets.UTF_8);
              var historyWriter = Files.newBufferedWriter(history, StandardCharsets.UTF_8,
@@ -90,7 +93,7 @@ public final class MoonshineBenchmarkCli {
                     for (CaseItem item : cases) {
                         if (!item.language.isBlank() && !item.language.equalsIgnoreCase(preset.language)) continue;
                         if (!item.scene.isBlank() && !item.scene.equalsIgnoreCase(preset.scene)) continue;
-                        JSONObject row = runCase(loaded.stt, preset, item, modelPath, loaded.arch, opts);
+                        JSONObject row = runCase(mobMateFinalRoute, loaded.stt, preset, item, modelPath, loaded.arch, opts);
                         row.put("run_id", runId);
                         writer.write(row.toString());
                         writer.newLine();
@@ -110,7 +113,8 @@ public final class MoonshineBenchmarkCli {
         System.out.println("appended history " + history);
     }
 
-    private static JSONObject runCase(LocalMoonshineSTT stt,
+    private static JSONObject runCase(MobMateWhisp mobMateFinalRoute,
+                                      LocalMoonshineSTT stt,
                                       Preset preset,
                                       CaseItem item,
                                       Path modelPath,
@@ -119,39 +123,96 @@ public final class MoonshineBenchmarkCli {
         long startedNs = System.nanoTime();
         AudioData audio = readWavAsPcm16Mono(item.wavPath);
         byte[] mono16k = resamplePcm16Mono(audio.pcm16le, audio.sampleRateHz, TARGET_SAMPLE_RATE);
-        byte[] trimmed = trimPcmSilence16le(mono16k, preset.trimAbsThreshold, preset.trimPadMs);
-        byte[] cropped = cropPcm16leToMaxMs(trimmed, preset.maxInputMs);
-        byte[] squashed = squashInternalSilence16le(
-                cropped,
-                preset.squashSilenceAbsThreshold,
-                preset.squashSilenceMinMs,
-                preset.squashSilenceKeepMs);
-        byte[] processed = AudioPrefilter.processForAsr(
-                squashed, squashed.length, TARGET_SAMPLE_RATE, AudioPrefilter.Mode.TALK,
-                preset.prefilter, new AudioPrefilter.State());
-        processed = AudioPrefilter.normalizeFinalChunkForAsr(processed, processed.length, preset.normalizeDbfs);
-        if (preset.slowDownRatio > 1.01d) {
-            processed = slowDownPcm16le(processed, preset.slowDownRatio);
-        }
-        Path dumpedAudio = dumpProcessedAudioIfRequested(opts, preset, item, processed);
-
         long decodeStartedNs = System.nanoTime();
-        LocalMoonshineSTT.OneShotTranscriptResult result = stt.transcribeOneShotDetailed(
-                pcm16leToFloat(processed),
-                preset.leadingPaddingMs,
-                preset.tailPaddingMs,
-                preset.passes,
-                preset.settleSleepMs,
-                preset.withoutStreaming,
-                "bench:" + preset.id);
+        AudioPrefilter.FinalAsrTuning runtimeTuning;
+        boolean useRuntimeTuning;
+        int actualTrimAbsThreshold;
+        int actualTrimPadMs;
+        double actualNormalizeDbfs;
+        int actualLeadingPaddingMs = preset.leadingPaddingMs;
+        int actualTailPaddingMs = preset.tailPaddingMs;
+        double actualSlowDownRatio = preset.slowDownRatio;
+        String selectedPrefilterKey;
+        byte[] processed;
+        AudioPrefilter.VoiceMetrics metrics;
+        String text;
+        float lineConfidence = Float.NaN;
+        int wordCount = 0;
+        if (mobMateFinalRoute != null) {
+            MobMateWhisp.MoonshineBenchmarkFinalResult routeResult =
+                    mobMateFinalRoute.transcribeMoonshineBenchmarkTalkFinal(
+                            stt,
+                            mono16k,
+                            preset.prefilter.name().toLowerCase(Locale.ROOT),
+                            preset.trimPadMs,
+                            "benchBody:" + preset.id);
+            MobMateWhisp.MoonshineTalkFinalAudio routeAudio = routeResult.audio;
+            runtimeTuning = routeAudio.tuning;
+            useRuntimeTuning = runtimeTuning != null && !"default".equals(runtimeTuning.id);
+            actualTrimAbsThreshold = runtimeTuning == null ? preset.trimAbsThreshold : runtimeTuning.trimAbsThreshold;
+            actualTrimPadMs = runtimeTuning == null ? preset.trimPadMs : Math.max(preset.trimPadMs, runtimeTuning.trimPadMs);
+            actualNormalizeDbfs = runtimeTuning == null ? preset.normalizeDbfs : runtimeTuning.normalizeDbfs;
+            actualSlowDownRatio = runtimeTuning == null ? preset.slowDownRatio : runtimeTuning.slowDownRatio;
+            selectedPrefilterKey = routeAudio.selectedPrefilterMode;
+            processed = routeAudio.procChunk;
+            metrics = routeResult.metrics;
+            text = routeResult.text.trim();
+        } else {
+            runtimeTuning = AudioPrefilter.selectFinalAsrTuning(
+                    mono16k, mono16k.length, TARGET_SAMPLE_RATE, AudioPrefilter.Mode.TALK);
+            useRuntimeTuning = parseBooleanOpt(opts, "runtime-adaptive-tuning", true)
+                    && !"default".equals(runtimeTuning.id);
+            actualTrimAbsThreshold = useRuntimeTuning
+                    ? Math.min(preset.trimAbsThreshold, runtimeTuning.trimAbsThreshold)
+                    : preset.trimAbsThreshold;
+            actualTrimPadMs = useRuntimeTuning
+                    ? Math.max(preset.trimPadMs, runtimeTuning.trimPadMs)
+                    : preset.trimPadMs;
+            actualNormalizeDbfs = useRuntimeTuning
+                    ? runtimeTuning.normalizeDbfs
+                    : preset.normalizeDbfs;
+            actualLeadingPaddingMs = useRuntimeTuning
+                    ? Math.max(preset.leadingPaddingMs, runtimeTuning.leadingPaddingMs)
+                    : preset.leadingPaddingMs;
+            actualTailPaddingMs = useRuntimeTuning
+                    ? Math.max(preset.tailPaddingMs, runtimeTuning.tailPaddingMs)
+                    : preset.tailPaddingMs;
+            actualSlowDownRatio = useRuntimeTuning
+                    ? runtimeTuning.slowDownRatio
+                    : preset.slowDownRatio;
+
+            byte[] trimmed = trimPcmSilence16le(mono16k, actualTrimAbsThreshold, actualTrimPadMs);
+            byte[] cropped = cropPcm16leToMaxMs(trimmed, preset.maxInputMs);
+            byte[] squashed = squashInternalSilence16le(
+                    cropped,
+                    preset.squashSilenceAbsThreshold,
+                    preset.squashSilenceMinMs,
+                    preset.squashSilenceKeepMs);
+            AudioPrefilter.Profile selectedPrefilter = preset.prefilter == AudioPrefilter.Profile.AUTO
+                    ? AudioPrefilter.selectAdaptiveProfile(
+                    squashed, squashed.length, TARGET_SAMPLE_RATE, AudioPrefilter.Mode.TALK)
+                    : preset.prefilter;
+            selectedPrefilterKey = selectedPrefilter.name().toLowerCase(Locale.ROOT);
+            processed = processForDecode(squashed, selectedPrefilter, actualNormalizeDbfs, actualSlowDownRatio);
+            LocalMoonshineSTT.OneShotTranscriptResult result = stt.transcribeOneShotDetailed(
+                    pcm16leToFloat(processed),
+                    actualLeadingPaddingMs,
+                    actualTailPaddingMs,
+                    preset.passes,
+                    preset.settleSleepMs,
+                    preset.withoutStreaming,
+                    "bench:" + preset.id);
+            text = result.text == null ? "" : result.text.trim();
+            lineConfidence = result.lineConfidence;
+            wordCount = result.wordCount;
+            metrics = AudioPrefilter.analyzeVoiceLike(processed, processed.length, TARGET_SAMPLE_RATE);
+        }
         long finishedNs = System.nanoTime();
 
-        String text = result.text == null ? "" : result.text.trim();
         String expected = item.expected == null ? "" : item.expected.trim();
         String metricExpected = normalizeForMetric(expected, preset.language);
         String metricText = normalizeForMetric(text, preset.language);
-        AudioPrefilter.VoiceMetrics metrics =
-                AudioPrefilter.analyzeVoiceLike(processed, processed.length, TARGET_SAMPLE_RATE);
+        Path dumpedAudio = dumpProcessedAudioIfRequested(opts, preset, item, processed);
 
         JSONObject row = new JSONObject();
         row.put("wav", item.wavPath.toString());
@@ -163,6 +224,7 @@ public final class MoonshineBenchmarkCli {
         row.put("language", preset.language);
         row.put("scene", preset.scene);
         row.put("preset_id", preset.id);
+        row.put("mobmate_final_route", mobMateFinalRoute != null);
         row.put("model_path", modelPath.toString());
         row.put("arch", arch);
         row.put("exact", !expected.isBlank() && metricExpected.equals(metricText));
@@ -176,8 +238,8 @@ public final class MoonshineBenchmarkCli {
         row.put("rms", metrics.rms);
         row.put("peak", metrics.peak);
         row.put("voice_band_ratio", metrics.voiceBandRatio);
-        row.put("line_confidence", Float.isNaN(result.lineConfidence) ? JSONObject.NULL : result.lineConfidence);
-        row.put("word_count", result.wordCount);
+        row.put("line_confidence", Float.isNaN(lineConfidence) ? JSONObject.NULL : lineConfidence);
+        row.put("word_count", wordCount);
         row.put("preset", new JSONObject()
                 .put("id", preset.id)
                 .put("vad_window_sec", preset.vadWindowSec)
@@ -185,27 +247,43 @@ public final class MoonshineBenchmarkCli {
                 .put("vad_threshold", preset.vadThreshold)
                 .put("max_tokens_per_second", preset.maxTokensPerSecond)
                 .put("prefilter", preset.prefilter.name().toLowerCase(Locale.ROOT))
-                .put("trim_abs_threshold", preset.trimAbsThreshold)
-                .put("trim_pad_ms", preset.trimPadMs)
+                .put("selected_prefilter", selectedPrefilterKey)
+                .put("runtime_tuning", useRuntimeTuning ? runtimeTuning.id : "preset")
+                .put("trim_abs_threshold", actualTrimAbsThreshold)
+                .put("trim_pad_ms", actualTrimPadMs)
                 .put("max_input_ms", preset.maxInputMs)
                 .put("squash_silence_abs_threshold", preset.squashSilenceAbsThreshold)
                 .put("squash_silence_min_ms", preset.squashSilenceMinMs)
                 .put("squash_silence_keep_ms", preset.squashSilenceKeepMs)
-                .put("normalize_dbfs", preset.normalizeDbfs)
-                .put("slow_down_ratio", preset.slowDownRatio)
-                .put("leading_padding_ms", preset.leadingPaddingMs)
-                .put("tail_padding_ms", preset.tailPaddingMs)
+                .put("normalize_dbfs", actualNormalizeDbfs)
+                .put("slow_down_ratio", actualSlowDownRatio)
+                .put("leading_padding_ms", actualLeadingPaddingMs)
+                .put("tail_padding_ms", actualTailPaddingMs)
                 .put("passes", preset.passes)
                 .put("settle_sleep_ms", preset.settleSleepMs)
                 .put("without_streaming", preset.withoutStreaming));
         return row;
     }
 
+    private static byte[] processForDecode(byte[] pcm16le,
+                                           AudioPrefilter.Profile profile,
+                                           double normalizeDbfs,
+                                           double slowDownRatio) {
+        byte[] processed = AudioPrefilter.processForAsr(
+                pcm16le, pcm16le.length, TARGET_SAMPLE_RATE, AudioPrefilter.Mode.TALK,
+                profile, new AudioPrefilter.State());
+        processed = AudioPrefilter.normalizeFinalChunkForAsr(processed, processed.length, normalizeDbfs);
+        if (slowDownRatio > 1.01d) {
+            processed = slowDownPcm16le(processed, slowDownRatio);
+        }
+        return processed;
+    }
+
     private static List<Preset> defaultPresets() {
         List<Preset> ja = List.of(
                 new Preset("ja_talk_clean_v1", "ja", "talk_clean", 0.15, 20000, 0.30, 13.0, AudioPrefilter.Profile.NORMAL, 260, 120, 0, 0, 0, 0, -22.8, 1.00, 300, 300, 2, 35, false),
                 new Preset("ja_talk_noisy_v1", "ja", "talk_noisy", 0.15, 26000, 0.34, 13.0, AudioPrefilter.Profile.STRONG, 320, 160, 0, 0, 0, 0, -22.3, 1.00, 320, 420, 3, 45, true),
-                new Preset("ja_talk_low_voice_v1", "ja", "talk_low_voice", 0.12, 32000, 0.24, 13.0, AudioPrefilter.Profile.NORMAL, 180, 180, 0, 0, 0, 0, -24.0, 1.00, 360, 480, 3, 45, true),
+                new Preset("ja_talk_low_voice_v1", "ja", "talk_low_voice", 0.12, 32000, 0.24, 13.0, AudioPrefilter.Profile.NORMAL, 180, 180, 0, 0, 0, 0, -26.0, 1.00, 360, 480, 3, 45, true),
                 new Preset("ja_short_command_v1", "ja", "short_command", 0.10, 32000, 0.26, 13.0, AudioPrefilter.Profile.OFF, 180, 220, 0, 0, 0, 0, -23.4, 1.08, 420, 520, 3, 45, true),
                 new Preset("ja_desktop_hearing_v1", "ja", "desktop_hearing", 0.18, 22000, 0.32, 13.0, AudioPrefilter.Profile.STRONG, 260, 180, 0, 0, 0, 0, -22.6, 1.00, 300, 450, 3, 45, true)
         );
@@ -213,19 +291,19 @@ public final class MoonshineBenchmarkCli {
         out.addAll(List.of(
                 new Preset("en_talk_clean_v1", "en", "talk_clean", 0.15, 20000, 0.30, 6.5, AudioPrefilter.Profile.NORMAL, 260, 120, 0, 0, 0, 0, -22.8, 1.00, 300, 300, 2, 35, false),
                 new Preset("en_talk_noisy_v1", "en", "talk_noisy", 0.15, 26000, 0.34, 6.5, AudioPrefilter.Profile.STRONG, 320, 160, 0, 0, 0, 0, -22.3, 1.00, 320, 420, 3, 45, true),
-                new Preset("en_talk_low_voice_v1", "en", "talk_low_voice", 0.12, 32000, 0.24, 6.5, AudioPrefilter.Profile.NORMAL, 180, 180, 0, 0, 0, 0, -24.0, 1.00, 360, 480, 3, 45, true),
+                new Preset("en_talk_low_voice_v1", "en", "talk_low_voice", 0.12, 32000, 0.24, 6.5, AudioPrefilter.Profile.NORMAL, 180, 180, 0, 0, 0, 0, -26.0, 1.00, 360, 480, 3, 45, true),
                 new Preset("en_short_command_v1", "en", "short_command", 0.10, 32000, 0.26, 6.5, AudioPrefilter.Profile.NORMAL, 180, 220, 0, 0, 0, 0, -23.4, 1.08, 420, 520, 3, 45, true),
                 new Preset("en_desktop_hearing_v1", "en", "desktop_hearing", 0.18, 22000, 0.32, 6.5, AudioPrefilter.Profile.STRONG, 260, 180, 0, 0, 0, 0, -22.6, 1.00, 300, 450, 3, 45, true),
 
                 new Preset("zh_talk_clean_v1", "zh", "talk_clean", 0.16, 24000, 0.27, 16.0, AudioPrefilter.Profile.NORMAL, 140, 220, 0, 0, 0, 0, -24.0, 1.08, 420, 620, 4, 55, true),
                 new Preset("zh_talk_noisy_v1", "zh", "talk_noisy", 0.16, 30000, 0.31, 16.0, AudioPrefilter.Profile.NORMAL, 120, 260, 0, 0, 0, 0, -25.2, 1.18, 620, 900, 4, 65, true),
-                new Preset("zh_talk_low_voice_v1", "zh", "talk_low_voice", 0.14, 34000, 0.23, 16.0, AudioPrefilter.Profile.OFF, 90, 300, 0, 0, 0, 0, -24.8, 1.12, 520, 820, 4, 65, true),
+                new Preset("zh_talk_low_voice_v1", "zh", "talk_low_voice", 0.14, 34000, 0.23, 16.0, AudioPrefilter.Profile.NORMAL, 90, 300, 0, 0, 0, 0, -26.0, 1.12, 520, 820, 4, 65, true),
                 new Preset("zh_short_command_v1", "zh", "short_command", 0.12, 36000, 0.24, 16.0, AudioPrefilter.Profile.NORMAL, 120, 240, 0, 0, 0, 0, -24.8, 1.00, 460, 760, 4, 70, true),
                 new Preset("zh_desktop_hearing_v1", "zh", "desktop_hearing", 0.18, 28000, 0.29, 16.0, AudioPrefilter.Profile.NORMAL, 140, 260, 0, 0, 0, 0, -23.8, 1.08, 460, 760, 4, 65, true),
 
                 new Preset("ko_talk_clean_v1", "ko", "talk_clean", 0.16, 26000, 0.27, 13.0, AudioPrefilter.Profile.NORMAL, 120, 240, 0, 0, 0, 0, -24.2, 1.12, 480, 760, 4, 60, true),
                 new Preset("ko_talk_noisy_v1", "ko", "talk_noisy", 0.16, 32000, 0.31, 13.0, AudioPrefilter.Profile.NORMAL, 160, 280, 0, 0, 0, 0, -23.8, 1.10, 500, 840, 4, 65, true),
-                new Preset("ko_talk_low_voice_v1", "ko", "talk_low_voice", 0.14, 36000, 0.23, 13.0, AudioPrefilter.Profile.OFF, 80, 320, 0, 0, 0, 0, -25.0, 1.16, 620, 960, 4, 70, true),
+                new Preset("ko_talk_low_voice_v1", "ko", "talk_low_voice", 0.14, 36000, 0.23, 13.0, AudioPrefilter.Profile.NORMAL, 80, 320, 0, 0, 0, 0, -26.0, 1.16, 620, 960, 4, 70, true),
                 new Preset("ko_short_command_v1", "ko", "short_command", 0.12, 36000, 0.23, 13.0, AudioPrefilter.Profile.OFF, 80, 360, 0, 0, 0, 0, -25.0, 1.20, 700, 980, 4, 75, true),
                 new Preset("ko_desktop_hearing_v1", "ko", "desktop_hearing", 0.18, 30000, 0.28, 13.0, AudioPrefilter.Profile.NORMAL, 120, 280, 0, 0, 0, 0, -24.0, 1.12, 520, 840, 4, 65, true)
         ));

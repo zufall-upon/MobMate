@@ -170,6 +170,36 @@ public final class MoonshinePresetSweepCli {
                 "override-passes", "4",
                 "override-settle-sleep-ms", "75",
                 "override-prefilter", "off")));
+        out.add(new Candidate("presence_light", linked(
+                "override-trim-abs-threshold", "100",
+                "override-trim-pad-ms", "300",
+                "override-leading-padding-ms", "560",
+                "override-tail-padding-ms", "860",
+                "override-normalize-dbfs", "-24.2",
+                "override-passes", "4",
+                "override-settle-sleep-ms", "65",
+                "override-slow-down-ratio", "1.10",
+                "override-prefilter", "presence_light")));
+        out.add(new Candidate("presence_mid", linked(
+                "override-trim-abs-threshold", "90",
+                "override-trim-pad-ms", "320",
+                "override-leading-padding-ms", "620",
+                "override-tail-padding-ms", "960",
+                "override-normalize-dbfs", "-24.8",
+                "override-passes", "4",
+                "override-settle-sleep-ms", "70",
+                "override-slow-down-ratio", "1.12",
+                "override-prefilter", "presence_mid")));
+        out.add(new Candidate("presence_strong", linked(
+                "override-trim-abs-threshold", "80",
+                "override-trim-pad-ms", "340",
+                "override-leading-padding-ms", "700",
+                "override-tail-padding-ms", "1100",
+                "override-normalize-dbfs", "-25.0",
+                "override-passes", "4",
+                "override-settle-sleep-ms", "75",
+                "override-slow-down-ratio", "1.16",
+                "override-prefilter", "presence_strong")));
         out.add(new Candidate("clear_fast", linked(
                 "override-trim-pad-ms", "180",
                 "override-leading-padding-ms", "360",
